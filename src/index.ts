@@ -6,6 +6,7 @@ export {
   type GraphInputIssue,
   type GraphLayoutHint,
   type GraphLink,
+  type GraphLinkOccurrence,
   type GraphNode,
   type GraphNodeRole,
 } from "./contract.js";

@@ -15,6 +15,7 @@ export const graphFixture: GraphInput = {
       target: "component:api",
       relationKind: "workflow-step",
       ordinal: 1,
+      occurrences: [{ ordinal: 1, id: "release-api" }],
     },
     {
       id: "api-web",

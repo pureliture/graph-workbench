@@ -55,6 +55,7 @@ const input: GraphInput = {
       target: "component:api",
       relationKind: "workflow-step",
       ordinal: 1,
+      occurrences: [{ ordinal: 1, id: "release-api" }],
     },
   ],
 };
@@ -68,6 +69,7 @@ workbench.mount(document.querySelector("#graph")!);
 
 `master` is an explicit role. The renderer does not infer it from node degree,
 screen position, or visual size. Inputs without a master node are valid.
+Bundled links can preserve more than one ordered occurrence through `occurrences`.
 
 ## Public API
 

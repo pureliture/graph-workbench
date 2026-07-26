@@ -66,6 +66,20 @@ export const graphInputJsonSchema = {
                     target: { type: "string", minLength: 1 },
                     relationKind: { type: "string", minLength: 1 },
                     ordinal: { type: "integer", minimum: 0 },
+                    occurrences: {
+                        type: "array",
+                        minItems: 1,
+                        items: {
+                            type: "object",
+                            additionalProperties: false,
+                            required: ["ordinal"],
+                            properties: {
+                                ordinal: { type: "integer", minimum: 0 },
+                                id: { type: "string", minLength: 1 },
+                                metadata: { type: "object", additionalProperties: true },
+                            },
+                        },
+                    },
                     metadata: { type: "object", additionalProperties: true },
                 },
             },
@@ -193,6 +207,36 @@ export function validateGraphInput(value) {
             if (link.ordinal !== undefined
                 && (typeof link.ordinal !== "number" || !Number.isInteger(link.ordinal) || link.ordinal < 0)) {
                 issues.push({ path: `${path}.ordinal`, message: "must be a non-negative integer" });
+            }
+            if (link.occurrences !== undefined) {
+                if (!Array.isArray(link.occurrences) || link.occurrences.length === 0) {
+                    issues.push({ path: `${path}.occurrences`, message: "must be a non-empty array" });
+                }
+                else {
+                    const occurrenceOrdinals = new Set();
+                    link.occurrences.forEach((occurrence, occurrenceIndex) => {
+                        const occurrencePath = `${path}.occurrences[${occurrenceIndex}]`;
+                        if (!isRecord(occurrence)) {
+                            issues.push({ path: occurrencePath, message: "must be an object" });
+                            return;
+                        }
+                        if (typeof occurrence.ordinal !== "number"
+                            || !Number.isInteger(occurrence.ordinal)
+                            || occurrence.ordinal < 0) {
+                            issues.push({ path: `${occurrencePath}.ordinal`, message: "must be a non-negative integer" });
+                        }
+                        else if (occurrenceOrdinals.has(occurrence.ordinal)) {
+                            issues.push({ path: `${occurrencePath}.ordinal`, message: "must be unique per link" });
+                        }
+                        else {
+                            occurrenceOrdinals.add(occurrence.ordinal);
+                        }
+                        if (occurrence.id !== undefined && !nonEmptyString(occurrence.id)) {
+                            issues.push({ path: `${occurrencePath}.id`, message: "must be a non-empty string" });
+                        }
+                        validateMetadata(occurrence.metadata, `${occurrencePath}.metadata`, issues);
+                    });
+                }
             }
             validateMetadata(link.metadata, `${path}.metadata`, issues);
         });

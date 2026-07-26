@@ -38,6 +38,7 @@ export const fixture: GraphInput = {
       target: "component:api",
       relationKind: "workflow-step",
       ordinal: 1,
+      occurrences: [{ ordinal: 1, id: "release-api" }],
     },
     {
       id: "component:api->component:web",

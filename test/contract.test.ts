@@ -17,6 +17,7 @@ describe("GraphInput", () => {
       "component:web",
     ]);
     expect(result.links.map((link) => link.relationKind)).toEqual(["workflow-step", "serves"]);
+    expect(result.links[0]?.occurrences).toEqual([{ ordinal: 1, id: "release-api" }]);
     expect(result.nodes.find((node) => node.roles?.includes("master"))?.id).toBe("relation:release");
     expect(graphInputJsonSchema.properties.schemaVersion.const).toBe(1);
   });

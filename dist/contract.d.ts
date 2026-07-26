@@ -20,6 +20,12 @@ export interface GraphLink {
     readonly target: string;
     readonly relationKind: string;
     readonly ordinal?: number;
+    readonly occurrences?: readonly GraphLinkOccurrence[];
+    readonly metadata?: Readonly<Record<string, unknown>>;
+}
+export interface GraphLinkOccurrence {
+    readonly ordinal: number;
+    readonly id?: string;
     readonly metadata?: Readonly<Record<string, unknown>>;
 }
 export interface GraphInput {
@@ -147,6 +153,29 @@ export declare const graphInputJsonSchema: {
                     readonly ordinal: {
                         readonly type: "integer";
                         readonly minimum: 0;
+                    };
+                    readonly occurrences: {
+                        readonly type: "array";
+                        readonly minItems: 1;
+                        readonly items: {
+                            readonly type: "object";
+                            readonly additionalProperties: false;
+                            readonly required: readonly ["ordinal"];
+                            readonly properties: {
+                                readonly ordinal: {
+                                    readonly type: "integer";
+                                    readonly minimum: 0;
+                                };
+                                readonly id: {
+                                    readonly type: "string";
+                                    readonly minLength: 1;
+                                };
+                                readonly metadata: {
+                                    readonly type: "object";
+                                    readonly additionalProperties: true;
+                                };
+                            };
+                        };
                     };
                     readonly metadata: {
                         readonly type: "object";
