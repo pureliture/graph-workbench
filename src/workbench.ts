@@ -282,6 +282,11 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
       viewport = viewportFor(container, width, height);
       renderer?.resize(width, height);
       sync();
+      // ResizeObserver preserves the selected identity, so `sync()` alone
+      // updates graphData without re-running the renderer's selection camera
+      // target. Reframe after the viewport-derived data is current; this uses
+      // the same reduced-motion and cancellation policy as an initial select.
+      transitionToSelection(selectionState.nodeId);
     },
     restoreCamera() {
       renderer?.restoreCamera();

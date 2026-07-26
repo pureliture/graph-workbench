@@ -19,18 +19,34 @@ function normalizeViewport(viewport) {
         height: Number.isFinite(height) ? Math.max(1, Math.floor(height)) : DEFAULT_VIEWPORT.height,
     };
 }
-function sphericalPosition(node, seed, index, total) {
+function organicPosition(node, seed, index, total) {
     const hint = node.layoutHint;
     if ([hint?.x, hint?.y, hint?.z].every((axis) => Number.isFinite(axis))) {
         return { x: hint.x, y: hint.y, z: hint.z };
     }
-    const radius = 90 + (unit(`${seed}:${node.id}:radius`) * 35);
-    const theta = 2 * Math.PI * ((index + unit(`${seed}:${node.id}:theta`)) / Math.max(1, total));
-    const phi = Math.acos(1 - (2 * ((index + 0.5) / Math.max(1, total))));
+    // A uniform sphere makes a small graph read as a diagram projected onto a
+    // balloon. The workbench instead starts as a few vertically biased pockets:
+    // nodes in the same semantic lane have a coherent anchor, while a stable
+    // per-node offset keeps the composition organic and legible in perspective.
+    const clusterCount = Math.max(2, Math.min(5, Math.ceil(Math.sqrt(Math.max(1, total)) / 1.35)));
+    const clusterIndex = hash(`${seed}:${node.kind ?? node.type}:cluster`) % clusterCount;
+    const clusterAngle = ((clusterIndex / clusterCount) * Math.PI * 2)
+        + ((unit(`${seed}:${node.id}:cluster-angle`) - 0.5) * 0.54);
+    const clusterRadius = 52 + (unit(`${seed}:${node.id}:cluster-radius`) * 34);
+    const pocketX = Math.cos(clusterAngle) * clusterRadius;
+    const pocketY = Math.sin(clusterAngle) * clusterRadius * 0.72;
+    const verticalBand = (((index / Math.max(1, total - 1)) - 0.5) * 128)
+        + ((unit(`${seed}:${node.id}:vertical`) - 0.5) * 28);
+    const localRadius = 12 + (unit(`${seed}:${node.id}:local-radius`) * 32);
+    const localAngle = unit(`${seed}:${node.id}:local-angle`) * Math.PI * 2;
     return {
-        x: radius * Math.sin(phi) * Math.cos(theta),
-        y: radius * Math.cos(phi),
-        z: radius * Math.sin(phi) * Math.sin(theta),
+        x: pocketX + (Math.cos(localAngle) * localRadius),
+        y: pocketY + verticalBand + (Math.sin(localAngle) * localRadius * 0.42),
+        // Keep enough Z variance for small distant nodes and receding edges, but
+        // avoid a symmetric shell that flattens once the camera starts moving.
+        z: ((unit(`${seed}:${node.id}:depth`) - 0.5) * 136)
+            + (Math.sin(clusterAngle) * 18)
+            + ((node.type === "relation" ? 1 : -1) * 8),
     };
 }
 function primarySelectedNodeId(input, presentation) {
@@ -73,11 +89,13 @@ function oneHopNodeIds(input, selectedNodeId) {
 function visualCue(node, selectedNodeId, neighborNodeIds) {
     const selected = node.id === selectedNodeId;
     const neighboring = neighborNodeIds.has(node.id);
-    const initial = selected
-        ? { contrast: 1, labelCue: "primary", opacity: 1 }
-        : neighboring
-            ? { contrast: 0.82, labelCue: "visible", opacity: 0.86 }
-            : { contrast: 0.3, labelCue: "muted", opacity: 0.3 };
+    const initial = !selectedNodeId
+        ? { contrast: 0.72, labelCue: "visible", opacity: 0.76 }
+        : selected
+            ? { contrast: 1, labelCue: "primary", opacity: 1 }
+            : neighboring
+                ? { contrast: 0.82, labelCue: "visible", opacity: 0.86 }
+                : { contrast: 0.3, labelCue: "muted", opacity: 0.3 };
     const isMaster = node.roles?.includes("master") === true;
     return {
         contrast: isMaster ? Math.max(initial.contrast, MASTER_READABILITY_FLOOR.contrast) : initial.contrast,
@@ -87,15 +105,17 @@ function visualCue(node, selectedNodeId, neighborNodeIds) {
     };
 }
 function linkVisualCue(link, selectedNodeId, neighborNodeIds) {
+    // Edges establish a field, not a wireframe cage. The selected relationship
+    // rises just enough to explain the focused node while the rest recedes.
     if (!selectedNodeId)
-        return { opacity: 0.68, width: 1 };
+        return { opacity: 0.14, width: 0.8 };
     const selectedLink = link.source === selectedNodeId || link.target === selectedNodeId;
     const neighborhoodLink = neighborNodeIds.has(link.source) && neighborNodeIds.has(link.target);
     return selectedLink
-        ? { opacity: 0.9, width: 1.65 }
+        ? { opacity: 0.62, width: 1.25 }
         : neighborhoodLink
-            ? { opacity: 0.62, width: 1.2 }
-            : { opacity: 0.22, width: 0.7 };
+            ? { opacity: 0.32, width: 0.95 }
+            : { opacity: 0.1, width: 0.6 };
 }
 function selectedLayoutPositions(input, basePositions, selectedNodeId, neighborNodeIds, viewport) {
     const positions = new Map(basePositions);
@@ -104,20 +124,45 @@ function selectedLayoutPositions(input, basePositions, selectedNodeId, neighborN
     const selected = input.nodes.find((node) => node.id === selectedNodeId);
     if (!selected)
         return positions;
+    const selectedBase = basePositions.get(selected.id);
+    const selectedTarget = { x: 0, y: 6, z: 24 };
     if (!selected.layoutHint?.pinned)
-        positions.set(selected.id, { x: 0, y: 0, z: 0 });
-    const radius = Math.max(36, Math.min(96, Math.min(viewport.width, viewport.height) * 0.14));
-    const offset = unit(`${input.layout.seed}:${selected.id}:neighbors`) * Math.PI * 2;
-    neighborNodeIds.forEach((neighborId, index) => {
-        const neighbor = input.nodes.find((node) => node.id === neighborId);
-        if (!neighbor || neighbor.layoutHint?.pinned)
+        positions.set(selected.id, selectedTarget);
+    // Selection re-centres the *entire* deterministic cloud around the selected
+    // node's original position. Rotating and tightening the existing local
+    // composition preserves real clusters and avoids the artificial perimeter
+    // ring produced by re-assigning every far node to a common radius.
+    const rotation = (unit(`${input.layout.seed}:${selected.id}:selection-rotation`) - 0.5) * 0.48;
+    const cloudScale = Math.max(0.92, Math.min(1, 0.94 + (Math.min(viewport.width, viewport.height) / 12000)));
+    const neighborhood = new Set([selectedNodeId, ...neighborNodeIds]);
+    input.nodes.forEach((node, index) => {
+        if (node.id === selectedNodeId || node.layoutHint?.pinned)
             return;
-        const theta = offset + ((index / Math.max(1, neighborNodeIds.length)) * Math.PI * 2);
-        const vertical = Math.sin(theta) * radius * 0.56;
-        positions.set(neighborId, {
-            x: Math.cos(theta) * radius,
-            y: vertical,
-            z: Math.sin(theta * 0.7 + offset) * radius * 0.4,
+        const base = basePositions.get(node.id);
+        const delta = {
+            x: base.x - selectedBase.x,
+            y: base.y - selectedBase.y,
+            z: base.z - selectedBase.z,
+        };
+        const rotated = {
+            x: ((delta.x * Math.cos(rotation)) - (delta.y * Math.sin(rotation))) * cloudScale,
+            y: ((delta.x * Math.sin(rotation)) + (delta.y * Math.cos(rotation))) * cloudScale,
+            z: delta.z * (cloudScale * 0.78),
+        };
+        const isNeighbor = neighborhood.has(node.id);
+        const focusPull = isNeighbor ? 0.9 : 1;
+        const jitter = {
+            x: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-x`) - 0.5) * (isNeighbor ? 7 : 13),
+            y: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-y`) - 0.5) * (isNeighbor ? 6 : 12),
+            z: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-z`) - 0.5) * (isNeighbor ? 5 : 10),
+        };
+        positions.set(node.id, {
+            x: selectedTarget.x + (rotated.x * focusPull) + jitter.x,
+            y: selectedTarget.y + (rotated.y * focusPull) + jitter.y
+                + (((index / Math.max(1, input.nodes.length - 1)) - 0.5) * 8),
+            // Neighbours sit slightly forward, while the wider cloud retains its
+            // original depth relationships instead of collapsing into a back ring.
+            z: selectedTarget.z + (rotated.z * focusPull) + jitter.z + (isNeighbor ? 8 : -14),
         });
     });
     return positions;
@@ -133,7 +178,7 @@ export function createRenderGraphData(input, presentation, options = {}) {
     const neighborNodeIdSet = new Set(neighborNodeIds);
     const basePositions = new Map(input.nodes.map((node, index) => [
         node.id,
-        sphericalPosition(node, input.layout.seed, index, input.nodes.length),
+        organicPosition(node, input.layout.seed, index, input.nodes.length),
     ]));
     const positions = selectedLayoutPositions(input, basePositions, selectedNodeId, neighborNodeIds, viewport);
     const settledNodeIds = new Set(selectedNodeId ? [selectedNodeId, ...neighborNodeIds] : []);

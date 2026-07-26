@@ -104,6 +104,37 @@ describe("selection-driven layout", () => {
     expect(first.links.map((link) => link.relationKind)).toEqual(["workflow-step", "serves"]);
   });
 
+  it("uses a deterministic vertically clustered depth field and re-stages every non-pinned node on selection", () => {
+    const input = {
+      ...graphFixture,
+      nodes: [
+        ...graphFixture.nodes,
+        { id: "component:docs", type: "component" as const, kind: "service", label: "Docs" },
+        {
+          id: "component:pinned",
+          type: "component" as const,
+          kind: "service",
+          label: "Pinned",
+          layoutHint: { pinned: true, x: 180, y: -48, z: 72 },
+        },
+      ],
+    };
+    const base = createRenderGraphData(input, {});
+    const selected = createRenderGraphData(input, { selectedNodeIds: ["component:api"] });
+    const repeated = createRenderGraphData(input, { selectedNodeIds: ["component:api"] });
+    const baseById = new Map(base.nodes.map((node) => [node.id, { x: node.x, y: node.y, z: node.z }]));
+    const selectedById = new Map(selected.nodes.map((node) => [node.id, { x: node.x, y: node.y, z: node.z }]));
+
+    expect(new Set(base.nodes.map((node) => node.z)).size).toBeGreaterThan(3);
+    expect(Math.max(...base.nodes.map((node) => node.y)) - Math.min(...base.nodes.map((node) => node.y))).toBeGreaterThan(100);
+    ["relation:release", "component:api", "component:web", "component:docs"].forEach((id) => {
+      expect(selectedById.get(id)).not.toEqual(baseById.get(id));
+    });
+    expect(selectedById.get("component:pinned")).toEqual(baseById.get("component:pinned"));
+    expect(selected.selection.targetNodePositions).toEqual(repeated.selection.targetNodePositions);
+    expect(base.nodes.every((node) => node.visual.labelCue === "visible")).toBe(true);
+  });
+
   it("uses UTF-16 code-unit ordering for non-ASCII one-hop identities", () => {
     const input = {
       schemaVersion: 1 as const,
@@ -193,6 +224,46 @@ describe("selection-driven layout", () => {
     expect(renderer?.transitions.at(-1)).toEqual({ nodeId: "component:web", reducedMotion: true });
     expect(renderer?.cancelCalls).toBeGreaterThanOrEqual(4);
     expect(workbench.getSelectionState()).toBe(renderer?.data?.selection);
+  });
+
+  it("reframes a mouse-selected full cloud after a ResizeObserver-style viewport sync", () => {
+    let callbacks: GraphRendererFactoryOptions["callbacks"] | null = null;
+    let renderer: TransitionRenderer | null = null;
+    const workbench = createGraphWorkbench({
+      input: graphFixture,
+      rendererFactory: (options) => {
+        callbacks = options.callbacks;
+        renderer = new TransitionRenderer();
+        return renderer;
+      },
+    });
+    const element = new FakeElement();
+
+    workbench.mount(element as unknown as HTMLElement);
+    callbacks?.onNodeClick("component:api");
+    const transitionsBeforeResize = renderer!.transitions.length;
+    const operationsBeforeResize = renderer!.operations.length;
+
+    // This is the order used by BrowserGraphFixture's ResizeObserver:
+    // viewport update -> renderer.resize() -> graphData sync.
+    workbench.resize(390, 844);
+
+    expect(renderer!.operations.slice(operationsBeforeResize, operationsBeforeResize + 2)).toEqual([
+      "data:component:api",
+      "cancel",
+    ]);
+    expect(renderer!.data?.selection).toMatchObject({
+      nodeId: "component:api",
+      viewport: { height: 844, width: 390 },
+    });
+    expect(renderer!.transitions).toHaveLength(transitionsBeforeResize + 1);
+    expect(renderer!.transitions.at(-1)).toEqual({ nodeId: "component:api", reducedMotion: false });
+
+    workbench.setReducedMotion(true);
+    const reducedMotionTransitions = renderer!.transitions.length;
+    workbench.resize(720, 540);
+    expect(renderer!.transitions).toHaveLength(reducedMotionTransitions + 1);
+    expect(renderer!.transitions.at(-1)).toEqual({ nodeId: "component:api", reducedMotion: true });
   });
 
   it("cancels the active camera before background clear and a setInput removal", () => {

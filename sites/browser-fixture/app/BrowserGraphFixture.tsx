@@ -15,7 +15,7 @@ import {
 
 const graphInput = {
   schemaVersion: 1,
-  layout: { seed: "browser-fixture-selection-v1" },
+  layout: { seed: "browser-fixture-selection-v2" },
   nodes: [
     {
       id: "relation:release",
@@ -23,28 +23,392 @@ const graphInput = {
       kind: "workflow",
       label: "Release workflow",
       roles: ["master"],
-      metadata: { domain: "delivery", workflow: "release" },
+      metadata: { domain: "delivery", visualTier: "near", workflow: "release" },
+      layoutHint: { x: 10, y: 4, z: 26 },
     },
     {
       id: "component:api",
       type: "component",
       kind: "service",
       label: "API service",
-      metadata: { domain: "platform", owner: "runtime" },
+      metadata: { domain: "platform", owner: "runtime", visualTier: "near" },
+      layoutHint: { x: -44, y: -10, z: 16 },
     },
     {
       id: "component:web",
       type: "component",
       kind: "application",
       label: "Web console",
-      metadata: { domain: "experience", owner: "console" },
+      metadata: { domain: "experience", owner: "console", visualTier: "mid" },
+      layoutHint: { x: -88, y: -35, z: -24 },
     },
     {
       id: "profile:platform",
       type: "profile",
       kind: "operating-profile",
       label: "Platform profile",
-      metadata: { domain: "platform", environment: "production" },
+      metadata: { domain: "platform", environment: "production", visualTier: "mid" },
+      layoutHint: { x: -14, y: 47, z: -16 },
+    },
+    {
+      id: "relation:ingest",
+      type: "relation",
+      kind: "ingestion",
+      label: "Ingest",
+      metadata: { domain: "knowledge", visualTier: "near" },
+      layoutHint: { x: -86, y: 42, z: -28 },
+    },
+    {
+      id: "relation:query",
+      type: "relation",
+      kind: "retrieval",
+      label: "Query",
+      metadata: { domain: "knowledge", visualTier: "near" },
+      layoutHint: { x: 77, y: 32, z: 18 },
+    },
+    {
+      id: "relation:review",
+      type: "relation",
+      kind: "review",
+      label: "Review",
+      metadata: { domain: "quality", visualTier: "mid" },
+      layoutHint: { x: 96, y: -19, z: -8 },
+    },
+    {
+      id: "relation:handoff",
+      type: "relation",
+      kind: "handoff",
+      label: "Handoff",
+      metadata: { domain: "delivery", visualTier: "near" },
+      layoutHint: { x: 24, y: -72, z: 7 },
+    },
+    {
+      id: "component:cache",
+      type: "component",
+      kind: "cache",
+      label: "Prefix cache",
+      metadata: { domain: "runtime", visualTier: "mid" },
+      layoutHint: { x: -55, y: -63, z: 37 },
+    },
+    {
+      id: "component:queue",
+      type: "component",
+      kind: "queue",
+      label: "Queue",
+      metadata: { domain: "runtime", visualTier: "near" },
+      layoutHint: { x: 16, y: -32, z: -49 },
+    },
+    {
+      id: "component:controller",
+      type: "component",
+      kind: "controller",
+      label: "Controller",
+      metadata: { domain: "runtime", visualTier: "mid" },
+      layoutHint: { x: 57, y: 67, z: -37 },
+    },
+    {
+      id: "concept:source",
+      type: "concept",
+      kind: "input",
+      label: "Source",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: -125, y: 58, z: 22 },
+    },
+    {
+      id: "concept:event",
+      type: "concept",
+      kind: "event",
+      label: "Event",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: -111, y: 19, z: -42 },
+    },
+    {
+      id: "concept:schema",
+      type: "concept",
+      kind: "schema",
+      label: "Schema",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: -63, y: 76, z: 11 },
+    },
+    {
+      id: "concept:index",
+      type: "concept",
+      kind: "index",
+      label: "Index",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: -22, y: 88, z: -42 },
+    },
+    {
+      id: "concept:evidence",
+      type: "concept",
+      kind: "evidence",
+      label: "Evidence",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: 53, y: 57, z: 44 },
+    },
+    {
+      id: "concept:policy",
+      type: "concept",
+      kind: "policy",
+      label: "Policy",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: 110, y: 45, z: -25 },
+    },
+    {
+      id: "concept:permission",
+      type: "concept",
+      kind: "permission",
+      label: "Permission",
+      metadata: { visualTier: "far" },
+      layoutHint: { x: 137, y: 14, z: -53 },
+    },
+    {
+      id: "concept:boundary",
+      type: "concept",
+      kind: "boundary",
+      label: "Boundary",
+      metadata: { visualTier: "far" },
+      layoutHint: { x: 135, y: -42, z: 41 },
+    },
+    {
+      id: "concept:contract",
+      type: "concept",
+      kind: "contract",
+      label: "Contract",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: 92, y: -61, z: 24 },
+    },
+    {
+      id: "concept:registry",
+      type: "concept",
+      kind: "registry",
+      label: "Registry",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: 54, y: -89, z: -35 },
+    },
+    {
+      id: "concept:artifact",
+      type: "concept",
+      kind: "artifact",
+      label: "Artifact",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: 2, y: -106, z: 31 },
+    },
+    {
+      id: "concept:memory",
+      type: "concept",
+      kind: "memory",
+      label: "Memory",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: -41, y: -92, z: -17 },
+    },
+    {
+      id: "concept:context",
+      type: "concept",
+      kind: "context",
+      label: "Context",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: -92, y: -77, z: 12 },
+    },
+    {
+      id: "concept:session",
+      type: "concept",
+      kind: "session",
+      label: "Session",
+      metadata: { visualTier: "far" },
+      layoutHint: { x: -128, y: -54, z: -46 },
+    },
+    {
+      id: "concept:turn",
+      type: "concept",
+      kind: "turn",
+      label: "Turn",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: -122, y: -5, z: 34 },
+    },
+    {
+      id: "concept:task",
+      type: "concept",
+      kind: "task",
+      label: "Task",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: -106, y: -30, z: 54 },
+    },
+    {
+      id: "concept:workflow",
+      type: "concept",
+      kind: "workflow",
+      label: "Workflow",
+      metadata: { visualTier: "far" },
+      layoutHint: { x: -71, y: -15, z: 64 },
+    },
+    {
+      id: "concept:hook",
+      type: "concept",
+      kind: "hook",
+      label: "Hook",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: 28, y: 92, z: 47 },
+    },
+    {
+      id: "concept:tool",
+      type: "concept",
+      kind: "tool",
+      label: "Tool",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: 100, y: 84, z: -8 },
+    },
+    {
+      id: "concept:trace",
+      type: "concept",
+      kind: "trace",
+      label: "Trace",
+      metadata: { visualTier: "far" },
+      layoutHint: { x: 139, y: 67, z: 38 },
+    },
+    {
+      id: "concept:state",
+      type: "concept",
+      kind: "state",
+      label: "State",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: 120, y: -75, z: -43 },
+    },
+    {
+      id: "relation:orchestrate",
+      type: "relation",
+      kind: "orchestration",
+      label: "Orchestrate",
+      metadata: { domain: "control", visualTier: "near" },
+      layoutHint: { x: -4, y: -12, z: 70 },
+    },
+    {
+      id: "relation:inspect",
+      type: "relation",
+      kind: "inspection",
+      label: "Inspect",
+      metadata: { domain: "quality", visualTier: "mid" },
+      layoutHint: { x: 42, y: 12, z: -66 },
+    },
+    {
+      id: "relation:promote",
+      type: "relation",
+      kind: "promotion",
+      label: "Promote",
+      metadata: { domain: "delivery", visualTier: "near" },
+      layoutHint: { x: 78, y: -53, z: 52 },
+    },
+    {
+      id: "concept:model",
+      type: "concept",
+      kind: "model",
+      label: "Model",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: -22, y: 14, z: 54 },
+    },
+    {
+      id: "concept:provider",
+      type: "concept",
+      kind: "provider",
+      label: "Provider",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: 14, y: 29, z: 61 },
+    },
+    {
+      id: "concept:token",
+      type: "concept",
+      kind: "token",
+      label: "Token",
+      metadata: { visualTier: "far" },
+      layoutHint: { x: 44, y: 43, z: 66 },
+    },
+    {
+      id: "concept:ledger",
+      type: "concept",
+      kind: "ledger",
+      label: "Ledger",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: -46, y: 1, z: 49 },
+    },
+    {
+      id: "concept:vector",
+      type: "concept",
+      kind: "vector",
+      label: "Vector",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: 64, y: 1, z: -56 },
+    },
+    {
+      id: "concept:snapshot",
+      type: "concept",
+      kind: "snapshot",
+      label: "Snapshot",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: -8, y: -52, z: 58 },
+    },
+    {
+      id: "concept:branch",
+      type: "concept",
+      kind: "branch",
+      label: "Branch",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: -82, y: -43, z: 62 },
+    },
+    {
+      id: "concept:review-thread",
+      type: "concept",
+      kind: "review-thread",
+      label: "Review thread",
+      metadata: { visualTier: "far" },
+      layoutHint: { x: -96, y: 2, z: -61 },
+    },
+    {
+      id: "concept:check",
+      type: "concept",
+      kind: "check",
+      label: "Check",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: 45, y: -39, z: 55 },
+    },
+    {
+      id: "concept:release",
+      type: "concept",
+      kind: "release",
+      label: "Release",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: 102, y: -3, z: 59 },
+    },
+    {
+      id: "concept:delta",
+      type: "concept",
+      kind: "delta",
+      label: "Delta",
+      metadata: { visualTier: "far" },
+      layoutHint: { x: 124, y: 32, z: -63 },
+    },
+    {
+      id: "concept:owner",
+      type: "concept",
+      kind: "owner",
+      label: "Owner",
+      metadata: { visualTier: "near" },
+      layoutHint: { x: -16, y: 69, z: 55 },
+    },
+    {
+      id: "concept:operator",
+      type: "concept",
+      kind: "operator",
+      label: "Operator",
+      metadata: { visualTier: "mid" },
+      layoutHint: { x: -58, y: 46, z: 61 },
+    },
+    {
+      id: "concept:signal",
+      type: "concept",
+      kind: "signal",
+      label: "Signal",
+      metadata: { visualTier: "far" },
+      layoutHint: { x: 117, y: 76, z: -58 },
     },
   ],
   links: [
@@ -87,6 +451,62 @@ const graphInput = {
       occurrences: [{ id: "profile-api:runtime", ordinal: 0 }],
       metadata: { policy: "runtime" },
     },
+    { id: "ingest-source", source: "relation:ingest", target: "concept:source", relationKind: "reads", ordinal: 4 },
+    { id: "source-event", source: "concept:source", target: "concept:event", relationKind: "emits", ordinal: 5 },
+    { id: "event-schema", source: "concept:event", target: "concept:schema", relationKind: "conforms-to", ordinal: 6 },
+    { id: "schema-index", source: "concept:schema", target: "concept:index", relationKind: "indexes", ordinal: 7 },
+    { id: "index-query", source: "concept:index", target: "relation:query", relationKind: "serves", ordinal: 8 },
+    { id: "query-evidence", source: "relation:query", target: "concept:evidence", relationKind: "returns", ordinal: 9 },
+    { id: "evidence-policy", source: "concept:evidence", target: "concept:policy", relationKind: "checks", ordinal: 10 },
+    { id: "policy-permission", source: "concept:policy", target: "concept:permission", relationKind: "permits", ordinal: 11 },
+    { id: "permission-boundary", source: "concept:permission", target: "concept:boundary", relationKind: "guards", ordinal: 12 },
+    { id: "review-contract", source: "relation:review", target: "concept:contract", relationKind: "reviews", ordinal: 13 },
+    { id: "contract-registry", source: "concept:contract", target: "concept:registry", relationKind: "records", ordinal: 14 },
+    { id: "registry-artifact", source: "concept:registry", target: "concept:artifact", relationKind: "stores", ordinal: 15 },
+    { id: "handoff-artifact", source: "relation:handoff", target: "concept:artifact", relationKind: "hands-off", ordinal: 16 },
+    { id: "handoff-memory", source: "relation:handoff", target: "concept:memory", relationKind: "summarizes", ordinal: 17 },
+    { id: "memory-context", source: "concept:memory", target: "concept:context", relationKind: "restores", ordinal: 18 },
+    { id: "context-session", source: "concept:context", target: "concept:session", relationKind: "bounds", ordinal: 19 },
+    { id: "session-turn", source: "concept:session", target: "concept:turn", relationKind: "contains", ordinal: 20 },
+    { id: "turn-task", source: "concept:turn", target: "concept:task", relationKind: "advances", ordinal: 21 },
+    { id: "task-workflow", source: "concept:task", target: "concept:workflow", relationKind: "follows", ordinal: 22 },
+    { id: "workflow-hook", source: "concept:workflow", target: "concept:hook", relationKind: "calls", ordinal: 23 },
+    { id: "hook-tool", source: "concept:hook", target: "concept:tool", relationKind: "exposes", ordinal: 24 },
+    { id: "tool-trace", source: "concept:tool", target: "concept:trace", relationKind: "produces", ordinal: 25 },
+    { id: "trace-state", source: "concept:trace", target: "concept:state", relationKind: "observes", ordinal: 26 },
+    { id: "state-queue", source: "concept:state", target: "component:queue", relationKind: "queues", ordinal: 27 },
+    { id: "queue-controller", source: "component:queue", target: "component:controller", relationKind: "dispatches", ordinal: 28 },
+    { id: "controller-cache", source: "component:controller", target: "component:cache", relationKind: "hydrates", ordinal: 29 },
+    { id: "orchestrate-task", source: "relation:orchestrate", target: "concept:task", relationKind: "assigns", ordinal: 30 },
+    { id: "task-branch", source: "concept:task", target: "concept:branch", relationKind: "tracks", ordinal: 31 },
+    { id: "branch-review-thread", source: "concept:branch", target: "concept:review-thread", relationKind: "opens", ordinal: 32 },
+    { id: "review-thread-check", source: "concept:review-thread", target: "concept:check", relationKind: "requires", ordinal: 33 },
+    { id: "check-promote", source: "concept:check", target: "relation:promote", relationKind: "permits", ordinal: 34 },
+    { id: "promote-release", source: "relation:promote", target: "relation:release", relationKind: "promotes", ordinal: 35 },
+    { id: "release-signal", source: "relation:release", target: "concept:signal", relationKind: "emits", ordinal: 36 },
+    { id: "signal-owner", source: "concept:signal", target: "concept:owner", relationKind: "alerts", ordinal: 37 },
+    { id: "owner-operator", source: "concept:owner", target: "concept:operator", relationKind: "routes", ordinal: 38 },
+    { id: "operator-ledger", source: "concept:operator", target: "concept:ledger", relationKind: "records", ordinal: 39 },
+    { id: "ledger-snapshot", source: "concept:ledger", target: "concept:snapshot", relationKind: "captures", ordinal: 40 },
+    { id: "snapshot-delta", source: "concept:snapshot", target: "concept:delta", relationKind: "compares", ordinal: 41 },
+    { id: "delta-vector", source: "concept:delta", target: "concept:vector", relationKind: "indexes", ordinal: 42 },
+    { id: "vector-model", source: "concept:vector", target: "concept:model", relationKind: "retrieves", ordinal: 43 },
+    { id: "model-provider", source: "concept:model", target: "concept:provider", relationKind: "runs-on", ordinal: 44 },
+    { id: "provider-token", source: "concept:provider", target: "concept:token", relationKind: "bills", ordinal: 45 },
+    { id: "ingest-ledger", source: "relation:ingest", target: "concept:ledger", relationKind: "persists", ordinal: 46 },
+    { id: "query-vector", source: "relation:query", target: "concept:vector", relationKind: "searches", ordinal: 47 },
+    { id: "review-owner", source: "relation:review", target: "concept:owner", relationKind: "notifies", ordinal: 48 },
+    { id: "handoff-snapshot", source: "relation:handoff", target: "concept:snapshot", relationKind: "preserves", ordinal: 49 },
+    { id: "context-model", source: "concept:context", target: "concept:model", relationKind: "conditions", ordinal: 50 },
+    { id: "workflow-operator", source: "concept:workflow", target: "concept:operator", relationKind: "coordinates", ordinal: 51 },
+    { id: "hook-provider", source: "concept:hook", target: "concept:provider", relationKind: "calls", ordinal: 52 },
+    { id: "tool-check", source: "concept:tool", target: "concept:check", relationKind: "verifies", ordinal: 53 },
+    { id: "trace-delta", source: "concept:trace", target: "concept:delta", relationKind: "measures", ordinal: 54 },
+    { id: "state-ledger", source: "concept:state", target: "concept:ledger", relationKind: "restores", ordinal: 55 },
+    { id: "cache-token", source: "component:cache", target: "concept:token", relationKind: "caches", ordinal: 56 },
+    { id: "controller-signal", source: "component:controller", target: "concept:signal", relationKind: "observes", ordinal: 57 },
+    { id: "queue-owner", source: "component:queue", target: "concept:owner", relationKind: "assigns", ordinal: 58 },
+    { id: "inspect-evidence", source: "relation:inspect", target: "concept:evidence", relationKind: "inspects", ordinal: 59 },
   ],
 } as const satisfies GraphInput;
 
@@ -117,6 +537,17 @@ interface ObservedScreenPositionTelemetry {
 }
 
 type ScreenPositionTelemetry = ObservedScreenPositionTelemetry | UnavailableTelemetry;
+
+interface ObservedNodeProjectionTelemetry {
+  readonly availability: "observed";
+  readonly projections: readonly {
+    readonly id: string;
+    readonly x: number;
+    readonly y: number;
+  }[];
+}
+
+type NodeProjectionTelemetry = ObservedNodeProjectionTelemetry | UnavailableTelemetry;
 
 interface UnknownTelemetry {
   readonly availability: "unknown";
@@ -164,27 +595,17 @@ const masterNodeId = graphInput.nodes.find((node) => node.roles?.includes("maste
 const graphPresentationByMode = {
   light: {
     linkColor: "#4b5a70",
-    nodeColors: {
-      "component:api": "#64748b",
-      "component:web": "#64748b",
-      "profile:platform": "#64748b",
-      "relation:release": "#64748b",
-    },
+    nodeColor: "#64748b",
   },
   dark: {
     linkColor: "#aaa7c2",
-    nodeColors: {
-      "component:api": "#475569",
-      "component:web": "#475569",
-      "profile:platform": "#475569",
-      "relation:release": "#475569",
-    },
+    nodeColor: "#475569",
   },
 } as const satisfies Record<
   ResolvedMode,
   {
     readonly linkColor: string;
-    readonly nodeColors: Readonly<Record<(typeof graphInput.nodes)[number]["id"], string>>;
+    readonly nodeColor: string;
   }
 >;
 
@@ -205,7 +626,7 @@ function applySystemPresentation(
       graphInput.links.map((link) => [link.id, { color: palette.linkColor }]),
     ),
     nodeDescriptors: Object.fromEntries(
-      graphInput.nodes.map((node) => [node.id, { color: palette.nodeColors[node.id] }]),
+      graphInput.nodes.map((node) => [node.id, { color: palette.nodeColor }]),
     ),
     reducedMotion,
     selectedNodeIds: selection.nodeId ? [selection.nodeId] : [],
@@ -323,6 +744,7 @@ export function BrowserGraphFixture() {
   const motionFramesRef = useRef<MotionTelemetryFrame[]>([]);
   const motionGenerationRef = useRef<number | null>(null);
   const motionPublishedKeyRef = useRef("");
+  const nodeProjectionPublishedKeyRef = useRef("");
   const reducedMotionRef = useRef(false);
   const workbenchRef = useRef<GraphWorkbench | null>(null);
   const rendererReadyRef = useRef(false);
@@ -338,6 +760,10 @@ export function BrowserGraphFixture() {
   const [masterScreenPosition, setMasterScreenPosition] = useState<ScreenPositionTelemetry>({
     availability: "pending",
     reason: null,
+  });
+  const [nodeProjectionTelemetry, setNodeProjectionTelemetry] = useState<NodeProjectionTelemetry>({
+    availability: "unavailable",
+    reason: "Waiting for renderer projection support.",
   });
   const [renderTelemetry, setRenderTelemetry] = useState<RenderTelemetry>({
     availability: "pending",
@@ -465,10 +891,12 @@ export function BrowserGraphFixture() {
       setSelectionTelemetry({ availability: "unavailable", reason });
       setSelectedScreenPosition({ availability: "unavailable", reason });
       setMasterScreenPosition({ availability: "unavailable", reason });
+      setNodeProjectionTelemetry({ availability: "unavailable", reason });
       setRenderTelemetry({ availability: "unavailable", reason });
       motionFramesRef.current = [];
       motionGenerationRef.current = null;
       motionPublishedKeyRef.current = "";
+      nodeProjectionPublishedKeyRef.current = "";
       setMotionTelemetry({ availability: "unavailable", reason });
       if (destroy) {
         workbenchRef.current?.destroy();
@@ -563,7 +991,10 @@ export function BrowserGraphFixture() {
             setSelectionState(workbench.getSelectionState());
             fitFrame = window.requestAnimationFrame(() => {
               fitFrame = window.requestAnimationFrame(() => {
-                if (!disposed && rendererReadyRef.current) workbench.fit(0);
+                if (!disposed && rendererReadyRef.current) {
+                  workbench.fit(0);
+                  window.requestAnimationFrame(() => workbench.zoom(1.15));
+                }
               });
             });
             return;
@@ -762,6 +1193,37 @@ export function BrowserGraphFixture() {
     };
 
     animationFrame = window.requestAnimationFrame(sampleMotion);
+    return () => {
+      disposed = true;
+      if (animationFrame !== null) window.cancelAnimationFrame(animationFrame);
+    };
+  }, [renderer.status, rendererAvailable]);
+
+  useEffect(() => {
+    if (renderer.status === "failed" || !rendererAvailable) return undefined;
+
+    let animationFrame: number | null = null;
+    let disposed = false;
+    const sampleNodeProjections = () => {
+      if (disposed) return;
+      const workbench = workbenchRef.current;
+      const projections = graphInput.nodes.flatMap((node) => {
+        const position = workbench?.getNodeScreenPosition(node.id) ?? null;
+        return position && Number.isFinite(position.x) && Number.isFinite(position.y)
+          ? [{ id: node.id, x: position.x, y: position.y }]
+          : [];
+      });
+      if (projections.length === graphInput.nodes.length) {
+        const key = projections.map(({ id, x, y }) => `${id}:${x.toFixed(2)}:${y.toFixed(2)}`).join("|");
+        if (key !== nodeProjectionPublishedKeyRef.current) {
+          nodeProjectionPublishedKeyRef.current = key;
+          setNodeProjectionTelemetry({ availability: "observed", projections });
+        }
+      }
+      animationFrame = window.requestAnimationFrame(sampleNodeProjections);
+    };
+
+    animationFrame = window.requestAnimationFrame(sampleNodeProjections);
     return () => {
       disposed = true;
       if (animationFrame !== null) window.cancelAnimationFrame(animationFrame);
@@ -1199,6 +1661,7 @@ export function BrowserGraphFixture() {
           <Telemetry testId="graph-settled-layout" value={layoutTelemetry} />
           <Telemetry testId="graph-selected-screen-position" value={selectedScreenPosition} />
           <Telemetry testId="graph-master-screen-position" value={masterScreenPosition} />
+          <Telemetry testId="graph-node-projections" value={nodeProjectionTelemetry} />
           <Telemetry testId="graph-camera-state" value={selectedScreenPosition} />
           <Telemetry testId="camera-transition-status" value={selectedScreenPosition} />
           <Telemetry testId="graph-motion-observation" value={motionTelemetry} />

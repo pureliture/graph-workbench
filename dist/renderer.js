@@ -1,9 +1,17 @@
 import ForceGraph3D from "3d-force-graph";
-import { BackSide, BufferGeometry, Color, Float32BufferAttribute, Group, Line, LineBasicMaterial, Mesh, MeshBasicMaterial, MeshStandardMaterial, SphereGeometry, } from "three";
+import { BufferGeometry, CanvasTexture, Color, Float32BufferAttribute, Group, Line, LineBasicMaterial, Mesh, MeshStandardMaterial, NoColorSpace, Sprite, SpriteMaterial, SphereGeometry, } from "three";
 function boundedOpacity(value, fallback) {
     if (!Number.isFinite(value))
         return fallback;
     return Math.max(0, Math.min(1, value));
+}
+function stableUnit(value) {
+    let state = 2166136261;
+    for (let index = 0; index < value.length; index += 1) {
+        state ^= value.charCodeAt(index);
+        state = Math.imul(state, 16777619);
+    }
+    return (state >>> 0) / 0xffffffff;
 }
 // These are the semantic Three.js colors from routine-harness's Tauri graph.
 // The interaction choreography is intentionally independent of the palette.
@@ -23,6 +31,14 @@ const THEME_PALETTES = {
         rim: "#0f172a",
     },
 };
+// Static labels are the primary way to identify a node. Keep this independent
+// from the quieter body/edge treatment of distant nodes so every name remains
+// readable against the routine-harness background.
+const STATIC_LABEL_OPACITY = Object.freeze({
+    far: 0.72,
+    neighbor: 0.82,
+    selected: 1,
+});
 function themePalette(theme) {
     return theme === "light" ? THEME_PALETTES.light : THEME_PALETTES.dark;
 }
@@ -61,6 +77,11 @@ function materialLineWidth(material) {
         return null;
     const lineWidth = material.linewidth;
     return typeof lineWidth === "number" && Number.isFinite(lineWidth) ? lineWidth : null;
+}
+function materialDepthWrite(material) {
+    if (!material || typeof material !== "object" || !("depthWrite" in material))
+        return null;
+    return typeof material.depthWrite === "boolean" ? material.depthWrite : null;
 }
 function materialsForObject(object) {
     const material = object.material;
@@ -114,6 +135,30 @@ function visibleMaterialLineWidths(object) {
     });
     return widths;
 }
+function objectTransformObservation(id, object) {
+    if (!object)
+        return { position: null, scale: null };
+    return {
+        position: { id, x: object.position.x, y: object.position.y, z: object.position.z },
+        scale: { id, x: object.scale.x, y: object.scale.y, z: object.scale.z },
+    };
+}
+function nodeLabelObservation(id, label, scene) {
+    const material = label ? materialsForObject(label)[0] : undefined;
+    const alphaMasked = material && typeof material === "object" && "alphaMap" in material
+        ? material.alphaMap !== null
+        : null;
+    const transparent = material && typeof material === "object" && "transparent" in material
+        && typeof material.transparent === "boolean"
+        ? material.transparent
+        : null;
+    return {
+        ...observeGraphObject(id, label ?? undefined, scene),
+        ...objectTransformObservation(id, label ?? undefined),
+        alphaMasked,
+        transparent,
+    };
+}
 function updateObjectMaterials(object, update) {
     object.traverse((candidate) => {
         materialsForObject(candidate).forEach((material) => {
@@ -123,7 +168,11 @@ function updateObjectMaterials(object, update) {
                 material.opacity = update.opacity;
             }
             if ("transparent" in material && typeof material.transparent === "boolean") {
-                material.transparent = update.opacity < 1;
+                // Sprite labels carry their glyph mask in texture alpha. They must
+                // remain transparent even at opacity 1 or WebGL treats the empty canvas
+                // pixels as an opaque black rectangle.
+                material.transparent = ("isSpriteMaterial" in material && material.isSpriteMaterial === true)
+                    || update.opacity < 1;
             }
             if (update.emissiveIntensity !== undefined
                 && "emissiveIntensity" in material
@@ -165,6 +214,64 @@ function observeGraphObject(id, object, scene) {
         visibleMaterialOpacities: opacities,
     };
 }
+function createNodeLabelSprite(label, radius, opacity) {
+    const text = label.trim() || "Untitled";
+    const spriteMaterial = new SpriteMaterial({
+        color: THEME_PALETTES.dark.outline,
+        depthTest: true,
+        depthWrite: false,
+        alphaTest: 0.001,
+        opacity,
+        sizeAttenuation: true,
+        // Canvas glyph alpha is independent from the node's semantic opacity.
+        // Keep blending on at opacity 1 so transparent canvas pixels never become
+        // a dark rectangular backing behind selected labels.
+        transparent: true,
+    });
+    if (typeof document !== "undefined") {
+        const canvas = document.createElement("canvas");
+        const context = canvas.getContext("2d");
+        if (context) {
+            const fontSize = 56;
+            context.font = `600 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+            const horizontalPadding = 34;
+            canvas.width = Math.ceil(context.measureText(text).width + (horizontalPadding * 2));
+            canvas.height = 96;
+            context.font = `600 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+            context.fillStyle = "#ffffff";
+            context.textAlign = "center";
+            context.textBaseline = "middle";
+            context.fillText(text, canvas.width / 2, canvas.height / 2 + 2);
+            const texture = new CanvasTexture(canvas);
+            // Treat the canvas as a glyph mask. Using alphaMap, rather than a color
+            // map with transparent pixels, prevents opaque dark canvas rectangles
+            // when a selected label reaches material opacity 1.
+            texture.colorSpace = NoColorSpace;
+            spriteMaterial.alphaMap = texture;
+            // Three.js materials do not dispose maps they reference. The label is
+            // recreated when graphData changes, so retain this exact texture in the
+            // material lifecycle and release it once when the SpriteMaterial goes
+            // away. The guard matters because Material.dispose() dispatches on every
+            // call rather than making disposal idempotent itself.
+            let textureDisposed = false;
+            spriteMaterial.addEventListener("dispose", () => {
+                if (textureDisposed)
+                    return;
+                textureDisposed = true;
+                texture.dispose();
+            });
+            spriteMaterial.needsUpdate = true;
+        }
+    }
+    const sprite = new Sprite(spriteMaterial);
+    sprite.center.set(0.5, 0);
+    sprite.position.set(0, radius + 3.8, 0);
+    sprite.scale.set(Math.max(17, Math.min(58, text.length * 3.05)), radius >= 7 ? 10 : 8, 1);
+    sprite.userData.graphBaseLabelScale = { x: sprite.scale.x, y: sprite.scale.y, z: sprite.scale.z };
+    sprite.renderOrder = 42;
+    sprite.userData.graphVisualRole = "node-label";
+    return sprite;
+}
 export function createDefaultGraphNodeObject(node, descriptor) {
     const color = new Color(defaultNodeColor(node, descriptor));
     const opacity = boundedOpacity(descriptor?.opacity, 1);
@@ -184,38 +291,23 @@ export function createDefaultGraphNodeObject(node, descriptor) {
     const body = new Mesh(geometry, bodyMaterial);
     body.userData.graphVisualRole = "body";
     group.add(body);
-    const outline = new Mesh(geometry, new MeshBasicMaterial({
-        color: THEME_PALETTES.dark.outline,
-        depthWrite: false,
-        opacity,
-        side: BackSide,
-        transparent: opacity < 1,
-    }));
-    outline.scale.setScalar(1.08);
-    outline.userData.graphVisualRole = "outline";
-    group.add(outline);
-    const rim = new Mesh(geometry, new MeshBasicMaterial({
-        color: THEME_PALETTES.dark.rim,
-        depthWrite: false,
-        opacity,
-        side: BackSide,
-        transparent: opacity < 1,
-    }));
-    rim.renderOrder = 28;
-    rim.scale.setScalar(1.16);
-    rim.userData.graphVisualRole = "focus-rim";
-    rim.visible = false;
-    group.add(rim);
+    // Keep the reference's soft, filled node masses. Selection is carried by
+    // scale, the label and edge hierarchy instead of a permanent outline shell
+    // or a bright halo around the focused node.
+    group.add(createNodeLabelSprite(descriptor?.label ?? node.label, radius, opacity));
     group.userData.graphNodeId = node.id;
     group.userData.graphDefaultNodeObject = true;
     return group;
 }
 export function createDefaultGraphLinkObject(link, descriptor) {
     const geometry = new BufferGeometry();
-    geometry.setAttribute("position", new Float32BufferAttribute([0, 0, 0, 0, 0, 0], 3));
+    // A restrained three-point path is enough to make overlapping relationships
+    // readable in depth without turning the graph into a decorative spline map.
+    geometry.setAttribute("position", new Float32BufferAttribute([0, 0, 0, 0, 0, 0, 0, 0, 0], 3));
     const opacity = boundedOpacity(descriptor?.opacity, 0.68);
     const material = new LineBasicMaterial({
         color: defaultLinkColor(descriptor),
+        depthWrite: false,
         linewidth: descriptor?.width,
         opacity,
         transparent: opacity < 1,
@@ -228,10 +320,24 @@ function updateLinkObject(object, start, end) {
     if (!(object instanceof Line))
         return false;
     const positions = object.geometry.getAttribute("position");
-    if (!positions || positions.itemSize !== 3)
+    if (!positions || positions.itemSize !== 3 || positions.count < 2)
         return false;
     positions.setXYZ(0, start.x, start.y, start.z);
-    positions.setXYZ(1, end.x, end.y, end.z);
+    if (positions.count >= 3) {
+        const deltaX = end.x - start.x;
+        const deltaY = end.y - start.y;
+        const planarDistance = Math.hypot(deltaX, deltaY);
+        const curve = Math.max(3, Math.min(18, planarDistance * 0.12));
+        const direction = planarDistance > 0
+            ? { x: deltaX / planarDistance, y: deltaY / planarDistance }
+            : { x: 1, y: 0 };
+        const bendDirection = stableUnit(`${String(object.userData.graphLinkId ?? "link")}:curve`) >= 0.5 ? 1 : -1;
+        positions.setXYZ(1, ((start.x + end.x) / 2) + (-direction.y * curve * bendDirection), ((start.y + end.y) / 2) + (direction.x * curve * bendDirection), ((start.z + end.z) / 2) + (curve * 0.32 * bendDirection));
+        positions.setXYZ(2, end.x, end.y, end.z);
+    }
+    else {
+        positions.setXYZ(1, end.x, end.y, end.z);
+    }
     positions.needsUpdate = true;
     object.geometry.computeBoundingSphere();
     return true;
@@ -295,18 +401,21 @@ function interpolatePose(start, end, progress) {
 }
 function boundedPerspectiveProjection(camera, viewport) {
     const candidate = camera;
-    const suppliedAspect = typeof candidate?.aspect === "number" ? candidate.aspect : Number.NaN;
     const suppliedFov = typeof candidate?.fov === "number" ? candidate.fov : Number.NaN;
     return {
-        aspect: Number.isFinite(suppliedAspect) && suppliedAspect > 0
-            ? suppliedAspect
-            : viewport.width / viewport.height,
+        // ResizeObserver updates the workbench viewport before ThreeForceGraph
+        // necessarily updates `camera.aspect` on its next render tick. Framing
+        // must use that authoritative viewport now, otherwise a stale desktop
+        // aspect produces a too-wide FOV and crops the selected mobile cloud.
+        aspect: Number.isFinite(viewport.width / viewport.height) && viewport.width > 0 && viewport.height > 0
+            ? viewport.width / viewport.height
+            : 1,
         fovDegrees: Number.isFinite(suppliedFov)
             ? Math.max(20, Math.min(100, suppliedFov))
             : 50,
     };
 }
-function contextCameraPose(points, current, projection, viewport) {
+function contextCameraPose(points, current, projection, viewport, focalPoint = null) {
     if (points.length === 0)
         return null;
     const minimum = { x: Infinity, y: Infinity, z: Infinity };
@@ -319,21 +428,20 @@ function contextCameraPose(points, current, projection, viewport) {
         maximum.y = Math.max(maximum.y, point.y + point.radius);
         maximum.z = Math.max(maximum.z, point.z + point.radius);
     });
-    const center = {
+    const boundsCenter = {
         x: (minimum.x + maximum.x) / 2,
         y: (minimum.y + maximum.y) / 2,
         z: (minimum.z + maximum.z) / 2,
     };
-    const radius = Math.max(...points.map((point) => (Math.hypot(point.x - center.x, point.y - center.y, point.z - center.z) + point.radius)));
-    const verticalHalfFov = (projection.fovDegrees * Math.PI) / 360;
-    const horizontalHalfFov = Math.atan(Math.tan(verticalHalfFov) * projection.aspect);
-    const paddingPixels = Math.min(48, Math.max(24, Math.min(viewport.width, viewport.height) * 0.06));
-    const usableWidth = Math.max(0.5, (viewport.width - (paddingPixels * 2)) / viewport.width);
-    const usableHeight = Math.max(0.5, (viewport.height - (paddingPixels * 2)) / viewport.height);
-    const paddedHorizontalHalfFov = Math.atan(Math.tan(horizontalHalfFov) * usableWidth);
-    const paddedVerticalHalfFov = Math.atan(Math.tan(verticalHalfFov) * usableHeight);
-    const limitingHalfFov = Math.max(0.12, Math.min(paddedHorizontalHalfFov, paddedVerticalHalfFov));
-    const distance = Math.max(80, (radius * 1.12) / Math.sin(limitingHalfFov));
+    // Keep the focus close to the visual centre while sizing from the whole
+    // cloud. A small pull toward the bounds centre prevents cropped far nodes.
+    const center = focalPoint
+        ? {
+            x: focalPoint.x + ((boundsCenter.x - focalPoint.x) * 0.18),
+            y: focalPoint.y + ((boundsCenter.y - focalPoint.y) * 0.18),
+            z: focalPoint.z + ((boundsCenter.z - focalPoint.z) * 0.18),
+        }
+        : boundsCenter;
     const directionLength = Math.hypot(current.position.x - center.x, current.position.y - center.y, current.position.z - center.z);
     const direction = directionLength > 0
         ? {
@@ -342,6 +450,42 @@ function contextCameraPose(points, current, projection, viewport) {
             z: (current.position.z - center.z) / directionLength,
         }
         : { x: 0, y: 0, z: 1 };
+    const referenceUp = Math.abs(direction.y) > 0.94
+        ? { x: 0, y: 0, z: 1 }
+        : { x: 0, y: 1, z: 0 };
+    const rightLength = Math.hypot((referenceUp.y * direction.z) - (referenceUp.z * direction.y), (referenceUp.z * direction.x) - (referenceUp.x * direction.z), (referenceUp.x * direction.y) - (referenceUp.y * direction.x));
+    const right = {
+        x: ((referenceUp.y * direction.z) - (referenceUp.z * direction.y)) / rightLength,
+        y: ((referenceUp.z * direction.x) - (referenceUp.x * direction.z)) / rightLength,
+        z: ((referenceUp.x * direction.y) - (referenceUp.y * direction.x)) / rightLength,
+    };
+    const up = {
+        x: (direction.y * right.z) - (direction.z * right.y),
+        y: (direction.z * right.x) - (direction.x * right.z),
+        z: (direction.x * right.y) - (direction.y * right.x),
+    };
+    const verticalHalfFov = (projection.fovDegrees * Math.PI) / 360;
+    const horizontalHalfFov = Math.atan(Math.tan(verticalHalfFov) * projection.aspect);
+    const paddingPixels = Math.min(36, Math.max(16, Math.min(viewport.width, viewport.height) * 0.035));
+    const usableWidth = Math.max(0.5, (viewport.width - (paddingPixels * 2)) / viewport.width);
+    const usableHeight = Math.max(0.5, (viewport.height - (paddingPixels * 2)) / viewport.height);
+    const paddedHorizontalHalfFov = Math.atan(Math.tan(horizontalHalfFov) * usableWidth);
+    const paddedVerticalHalfFov = Math.atan(Math.tan(verticalHalfFov) * usableHeight);
+    // A point's projected bounds widen as it approaches the camera. Sizing only
+    // from its view-plane radius (and then tightening it with a presentation
+    // multiplier) can crop nearer, off-axis nodes. Fit every node sphere against
+    // its nearest possible depth instead: `d - depth - radius`. This keeps the
+    // entire cloud within the padded desktop and mobile viewports while retaining
+    // the focal-point bias above.
+    const distance = Math.max(80, ...points.map((point) => {
+        const delta = { x: point.x - center.x, y: point.y - center.y, z: point.z - center.z };
+        const depth = (delta.x * direction.x) + (delta.y * direction.y) + (delta.z * direction.z);
+        const horizontal = Math.abs((delta.x * right.x) + (delta.y * right.y) + (delta.z * right.z));
+        const vertical = Math.abs((delta.x * up.x) + (delta.y * up.y) + (delta.z * up.z));
+        const horizontalDistance = (horizontal + point.radius) / Math.tan(paddedHorizontalHalfFov);
+        const verticalDistance = (vertical + point.radius) / Math.tan(paddedVerticalHalfFov);
+        return depth + point.radius + Math.max(horizontalDistance, verticalDistance);
+    }));
     return {
         position: {
             x: center.x + (direction.x * distance),
@@ -389,6 +533,37 @@ function graphChildWithRole(object, role) {
             found = candidate;
     });
     return found;
+}
+function sceneVisualForNode(node, data, descriptor) {
+    const baseOpacity = boundedOpacity(descriptor.opacity, node.visual.opacity);
+    const isSelected = data.selection.nodeId === node.id;
+    const isNeighbor = data.selection.neighborNodeIds.includes(node.id);
+    // The initial camera faces the positive Z direction. A stable world-space
+    // depth cue therefore gives receding nodes smaller, quieter silhouettes even
+    // before the user starts orbiting; selection keeps the active node crisp.
+    const depthProgress = Math.max(0, Math.min(1, (node.z + 132) / 264));
+    const depthScale = 0.72 + (depthProgress * 0.28);
+    const depthOpacity = 0.7 + (depthProgress * 0.3);
+    const viewportScale = Math.max(1, Math.min(1.3, 480 / Math.max(1, Math.min(data.selection.viewport.width, data.selection.viewport.height))));
+    const labelOpacity = data.selection.nodeId === null
+        ? Math.max(STATIC_LABEL_OPACITY.far, baseOpacity * depthOpacity)
+        : isSelected
+            ? STATIC_LABEL_OPACITY.selected
+            : isNeighbor
+                // Preserve some near-depth distinction without letting a neighbor
+                // equal the selected label or fall into the far-label readability tier.
+                ? Math.max(STATIC_LABEL_OPACITY.neighbor, Math.min(0.9, baseOpacity * depthOpacity))
+                : STATIC_LABEL_OPACITY.far;
+    return {
+        // Bodies can recede with depth, while node names retain a high-contrast
+        // floor. Counteracting the group depth scale and boosting narrow viewports
+        // makes distant labels readable without reviving outlines or focus rings.
+        labelVisible: true,
+        labelOpacity,
+        labelScale: (isSelected ? 1 : 1 / depthScale) * viewportScale,
+        opacity: Math.max(node.visual.opacityFloor, isSelected ? baseOpacity : baseOpacity * depthOpacity),
+        scale: isSelected ? 1.22 : depthScale,
+    };
 }
 function setObjectMaterialColor(object, color) {
     if (!object)
@@ -457,7 +632,10 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         .nodeId("id")
         .linkSource("source")
         .linkTarget("target")
-        .nodeLabel((node) => node.visual.labelCue === "muted" ? "" : nodeDescriptor(node).label ?? node.label)
+        // Static Sprite labels are the scene's source of truth. Disabling the
+        // vendor HTML tooltip avoids an opaque duplicate over the camera-facing
+        // label while keeping the host callback seam unchanged.
+        .nodeLabel(() => "")
         .nodeThreeObject((node) => {
         const object = nodeObjectFactory(node, nodeDescriptor(node));
         renderedNodeObjects.set(node.id, object);
@@ -505,6 +683,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         setObjectMaterialColor(graphChildWithRole(object, "body"), descriptor.color ?? palette.body);
         setObjectMaterialColor(graphChildWithRole(object, "outline"), palette.outline);
         setObjectMaterialColor(graphChildWithRole(object, "focus-rim"), palette.rim);
+        setObjectMaterialColor(graphChildWithRole(object, "node-label"), palette.outline);
     }
     function applyLinkPalette(link) {
         const object = renderedLinkObjects.get(link.id);
@@ -512,7 +691,22 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             return;
         setObjectMaterialColor(object, linkDescriptor(link).color ?? themePalette(currentPresentation.theme).edge);
     }
-    function applyNodeVisual(node, opacity, scale, rimOpacity) {
+    function staticLabelBaseScale(label) {
+        const stored = label.userData.graphBaseLabelScale;
+        if (stored && [stored.x, stored.y, stored.z].every((value) => typeof value === "number" && Number.isFinite(value))) {
+            return { x: stored.x, y: stored.y, z: stored.z };
+        }
+        const base = { x: label.scale.x, y: label.scale.y, z: label.scale.z };
+        label.userData.graphBaseLabelScale = base;
+        return base;
+    }
+    function staticLabelScaleMultiplier(label) {
+        if (!label)
+            return 1;
+        const base = staticLabelBaseScale(label);
+        return base.x > 0 ? label.scale.x / base.x : 1;
+    }
+    function applyNodeVisual(node, opacity, scale, rimOpacity, labelVisible, labelOpacity, labelScale) {
         const object = renderedNodeObjects.get(node.id);
         if (!object)
             return;
@@ -524,10 +718,17 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             object.scale.setScalar(scale);
         }
         const rim = graphChildWithRole(object, "focus-rim");
-        if (!rim)
-            return;
-        rim.visible = rimOpacity > 0;
-        setObjectMaterialOpacity(rim, rimOpacity);
+        if (rim) {
+            rim.visible = rimOpacity > 0;
+            setObjectMaterialOpacity(rim, rimOpacity);
+        }
+        const label = graphChildWithRole(object, "node-label");
+        if (label) {
+            label.visible = labelVisible;
+            setObjectMaterialOpacity(label, labelOpacity);
+            const base = staticLabelBaseScale(label);
+            label.scale.set(base.x * labelScale, base.y * labelScale, base.z * labelScale);
+        }
     }
     function applyLinkVisual(link, opacity, width) {
         const object = renderedLinkObjects.get(link.id);
@@ -538,8 +739,9 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     function applyFinalVisuals(data) {
         data.nodes.forEach((node) => {
             const descriptor = nodeDescriptor(node);
+            const visual = sceneVisualForNode(node, data, descriptor);
             applyNodePalette(node);
-            applyNodeVisual(node, boundedOpacity(descriptor.opacity, node.visual.opacity), data.selection.nodeId === node.id ? 1.06 : 1, data.selection.nodeId === node.id ? boundedOpacity(descriptor.opacity, node.visual.opacity) : 0);
+            applyNodeVisual(node, visual.opacity, visual.scale, data.selection.nodeId === node.id ? visual.opacity : 0, visual.labelVisible, visual.labelOpacity, visual.labelScale);
         });
         data.links.forEach((link) => {
             const descriptor = linkDescriptor(link);
@@ -582,24 +784,31 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const previousFocusNodeId = previousData.selection.nodeId;
         const nodes = data.nodes.map((node) => {
             const descriptor = nodeDescriptor(node);
+            const targetVisual = sceneVisualForNode(node, data, descriptor);
             const previousNode = previousNodeById.get(node.id);
             const previousObject = renderedNodeObjects.get(node.id);
-            const previousOpacity = previousNode
-                ? boundedOpacity(descriptorForNode(previousNode, previousData.presentation.nodeDescriptors?.[node.id]).opacity, previousNode.visual.opacity)
-                : boundedOpacity(descriptor.opacity, node.visual.opacity);
+            const previousVisual = previousNode
+                ? sceneVisualForNode(previousNode, previousData, descriptorForNode(previousNode, previousData.presentation.nodeDescriptors?.[node.id]))
+                : targetVisual;
             const start = startPositions.get(node.id) ?? nodePosition(node);
             const rim = previousObject ? graphChildWithRole(previousObject, "focus-rim") : null;
+            const label = previousObject ? graphChildWithRole(previousObject, "node-label") : null;
             return {
                 id: node.id,
                 start,
                 target: nodePosition(node),
-                startOpacity: firstMaterialOpacity(previousObject, previousOpacity),
+                startLabelOpacity: firstMaterialOpacity(label ?? undefined, previousVisual.labelOpacity),
+                startLabelScale: staticLabelScaleMultiplier(label),
+                targetLabelVisible: targetVisual.labelVisible,
+                targetLabelOpacity: targetVisual.labelOpacity,
+                targetLabelScale: targetVisual.labelScale,
+                startOpacity: firstMaterialOpacity(previousObject, previousVisual.opacity),
                 startRimOpacity: rim?.visible === true
-                    ? firstMaterialOpacity(rim, previousOpacity)
+                    ? firstMaterialOpacity(rim, previousVisual.opacity)
                     : 0,
                 startScale: previousObject?.scale.x ?? 1,
-                targetOpacity: boundedOpacity(descriptor.opacity, node.visual.opacity),
-                targetScale: targetFocusNodeId === node.id ? 1.06 : 1,
+                targetOpacity: targetVisual.opacity,
+                targetScale: targetVisual.scale,
             };
         });
         const links = data.links.map((link) => {
@@ -671,7 +880,11 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             else if (transition.id === scene.targetFocusNodeId) {
                 rimOpacity = transition.targetOpacity;
             }
-            applyNodeVisual(targetNode, final ? transition.targetOpacity : interpolate(transition.startOpacity, transition.targetOpacity, eased), final ? transition.targetScale : scale, final && transition.id === scene.targetFocusNodeId ? transition.targetOpacity : rimOpacity);
+            applyNodeVisual(targetNode, final ? transition.targetOpacity : interpolate(transition.startOpacity, transition.targetOpacity, eased), final ? transition.targetScale : scale, final && transition.id === scene.targetFocusNodeId ? transition.targetOpacity : rimOpacity, transition.targetLabelVisible, final
+                ? transition.targetLabelOpacity
+                : interpolate(transition.startLabelOpacity, transition.targetLabelOpacity, eased), final
+                ? transition.targetLabelScale
+                : interpolate(transition.startLabelScale, transition.targetLabelScale, eased));
         });
         scene.links.forEach((transition) => {
             const targetLink = targetLinkById.get(transition.id);
@@ -882,27 +1095,20 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         });
     }
     function nodeCameraTarget(nodeId) {
-        if (!currentData?.nodes.some((candidate) => candidate.id === nodeId))
+        const focused = currentData?.nodes.find((candidate) => candidate.id === nodeId);
+        if (!currentData || !focused)
             return null;
-        const contextNodeIds = new Set([
-            nodeId,
-            ...(currentData.selection.nodeId === nodeId ? currentData.selection.neighborNodeIds : []),
-            ...currentData.nodes
-                .filter((node) => node.roles?.includes("master"))
-                .map((node) => node.id),
-        ]);
+        const focalPoint = nodePosition(focused);
         const points = currentData.nodes.flatMap((node) => {
-            if (!contextNodeIds.has(node.id))
-                return [];
             const position = nodePosition(node);
             if (!position)
                 return [];
             const bodyRadius = node.type === "relation" ? 7.5 : 3;
-            const focusScale = node.id === nodeId ? 1.06 : 1;
+            const focusScale = node.id === nodeId ? 1.22 : 1;
             return [{ ...position, radius: bodyRadius * 1.16 * focusScale }];
         });
         const viewport = currentData.selection.viewport;
-        return contextCameraPose(points, cameraPose(), boundedPerspectiveProjection(graph.camera(), viewport), viewport);
+        return contextCameraPose(points, cameraPose(), boundedPerspectiveProjection(graph.camera(), viewport), viewport, focalPoint);
     }
     function transitionToNode(nodeId, options) {
         if (activeTransition)
@@ -936,8 +1142,14 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const node = nodesById.get(id);
             if (!node)
                 return;
+            const object = renderedNodeObjects.get(id);
+            const liveNode = data.nodes.find((candidate) => candidate.id === id);
+            const livePosition = nodePosition(liveNode) ?? nodePosition(node);
             nodes.push({
-                ...observeGraphObject(id, renderedNodeObjects.get(id), scene),
+                ...observeGraphObject(id, object, scene),
+                label: nodeLabelObservation(id, object ? graphChildWithRole(object, "node-label") : null, scene),
+                worldPosition: { id, ...livePosition },
+                worldScale: objectTransformObservation(id, object).scale,
                 visual: node.visual,
             });
         });
@@ -945,8 +1157,13 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const link = linksById.get(id);
             if (!link)
                 return;
+            const object = renderedLinkObjects.get(id);
+            const line = object instanceof Line ? object : null;
+            const material = line ? materialsForObject(line)[0] : undefined;
             links.push({
-                ...observeGraphObject(id, renderedLinkObjects.get(id), scene),
+                ...observeGraphObject(id, object, scene),
+                curvePointCount: line?.geometry.getAttribute("position")?.count ?? null,
+                depthWriteEnabled: materialDepthWrite(material),
                 visual: link.visual,
             });
         });
