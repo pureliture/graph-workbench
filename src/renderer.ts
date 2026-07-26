@@ -8,12 +8,14 @@ import {
   Line,
   LineBasicMaterial,
   Mesh,
+  MeshBasicMaterial,
   MeshStandardMaterial,
   NoColorSpace,
   Object3D,
   Sprite,
   SpriteMaterial,
   SphereGeometry,
+  Vector3,
 } from "three";
 
 import type { GraphNode } from "./contract.js";
@@ -21,6 +23,11 @@ import type { RenderGraphData, RenderLink, RenderNode } from "./layout.js";
 import type { GraphLinkDescriptor, GraphNodeDescriptor, GraphPresentation } from "./presentation.js";
 import type {
   GraphCameraTransitionOptions,
+  GraphAmbientMotionLinkFlowObservation,
+  GraphAmbientMotionNodePosition,
+  GraphAmbientMotionObservation,
+  GraphAmbientMotionParticleObservation,
+  GraphAmbientMotionScreenPosition,
   GraphLinkObjectFactory,
   GraphRenderLinkObservation,
   GraphRenderNodeObservation,
@@ -38,6 +45,11 @@ import type {
 
 export type {
   GraphLinkObjectFactory,
+  GraphAmbientMotionLinkFlowObservation,
+  GraphAmbientMotionNodePosition,
+  GraphAmbientMotionObservation,
+  GraphAmbientMotionParticleObservation,
+  GraphAmbientMotionScreenPosition,
   GraphRenderLinkObservation,
   GraphRenderNodeObservation,
   GraphRenderNodeLabelObservation,
@@ -93,14 +105,23 @@ const THEME_PALETTES: Readonly<Record<"dark" | "light", GraphThemePalette>> = {
   },
 };
 
-// Static labels are the primary way to identify a node. Keep this independent
-// from the quieter body/edge treatment of distant nodes so every name remains
-// readable against the routine-harness background.
+// Selection still carries the strongest readability tier. Ambient depth may
+// intentionally take unrelated far labels below this former static floor.
 const STATIC_LABEL_OPACITY = Object.freeze({
-  far: 0.72,
-  neighbor: 0.82,
+  far: 0.18,
+  neighbor: 0.72,
   selected: 1,
 });
+
+const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 7.2, y: 5.6, z: 1.8 });
+const AMBIENT_NODE_BREATHING = Object.freeze({ x: 2.8, y: 3.4, z: 1.2 });
+const AMBIENT_MAX_OFFSET = 12;
+const AMBIENT_RADIANS_PER_SECOND = 0.42;
+const FLOW_SPEED_CYCLES_PER_SECOND = 0.22;
+const MAX_FLOW_PARTICLES = 24;
+const AMBIENT_VISUAL_EPSILON = 0.0001;
+const AMBIENT_MASTER_BODY_OPACITY_FLOOR = 0.5;
+const AMBIENT_MASTER_LABEL_OPACITY_FLOOR = 0.48;
 
 function themePalette(theme: GraphPresentation["theme"]): GraphThemePalette {
   return theme === "light" ? THEME_PALETTES.light : THEME_PALETTES.dark;
@@ -247,25 +268,36 @@ function updateObjectMaterials(object: Object3D, update: MaterialVisualUpdate): 
     materialsForObject(candidate).forEach((material) => {
       if (!material || typeof material !== "object") return;
       if ("opacity" in material && typeof material.opacity === "number") {
-        material.opacity = update.opacity;
+        if (Math.abs(material.opacity - update.opacity) > AMBIENT_VISUAL_EPSILON) {
+          material.opacity = update.opacity;
+        }
       }
       if ("transparent" in material && typeof material.transparent === "boolean") {
         // Sprite labels carry their glyph mask in texture alpha. They must
         // remain transparent even at opacity 1 or WebGL treats the empty canvas
         // pixels as an opaque black rectangle.
-        material.transparent = ("isSpriteMaterial" in material && material.isSpriteMaterial === true)
+        const needsTransparency = ("isSpriteMaterial" in material && material.isSpriteMaterial === true)
           || update.opacity < 1;
+        // Ambient depth can make a previously opaque default material fade on
+        // the next RAF. Keep blending enabled once it has been selected rather
+        // than repeatedly recompiling shader variants when a transaction later
+        // returns it to opacity 1.
+        if (needsTransparency && !material.transparent) {
+          material.transparent = true;
+          if ("needsUpdate" in material) material.needsUpdate = true;
+        }
       }
       if (update.emissiveIntensity !== undefined
         && "emissiveIntensity" in material
         && typeof material.emissiveIntensity === "number") {
-        material.emissiveIntensity = update.emissiveIntensity;
+        if (Math.abs(material.emissiveIntensity - update.emissiveIntensity) > AMBIENT_VISUAL_EPSILON) {
+          material.emissiveIntensity = update.emissiveIntensity;
+        }
       }
       if (update.width !== undefined && "linewidth" in material && typeof material.linewidth === "number") {
-        material.linewidth = update.width;
-      }
-      if ("needsUpdate" in material && typeof material.needsUpdate === "boolean") {
-        material.needsUpdate = true;
+        if (Math.abs(material.linewidth - update.width) > AMBIENT_VISUAL_EPSILON) {
+          material.linewidth = update.width;
+        }
       }
     });
   });
@@ -414,34 +446,60 @@ export function createDefaultGraphLinkObject(
   });
   const line = new Line(geometry, material);
   line.userData.graphLinkId = link.id;
+  line.userData.graphDefaultLinkObject = true;
+  line.userData.graphCurveBendDirection = stableUnit(`${link.id}:curve`) >= 0.5 ? 1 : -1;
   return line;
+}
+
+function writeThreePointCurve(
+  positions: { count: number; itemSize: number; needsUpdate: boolean; setXYZ(index: number, x: number, y: number, z: number): void },
+  bendDirection: number,
+  start: { x: number; y: number; z: number },
+  end: { x: number; y: number; z: number },
+): void {
+  positions.setXYZ(0, start.x, start.y, start.z);
+  if (positions.count < 3) {
+    positions.setXYZ(1, end.x, end.y, end.z);
+    positions.needsUpdate = true;
+    return;
+  }
+  const deltaX = end.x - start.x;
+  const deltaY = end.y - start.y;
+  const planarDistance = Math.hypot(deltaX, deltaY);
+  const curve = Math.max(3, Math.min(18, planarDistance * 0.12));
+  const directionX = planarDistance > 0 ? deltaX / planarDistance : 1;
+  const directionY = planarDistance > 0 ? deltaY / planarDistance : 0;
+  positions.setXYZ(
+    1,
+    ((start.x + end.x) / 2) + (-directionY * curve * bendDirection),
+    ((start.y + end.y) / 2) + (directionX * curve * bendDirection),
+    ((start.z + end.z) / 2) + (curve * 0.32 * bendDirection),
+  );
+  positions.setXYZ(2, end.x, end.y, end.z);
+  positions.needsUpdate = true;
+}
+
+function pointOnThreePointCurve(
+  positions: { getX(index: number): number; getY(index: number): number; getZ(index: number): number },
+  progress: number,
+  output: { x: number; y: number; z: number },
+): void {
+  const t = Math.max(0, Math.min(1, progress));
+  const inverse = 1 - t;
+  output.x = (inverse * inverse * positions.getX(0)) + (2 * inverse * t * positions.getX(1)) + (t * t * positions.getX(2));
+  output.y = (inverse * inverse * positions.getY(0)) + (2 * inverse * t * positions.getY(1)) + (t * t * positions.getY(2));
+  output.z = (inverse * inverse * positions.getZ(0)) + (2 * inverse * t * positions.getZ(1)) + (t * t * positions.getZ(2));
 }
 
 function updateLinkObject(object: Object3D, start: { x: number; y: number; z: number }, end: { x: number; y: number; z: number }): boolean {
   if (!(object instanceof Line)) return false;
+  if (object.userData.graphDefaultLinkObject !== true) return false;
   const positions = object.geometry.getAttribute("position");
   if (!positions || positions.itemSize !== 3 || positions.count < 2) return false;
-  positions.setXYZ(0, start.x, start.y, start.z);
-  if (positions.count >= 3) {
-    const deltaX = end.x - start.x;
-    const deltaY = end.y - start.y;
-    const planarDistance = Math.hypot(deltaX, deltaY);
-    const curve = Math.max(3, Math.min(18, planarDistance * 0.12));
-    const direction = planarDistance > 0
-      ? { x: deltaX / planarDistance, y: deltaY / planarDistance }
-      : { x: 1, y: 0 };
-    const bendDirection = stableUnit(`${String(object.userData.graphLinkId ?? "link")}:curve`) >= 0.5 ? 1 : -1;
-    positions.setXYZ(
-      1,
-      ((start.x + end.x) / 2) + (-direction.y * curve * bendDirection),
-      ((start.y + end.y) / 2) + (direction.x * curve * bendDirection),
-      ((start.z + end.z) / 2) + (curve * 0.32 * bendDirection),
-    );
-    positions.setXYZ(2, end.x, end.y, end.z);
-  } else {
-    positions.setXYZ(1, end.x, end.y, end.z);
-  }
-  positions.needsUpdate = true;
+  const bendDirection = typeof object.userData.graphCurveBendDirection === "number"
+    ? object.userData.graphCurveBendDirection
+    : 1;
+  writeThreePointCurve(positions, bendDirection, start, end);
   object.geometry.computeBoundingSphere();
   return true;
 }
@@ -715,6 +773,60 @@ interface ActiveTransition {
   startedAt: number | null;
 }
 
+interface AmbientNodeState {
+  readonly id: string;
+  readonly node: RenderNode;
+  readonly baseOpacity: number;
+  readonly isMaster: boolean;
+  object: Object3D | null;
+  defaultVisual: AmbientDefaultNodeVisual | null;
+  readonly breathingPhase: number;
+  readonly breathingRate: number;
+  anchorX: number;
+  anchorY: number;
+  anchorZ: number;
+  renderedX: number;
+  renderedY: number;
+  renderedZ: number;
+}
+
+interface AmbientLinkState {
+  readonly baseOpacity: number;
+  readonly baseWidth: number;
+  readonly flowParticleCount: number;
+  readonly flowPhase: number;
+  readonly id: string;
+  readonly link: RenderLink;
+  object: Line | null;
+  material: LineBasicMaterial | null;
+  lastOpacity: number;
+  lastWidth: number;
+  particleCount: number;
+  active: boolean;
+}
+
+interface AmbientDefaultNodeVisual {
+  readonly baseLabelScale: Coordinates;
+  readonly bodyMaterial: MeshStandardMaterial;
+  readonly label: Sprite;
+  readonly labelMaterial: SpriteMaterial;
+  lastBodyOpacity: number;
+  lastLabelOpacity: number;
+  lastLabelScale: number;
+  lastLabelVisible: boolean | null;
+  lastScale: number;
+}
+
+interface FlowParticle {
+  readonly id: string;
+  readonly object: Mesh;
+  linkId: string | null;
+  phase: number;
+  x: number;
+  y: number;
+  z: number;
+}
+
 function isCoordinates(value: Partial<Coordinates> | undefined): value is Coordinates {
   if (!value) return false;
   return [value.x, value.y, value.z].every((axis) => Number.isFinite(axis));
@@ -854,12 +966,48 @@ export function createThreeForceGraphRenderer({
   const renderedNodeObjects = new Map<string, Object3D>();
   const frameScheduler = cameraFrameScheduler(container);
   let transitionGeneration = 0;
-  let transitionFrame: number | null = null;
+  let motionFrame: number | null = null;
   let activeTransition: ActiveTransition | null = null;
   let currentDataRevision: string | null = null;
   let deferredDataDuringTransition: RenderGraphData | null = null;
   let initialFitPending = true;
   let pendingSceneTransition: SceneTransition | null = null;
+  let transitionTick: ((timestamp: number) => void) | null = null;
+  let hoverNodeId: string | null = null;
+  let ambientElapsedMs = 0;
+  let ambientFrameCount = 0;
+  let ambientLastTimestamp: number | null = null;
+  let ambientPaused = false;
+  const ambientNodes = new Map<string, AmbientNodeState>();
+  const ambientLinks = new Map<string, AmbientLinkState>();
+  const particleGroup = new Group();
+  particleGroup.name = "graph-workbench-flow-particles";
+  const particleGeometry = new SphereGeometry(0.95, 10, 8);
+  const particleMaterial = new MeshBasicMaterial({
+    color: THEME_PALETTES.dark.rim,
+    depthWrite: false,
+    opacity: 0.86,
+    transparent: true,
+  });
+  const projectedWorldPosition = new Vector3();
+  const flowStart = { x: 0, y: 0, z: 0 };
+  const flowEnd = { x: 0, y: 0, z: 0 };
+  const flowParticles: FlowParticle[] = Array.from({ length: MAX_FLOW_PARTICLES }, (_unused, index) => {
+    const object = new Mesh(particleGeometry, particleMaterial);
+    object.visible = false;
+    object.renderOrder = 44;
+    particleGroup.add(object);
+    return {
+      id: `flow:${index}`,
+      linkId: null,
+      object,
+      phase: 0,
+      x: 0,
+      y: 0,
+      z: 0,
+    };
+  });
+  let particleResourcesDisposed = false;
   let transitionObservation: GraphTransitionObservation = {
     active: false,
     durationMs: 0,
@@ -892,14 +1040,31 @@ export function createThreeForceGraphRenderer({
     // vendor HTML tooltip avoids an opaque duplicate over the camera-facing
     // label while keeping the host callback seam unchanged.
     .nodeLabel(() => "")
+    .nodePositionUpdate((object, coordinates, node) => {
+      if (object.userData.graphDefaultNodeObject !== true) return false;
+      const state = ambientNodes.get(node.id);
+      if (!state) {
+        object.position.set(coordinates.x, coordinates.y, coordinates.z);
+        return true;
+      }
+      // ThreeForceGraph rewrites node Object3D positions on every render tick.
+      // Own that narrow hook for defaults so the visible raycast object and
+      // graph2ScreenCoords use the same ambient transform.
+      object.position.set(state.renderedX, state.renderedY, state.renderedZ);
+      return true;
+    })
     .nodeThreeObject((node) => {
       const object = nodeObjectFactory(node, nodeDescriptor(node));
       renderedNodeObjects.set(node.id, object);
+      const ambientState = ambientNodes.get(node.id);
+      if (ambientState) refreshAmbientNodeObject(ambientState, object);
       return object;
     })
     .linkThreeObject((link) => {
       const object = linkObjectFactory(link, linkDescriptor(link));
       renderedLinkObjects.set(link.id, object);
+      const ambientState = ambientLinks.get(link.id);
+      if (ambientState) refreshAmbientLinkObject(ambientState, object);
       return object;
     })
     .linkPositionUpdate((object, coordinates) => updateLinkObject(
@@ -908,7 +1073,13 @@ export function createThreeForceGraphRenderer({
       coordinates.end,
     ))
     .onNodeClick((node) => callbacks.onNodeClick(node.id))
-    .onNodeHover((node) => callbacks.onNodeHover(node?.id ?? null))
+    .onNodeHover((node) => {
+      hoverNodeId = node?.id ?? null;
+      if (currentData) applyFinalVisuals(currentData);
+      applyAmbientVisuals();
+      ensureMotionFrame();
+      callbacks.onNodeHover(hoverNodeId);
+    })
     // 3d-force-graph uses separate DragControls for nodes, so OrbitControls'
     // events do not cover this path.
     .onNodeDrag(() => {
@@ -969,6 +1140,134 @@ export function createThreeForceGraphRenderer({
     return base.x > 0 ? label.scale.x / base.x : 1;
   }
 
+  function cacheAmbientDefaultNodeVisual(state: AmbientNodeState): void {
+    const object = state.object;
+    if (state.defaultVisual || object?.userData.graphDefaultNodeObject !== true) return;
+    const body = graphChildWithRole(object, "body");
+    const label = graphChildWithRole(object, "node-label");
+    if (!(body instanceof Mesh) || !(body.material instanceof MeshStandardMaterial)) return;
+    if (!(label instanceof Sprite) || !(label.material instanceof SpriteMaterial)) return;
+    state.defaultVisual = {
+      baseLabelScale: staticLabelBaseScale(label),
+      bodyMaterial: body.material,
+      label,
+      labelMaterial: label.material,
+      lastBodyOpacity: Number.NaN,
+      lastLabelOpacity: Number.NaN,
+      lastLabelScale: Number.NaN,
+      lastLabelVisible: null,
+      lastScale: Number.NaN,
+    };
+  }
+
+  function cacheAmbientDefaultLinkMaterial(state: AmbientLinkState): void {
+    if (state.material || !state.object || !(state.object.material instanceof LineBasicMaterial)) return;
+    state.material = state.object.material;
+    state.lastOpacity = Number.NaN;
+    state.lastWidth = Number.NaN;
+  }
+
+  function refreshAmbientNodeObject(state: AmbientNodeState, object: Object3D | null): void {
+    if (state.object === object) return;
+    state.object = object;
+    state.defaultVisual = null;
+    cacheAmbientDefaultNodeVisual(state);
+  }
+
+  function refreshAmbientLinkObject(state: AmbientLinkState, object: Object3D | null): void {
+    const nextObject = object instanceof Line && object.userData.graphDefaultLinkObject === true
+      ? object
+      : null;
+    if (state.object === nextObject) return;
+    state.object = nextObject;
+    state.material = null;
+    state.lastOpacity = Number.NaN;
+    state.lastWidth = Number.NaN;
+    cacheAmbientDefaultLinkMaterial(state);
+  }
+
+  function invalidateAmbientDefaultNodeVisual(id: string): void {
+    const visual = ambientNodes.get(id)?.defaultVisual;
+    if (!visual) return;
+    visual.lastBodyOpacity = Number.NaN;
+    visual.lastLabelOpacity = Number.NaN;
+    visual.lastLabelScale = Number.NaN;
+    visual.lastLabelVisible = null;
+    visual.lastScale = Number.NaN;
+  }
+
+  function invalidateAmbientDefaultLinkVisual(id: string): void {
+    const state = ambientLinks.get(id);
+    if (!state) return;
+    state.lastOpacity = Number.NaN;
+    state.lastWidth = Number.NaN;
+  }
+
+  function changedAmbientVisualValue(previous: number, next: number): boolean {
+    return !Number.isFinite(previous) || Math.abs(previous - next) > AMBIENT_VISUAL_EPSILON;
+  }
+
+  function ensureAmbientTransparency(material: MeshStandardMaterial | LineBasicMaterial, transparent: boolean): void {
+    if (material.transparent === transparent) return;
+    material.transparent = transparent;
+    // This is a shader flag transition, never part of the stable RAF path.
+    material.needsUpdate = true;
+  }
+
+  function applyAmbientDefaultNodeVisual(
+    state: AmbientNodeState,
+    opacity: number,
+    scale: number,
+    labelVisible: boolean,
+    labelOpacity: number,
+    labelScale: number,
+  ): void {
+    cacheAmbientDefaultNodeVisual(state);
+    const visual = state.defaultVisual;
+    const object = state.object;
+    if (!visual || !object) return;
+    if (changedAmbientVisualValue(visual.lastBodyOpacity, opacity)) {
+      visual.bodyMaterial.opacity = opacity;
+      visual.lastBodyOpacity = opacity;
+    }
+    ensureAmbientTransparency(visual.bodyMaterial, true);
+    if (changedAmbientVisualValue(visual.lastScale, scale)) {
+      object.scale.setScalar(scale);
+      visual.lastScale = scale;
+    }
+    if (visual.lastLabelVisible !== labelVisible) {
+      visual.label.visible = labelVisible;
+      visual.lastLabelVisible = labelVisible;
+    }
+    if (changedAmbientVisualValue(visual.lastLabelOpacity, labelOpacity)) {
+      visual.labelMaterial.opacity = labelOpacity;
+      visual.lastLabelOpacity = labelOpacity;
+    }
+    if (changedAmbientVisualValue(visual.lastLabelScale, labelScale)) {
+      visual.label.scale.set(
+        visual.baseLabelScale.x * labelScale,
+        visual.baseLabelScale.y * labelScale,
+        visual.baseLabelScale.z * labelScale,
+      );
+      visual.lastLabelScale = labelScale;
+    }
+  }
+
+  function applyAmbientDefaultLinkVisual(state: AmbientLinkState, opacity: number, width: number): void {
+    cacheAmbientDefaultLinkMaterial(state);
+    const material = state.material;
+    if (!material) return;
+    if (changedAmbientVisualValue(state.lastOpacity, opacity)) {
+      material.opacity = opacity;
+      state.lastOpacity = opacity;
+    }
+    ensureAmbientTransparency(material, true);
+    if (changedAmbientVisualValue(state.lastWidth, width)) {
+      material.linewidth = width;
+      state.lastWidth = width;
+    }
+  }
+
   function applyNodeVisual(
     node: RenderNode,
     opacity: number,
@@ -999,12 +1298,262 @@ export function createThreeForceGraphRenderer({
       const base = staticLabelBaseScale(label);
       label.scale.set(base.x * labelScale, base.y * labelScale, base.z * labelScale);
     }
+    invalidateAmbientDefaultNodeVisual(node.id);
   }
 
   function applyLinkVisual(link: RenderLink, opacity: number, width: number): void {
     const object = renderedLinkObjects.get(link.id);
     if (!object) return;
     updateObjectMaterials(object, { opacity, width });
+    invalidateAmbientDefaultLinkVisual(link.id);
+  }
+
+  function ambientFocusNodeId(): string | null {
+    return currentData?.selection.nodeId ?? hoverNodeId ?? currentPresentation.focusNodeId ?? null;
+  }
+
+  function ambientMotionEnabled(): boolean {
+    return currentData?.presentation.ambientMotion !== false
+      && currentData?.presentation.reducedMotion !== true
+      && !ambientPaused
+      && ambientNodes.size > 0;
+  }
+
+  function rebuildAmbientState(): void {
+    ambientNodes.clear();
+    ambientLinks.clear();
+    if (!currentData) return;
+    const liveById = new Map(graph.graphData().nodes.map((node) => [node.id, node]));
+    for (const node of currentData.nodes) {
+      const live = liveById.get(node.id) ?? node;
+      const position = nodePosition(live) ?? nodePosition(node)!;
+      const object = renderedNodeObjects.get(node.id) ?? null;
+      const descriptor = nodeDescriptor(node);
+      const state: AmbientNodeState = {
+        baseOpacity: boundedOpacity(descriptor.opacity, node.visual.opacity),
+        id: node.id,
+        // RenderGraphData's visual floor is the renderer contract. It stays
+        // available even when a host serializes or projects away GraphNode
+        // source roles before calling setData.
+        isMaster: node.visual.opacityFloor > 0,
+        node: live,
+        object,
+        defaultVisual: null,
+        breathingPhase: stableUnit(`${node.id}:phase`) * Math.PI * 2,
+        breathingRate: 1.58 + (stableUnit(`${node.id}:rate`) * 0.34),
+        anchorX: position.x,
+        anchorY: position.y,
+        anchorZ: position.z,
+        renderedX: position.x,
+        renderedY: position.y,
+        renderedZ: position.z,
+      };
+      cacheAmbientDefaultNodeVisual(state);
+      ambientNodes.set(node.id, state);
+    }
+    for (const link of currentData.links) {
+      const object = renderedLinkObjects.get(link.id);
+      const descriptor = linkDescriptor(link);
+      ambientLinks.set(link.id, {
+        baseOpacity: boundedOpacity(descriptor.opacity, link.visual.opacity),
+        baseWidth: descriptor.width ?? link.visual.width,
+        flowParticleCount: stableUnit(`${link.id}:flow`) >= 0.45 ? 3 : 2,
+        flowPhase: stableUnit(`${link.id}:flow-phase`),
+        id: link.id,
+        link,
+        object: object instanceof Line && object.userData.graphDefaultLinkObject === true ? object : null,
+        material: null,
+        lastOpacity: Number.NaN,
+        lastWidth: Number.NaN,
+        particleCount: 0,
+        active: false,
+      });
+      const state = ambientLinks.get(link.id)!;
+      cacheAmbientDefaultLinkMaterial(state);
+    }
+    if (particleGroup.parent !== graph.scene()) graph.scene().add(particleGroup);
+  }
+
+  function updateAmbientNodePositions(): void {
+    const motionEnabled = ambientMotionEnabled();
+    const phase = (ambientElapsedMs / 1000) * AMBIENT_RADIANS_PER_SECOND;
+    const commonX = motionEnabled ? Math.sin(phase) * AMBIENT_COMMON_FLOAT.x : 0;
+    const commonY = motionEnabled ? Math.cos(phase * 0.91) * AMBIENT_COMMON_FLOAT.y : 0;
+    const commonZ = motionEnabled ? Math.sin(phase * 0.57) * AMBIENT_COMMON_FLOAT.z : 0;
+    for (const state of ambientNodes.values()) {
+      const anchor = state.node;
+      if (!Number.isFinite(anchor.x) || !Number.isFinite(anchor.y) || !Number.isFinite(anchor.z)) continue;
+      state.anchorX = anchor.x;
+      state.anchorY = anchor.y;
+      state.anchorZ = anchor.z;
+      refreshAmbientNodeObject(state, renderedNodeObjects.get(state.id) ?? null);
+      const breathingPhase = (phase * state.breathingRate) + state.breathingPhase;
+      const breathingX = motionEnabled ? Math.sin(breathingPhase) * AMBIENT_NODE_BREATHING.x : 0;
+      const breathingY = motionEnabled ? Math.cos(breathingPhase * 1.13) * AMBIENT_NODE_BREATHING.y : 0;
+      const breathingZ = motionEnabled ? Math.sin(breathingPhase * 0.67) * AMBIENT_NODE_BREATHING.z : 0;
+      if (state.object?.userData.graphDefaultNodeObject === true) {
+        state.renderedX = state.anchorX + commonX + breathingX;
+        state.renderedY = state.anchorY + commonY + breathingY;
+        state.renderedZ = state.anchorZ + commonZ + breathingZ;
+        state.object.position.set(state.renderedX, state.renderedY, state.renderedZ);
+      } else {
+        // Factories own their transforms. Reporting an offset that was never
+        // applied would make host-side picking disagree with rendered pixels.
+        state.renderedX = state.anchorX;
+        state.renderedY = state.anchorY;
+        state.renderedZ = state.anchorZ;
+      }
+    }
+  }
+
+  function applyCameraRelativeDepth(): void {
+    const data = currentData;
+    if (!data) return;
+    const camera = cameraPose();
+    const directionLength = Math.hypot(
+      camera.position.x - camera.lookAt.x,
+      camera.position.y - camera.lookAt.y,
+      camera.position.z - camera.lookAt.z,
+    ) || 1;
+    const directionX = (camera.position.x - camera.lookAt.x) / directionLength;
+    const directionY = (camera.position.y - camera.lookAt.y) / directionLength;
+    const directionZ = (camera.position.z - camera.lookAt.z) / directionLength;
+    let minimumDepth = Infinity;
+    let maximumDepth = -Infinity;
+    for (const state of ambientNodes.values()) {
+      const depth = ((state.renderedX - camera.lookAt.x) * directionX)
+        + ((state.renderedY - camera.lookAt.y) * directionY)
+        + ((state.renderedZ - camera.lookAt.z) * directionZ);
+      minimumDepth = Math.min(minimumDepth, depth);
+      maximumDepth = Math.max(maximumDepth, depth);
+    }
+    const depthRange = Math.max(1, maximumDepth - minimumDepth);
+    const selectedNodeId = data.selection.nodeId;
+    const focusNodeId = ambientFocusNodeId();
+    for (const state of ambientNodes.values()) {
+      if (state.object?.userData.graphDefaultNodeObject !== true) continue;
+      const node = state.node;
+      const depth = ((state.renderedX - camera.lookAt.x) * directionX)
+        + ((state.renderedY - camera.lookAt.y) * directionY)
+        + ((state.renderedZ - camera.lookAt.z) * directionZ);
+      const near = Math.max(0, Math.min(1, (depth - minimumDepth) / depthRange));
+      const selected = node.id === selectedNodeId;
+      const neighbor = data.selection.neighborNodeIds.includes(node.id);
+      const focused = node.id === focusNodeId;
+      // Keep semantic readability floors in the renderer-owned state built
+      // from the canonical visual contract, not a vendor live node's fields.
+      const master = state.isMaster;
+      const bodyFactor = selected
+        ? 1
+        : neighbor || focused
+          ? 0.66 + (near * 0.24)
+          : selectedNodeId
+            ? 0.18 + (near * 0.27)
+            : 0.34 + (near * 0.35);
+      const opacity = Math.max(
+        node.visual.opacityFloor,
+        master ? AMBIENT_MASTER_BODY_OPACITY_FLOOR : 0,
+        state.baseOpacity * bodyFactor,
+      );
+      const labelOpacity = selected
+        ? 1
+        : neighbor || focused
+          ? 0.68 + (near * 0.2)
+          : master
+            ? Math.max(AMBIENT_MASTER_LABEL_OPACITY_FLOOR, 0.32 + (near * 0.26))
+            : selectedNodeId
+              ? 0.025 + (near * 0.26)
+              : 0.12 + (near * 0.44);
+      const labelVisible = selected || neighbor || focused || master || labelOpacity >= 0.04;
+      const viewportScale = Math.max(
+        0.82,
+        Math.min(1.15, 480 / Math.max(1, Math.min(data.selection.viewport.width, data.selection.viewport.height))),
+      );
+      const scale = selected ? 1.22 : (0.68 + (near * 0.28));
+      applyAmbientDefaultNodeVisual(
+        state,
+        opacity,
+        scale,
+        labelVisible,
+        labelOpacity,
+        viewportScale * (0.68 + (near * 0.32)),
+      );
+    }
+  }
+
+  function renderedState(id: string): AmbientNodeState | null {
+    return ambientNodes.get(id) ?? null;
+  }
+
+  function actualNodeWorldPosition(state: AmbientNodeState): Coordinates {
+    const object = state.object ?? renderedNodeObjects.get(state.id);
+    if (object) {
+      object.getWorldPosition(projectedWorldPosition);
+      return {
+        x: projectedWorldPosition.x,
+        y: projectedWorldPosition.y,
+        z: projectedWorldPosition.z,
+      };
+    }
+    return { x: state.renderedX, y: state.renderedY, z: state.renderedZ };
+  }
+
+  function applyFocusedLinkFlow(): void {
+    const focusNodeId = ambientFocusNodeId();
+    let nextParticle = 0;
+    for (const particle of flowParticles) {
+      particle.linkId = null;
+      particle.object.visible = false;
+    }
+    for (const state of ambientLinks.values()) {
+      const source = renderedState(state.link.source);
+      const target = renderedState(state.link.target);
+      const incident = focusNodeId !== null && (state.link.source === focusNodeId || state.link.target === focusNodeId);
+      const selectedFocus = focusNodeId !== null && currentData?.selection.nodeId === focusNodeId;
+      const liveObject = renderedLinkObjects.get(state.id);
+      refreshAmbientLinkObject(state, liveObject ?? null);
+      state.active = Boolean(incident && state.object && ambientMotionEnabled());
+      state.particleCount = 0;
+      if (!source || !target || !state.object) continue;
+      flowStart.x = source.renderedX;
+      flowStart.y = source.renderedY;
+      flowStart.z = source.renderedZ;
+      flowEnd.x = target.renderedX;
+      flowEnd.y = target.renderedY;
+      flowEnd.z = target.renderedZ;
+      updateLinkObject(state.object, flowStart, flowEnd);
+      applyAmbientDefaultLinkVisual(
+        state,
+        incident ? Math.max(selectedFocus ? 0.52 : 0.38, state.baseOpacity) : Math.min(0.055, state.baseOpacity * 0.22),
+        incident ? Math.max(selectedFocus ? 1.1 : 0.9, state.baseWidth) : 0.5,
+      );
+      if (!state.active) continue;
+      const count = state.flowParticleCount;
+      const positions = state.object.geometry.getAttribute("position");
+      if (!positions || positions.count < 3) continue;
+      const outwardFromSource = state.link.source === focusNodeId;
+      for (let index = 0; index < count && nextParticle < flowParticles.length; index += 1) {
+        const particle = flowParticles[nextParticle]!;
+        nextParticle += 1;
+        const basePhase = ((ambientElapsedMs / 1000) * FLOW_SPEED_CYCLES_PER_SECOND)
+          + (index / count)
+          + state.flowPhase;
+        const outwardPhase = basePhase - Math.floor(basePhase);
+        const curveProgress = outwardFromSource ? outwardPhase : 1 - outwardPhase;
+        pointOnThreePointCurve(positions, curveProgress, particle);
+        particle.object.position.set(particle.x, particle.y, particle.z);
+        particle.object.visible = true;
+        particle.linkId = state.id;
+        particle.phase = outwardPhase;
+        state.particleCount += 1;
+      }
+    }
+  }
+
+  function applyAmbientVisuals(): void {
+    updateAmbientNodePositions();
+    applyCameraRelativeDepth();
+    applyFocusedLinkFlow();
   }
 
   function applyFinalVisuals(data: RenderGraphData): void {
@@ -1245,9 +1794,12 @@ export function createThreeForceGraphRenderer({
     renderedLinkObjects.forEach((_object, id) => {
       if (!linkIds.has(id)) renderedLinkObjects.delete(id);
     });
+    rebuildAmbientState();
     if (!previousData || !selectionChanged || !starts) {
       pendingSceneTransition = null;
       applyFinalVisuals(data);
+      applyAmbientVisuals();
+      ensureMotionFrame();
       return;
     }
 
@@ -1256,6 +1808,8 @@ export function createThreeForceGraphRenderer({
     data.nodes.forEach((node) => applyNodePalette(node));
     data.links.forEach((link) => applyLinkPalette(link));
     applySceneFrame(scene, 0);
+    applyAmbientVisuals();
+    ensureMotionFrame();
     if (scene.targetFocusNodeId === null) {
       pendingSceneTransition = null;
       transitionToFit(scene.durationMs, scene);
@@ -1275,8 +1829,12 @@ export function createThreeForceGraphRenderer({
       ? transitionObservation.progress
       : 1;
     transitionGeneration += 1;
-    if (transitionFrame !== null) frameScheduler.cancel(transitionFrame);
-    transitionFrame = null;
+    // A scheduled idle ambient tick is already the shared renderer loop; it
+    // can immediately pick up a newly-started camera transition. Cancel only
+    // a frame that belongs to a real active transaction.
+    if (cancelledTransition && motionFrame !== null) frameScheduler.cancel(motionFrame);
+    if (cancelledTransition) motionFrame = null;
+    if (cancelledTransition) transitionTick = null;
     activeTransition = null;
     if (cancelledTransition?.scene) {
       applySceneFrame(cancelledTransition.scene, 1, true);
@@ -1290,7 +1848,50 @@ export function createThreeForceGraphRenderer({
       reducedMotion: cancelledTransition?.reducedMotion ?? false,
     };
     if (cancelledTransition?.scene) flushDeferredData();
+    if (!destroyed) {
+      applyAmbientVisuals();
+      ensureMotionFrame();
+    }
   }
+
+  function ensureMotionFrame(): void {
+    if (destroyed || motionFrame !== null || (!transitionTick && !ambientMotionEnabled())) return;
+    let frameId = 0;
+    frameId = frameScheduler.request((timestamp) => {
+      if (motionFrame !== frameId) return;
+      motionFrame = null;
+      transitionTick?.(timestamp);
+      if (ambientMotionEnabled()) {
+        if (ambientLastTimestamp !== null) {
+          ambientElapsedMs += Math.max(0, timestamp - ambientLastTimestamp);
+        }
+        ambientLastTimestamp = timestamp;
+        ambientFrameCount += 1;
+        applyAmbientVisuals();
+      } else {
+        ambientLastTimestamp = null;
+        applyAmbientVisuals();
+      }
+      ensureMotionFrame();
+    });
+    motionFrame = frameId;
+  }
+
+  const onVisibilityChange = () => {
+    const hidden = ownerDocument.visibilityState === "hidden";
+    ambientPaused = hidden;
+    ambientLastTimestamp = null;
+    if (hidden) {
+      if (activeTransition) activeTransition.startedAt = null;
+      if (motionFrame !== null) frameScheduler.cancel(motionFrame);
+      motionFrame = null;
+      applyAmbientVisuals();
+      return;
+    }
+    applyAmbientVisuals();
+    ensureMotionFrame();
+  };
+  ownerDocument.addEventListener("visibilitychange", onVisibilityChange);
 
   // `graph.controls()` exposes the live OrbitControls instance for the configured
   // `controlType: "orbit"`. Its `start` event is user-originated; `change` is a
@@ -1349,6 +1950,10 @@ export function createThreeForceGraphRenderer({
     if (durationMs <= 0) {
       scene && applySceneFrame(scene, 1, true);
       if (targetCamera) setCameraPose(targetCamera);
+      // The zero-duration selection path still advances the deterministic
+      // anchor transaction. Refresh the ambient snapshot synchronously so
+      // reduced motion reports those new anchors, with zero visual offset.
+      applyAmbientVisuals();
       transitionObservation = {
         active: false,
         durationMs,
@@ -1369,12 +1974,10 @@ export function createThreeForceGraphRenderer({
       progress: 0,
       reducedMotion,
     };
-    let startedAt: number | null = null;
-    const update = (timestamp: number) => {
+    transitionTick = (timestamp: number) => {
       if (active.generation !== transitionGeneration || activeTransition !== active) return;
-      startedAt ??= timestamp;
-      const progress = Math.min(1, Math.max(0, (timestamp - startedAt) / durationMs));
-      active.startedAt = startedAt;
+      active.startedAt ??= timestamp;
+      const progress = Math.min(1, Math.max(0, (timestamp - active.startedAt) / durationMs));
       if (active.scene) applySceneFrame(active.scene, progress);
       if (active.startCamera && active.targetCamera) {
         setCameraPose(interpolatePose(active.startCamera, active.targetCamera, progress));
@@ -1388,15 +1991,14 @@ export function createThreeForceGraphRenderer({
         reducedMotion: active.reducedMotion,
       };
       if (progress < 1) {
-        transitionFrame = frameScheduler.request(update);
       } else {
         active.scene && applySceneFrame(active.scene, 1, true);
-        transitionFrame = null;
         activeTransition = null;
+        transitionTick = null;
         flushDeferredData();
       }
     };
-    transitionFrame = frameScheduler.request(update);
+    ensureMotionFrame();
   }
 
   function transitionToFit(durationMs: number, scene: SceneTransition | null = null): void {
@@ -1424,7 +2026,9 @@ export function createThreeForceGraphRenderer({
       if (!position) return [];
       const bodyRadius = node.type === "relation" ? 7.5 : 3;
       const focusScale = node.id === nodeId ? 1.22 : 1;
-      return [{ ...position, radius: bodyRadius * 1.16 * focusScale }];
+      // Reserve the renderer-owned micro-motion envelope inside the existing
+      // camera padding, including compact portrait framing.
+      return [{ ...position, radius: (bodyRadius * 1.16 * focusScale) + AMBIENT_MAX_OFFSET }];
     });
     const viewport = currentData.selection.viewport;
     return contextCameraPose(
@@ -1498,15 +2102,27 @@ export function createThreeForceGraphRenderer({
     cancelCameraTransition,
     destroy() {
       if (destroyed) return;
+      if (motionFrame !== null) frameScheduler.cancel(motionFrame);
+      motionFrame = null;
+      transitionTick = null;
       destroyed = true;
       deferredDataDuringTransition = null;
       cancelCameraTransition();
       ownerDocument.removeEventListener("pointerup", suppressMalformedVendorDragRelease, true);
+      ownerDocument.removeEventListener("visibilitychange", onVisibilityChange);
       cameraInteractionControls?.removeEventListener("start", beginCameraControlInteraction);
       cameraInteractionControls?.removeEventListener("change", updateCameraControlInteraction);
       cameraInteractionControls?.removeEventListener("end", endCameraControlInteraction);
       renderedNodeObjects.clear();
       renderedLinkObjects.clear();
+      ambientNodes.clear();
+      ambientLinks.clear();
+      particleGroup.removeFromParent();
+      if (!particleResourcesDisposed) {
+        particleResourcesDisposed = true;
+        particleGeometry.dispose();
+        particleMaterial.dispose();
+      }
       graph._destructor();
     },
     fit(durationMs = 250) {
@@ -1517,7 +2133,10 @@ export function createThreeForceGraphRenderer({
       transitionToNode(nodeId, { reducedMotion: false });
     },
     getNodeScreenPosition(nodeId) {
-      const node = graph.graphData().nodes.find((candidate) => candidate.id === nodeId);
+      const rendered = ambientNodes.get(nodeId);
+      const node = rendered
+        ? actualNodeWorldPosition(rendered)
+        : graph.graphData().nodes.find((candidate) => candidate.id === nodeId);
       if (!node || ![node.x, node.y, node.z].every((coordinate) => Number.isFinite(coordinate))) {
         return null;
       }
@@ -1526,6 +2145,56 @@ export function createThreeForceGraphRenderer({
         return null;
       }
       return { x: projected.x, y: projected.y };
+    },
+    getAmbientMotionObservation() {
+      if (destroyed || !currentData) return null;
+      const anchorNodePositions: GraphAmbientMotionNodePosition[] = [];
+      const renderedNodePositions: GraphAmbientMotionNodePosition[] = [];
+      const renderedScreenPositions: GraphAmbientMotionScreenPosition[] = [];
+      ambientNodes.forEach((state) => {
+        const rendered = actualNodeWorldPosition(state);
+        anchorNodePositions.push({ id: state.id, x: state.anchorX, y: state.anchorY, z: state.anchorZ });
+        renderedNodePositions.push({ id: state.id, x: rendered.x, y: rendered.y, z: rendered.z });
+        const screen = graph.graph2ScreenCoords(rendered.x, rendered.y, rendered.z);
+        if (Number.isFinite(screen.x) && Number.isFinite(screen.y)) {
+          renderedScreenPositions.push({ id: state.id, x: screen.x, y: screen.y });
+        }
+      });
+      const linkFlow: GraphAmbientMotionLinkFlowObservation[] = [];
+      ambientLinks.forEach((state) => linkFlow.push({
+        active: state.active,
+        id: state.id,
+        particleCount: state.particleCount,
+      }));
+      const particles: GraphAmbientMotionParticleObservation[] = [];
+      flowParticles.forEach((particle) => {
+        if (!particle.object.visible || !particle.linkId) return;
+        const screen = graph.graph2ScreenCoords(particle.x, particle.y, particle.z);
+        particles.push({
+          id: particle.id,
+          linkId: particle.linkId,
+          phase: particle.phase,
+          screenX: Number.isFinite(screen.x) ? screen.x : null,
+          screenY: Number.isFinite(screen.y) ? screen.y : null,
+          x: particle.x,
+          y: particle.y,
+          z: particle.z,
+        });
+      });
+      return {
+        active: ambientMotionEnabled(),
+        anchorNodePositions,
+        elapsedMs: ambientElapsedMs,
+        focusNodeId: ambientFocusNodeId(),
+        frame: ambientFrameCount,
+        linkFlow,
+        particles,
+        paused: ambientPaused,
+        phase: (ambientElapsedMs / 1000) * AMBIENT_RADIANS_PER_SECOND,
+        reducedMotion: currentData.presentation.reducedMotion === true,
+        renderedNodePositions,
+        renderedScreenPositions,
+      };
     },
     getRenderObservation,
     getTransitionObservation() {
@@ -1558,6 +2227,9 @@ export function createThreeForceGraphRenderer({
         currentData.nodes.forEach((node) => applyNodePalette(node));
         currentData.links.forEach((link) => applyLinkPalette(link));
         if (!activeTransition && !pendingSceneTransition) applyFinalVisuals(currentData);
+        rebuildAmbientState();
+        applyAmbientVisuals();
+        ensureMotionFrame();
         return;
       }
       applyData(nextData);

@@ -8,6 +8,7 @@ import {
   type GraphRenderer,
   type GraphRendererFactory,
   type GraphRendererFactoryOptions,
+  type GraphAmbientMotionObservation,
   type GraphRenderObservation,
   type GraphScreenPosition,
   type GraphTransitionObservation,
@@ -62,6 +63,8 @@ export interface GraphWorkbench {
   destroy(): void;
   fit(durationMs?: number): void;
   focusNode(nodeId: string | null): void;
+  /** Renderer-owned ambient-motion evidence, or null for legacy renderers. */
+  getAmbientMotionObservation(): GraphAmbientMotionObservation | null;
   getNodeScreenPosition(nodeId: string): GraphScreenPosition | null;
   /** Live Object3D evidence, or null when no enhanced renderer is mounted. */
   getRenderObservation(): GraphRenderObservation | null;
@@ -94,6 +97,7 @@ function normalizedPresentation(input: GraphInput, supplied: GraphPresentation):
     ? supplied.focusNodeId
     : null;
   return {
+    ambientMotion: supplied.ambientMotion !== false,
     selectedNodeIds,
     focusNodeId,
     reducedMotion: supplied.reducedMotion === true,
@@ -236,6 +240,9 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
       renderer?.setPresentation(presentation);
       if (nextNodeId) transitionToSelection(nextNodeId);
       options.onFocusChange?.({ input, nodeId: nextNodeId });
+    },
+    getAmbientMotionObservation() {
+      return renderer?.getAmbientMotionObservation?.() ?? null;
     },
     getNodeScreenPosition(nodeId) {
       if (!knownNodeIds(input).has(nodeId)) return null;

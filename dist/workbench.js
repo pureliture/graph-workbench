@@ -14,6 +14,7 @@ function normalizedPresentation(input, supplied) {
         ? supplied.focusNodeId
         : null;
     return {
+        ambientMotion: supplied.ambientMotion !== false,
         selectedNodeIds,
         focusNodeId,
         reducedMotion: supplied.reducedMotion === true,
@@ -157,6 +158,9 @@ export function createGraphWorkbench(options) {
             if (nextNodeId)
                 transitionToSelection(nextNodeId);
             options.onFocusChange?.({ input, nodeId: nextNodeId });
+        },
+        getAmbientMotionObservation() {
+            return renderer?.getAmbientMotionObservation?.() ?? null;
         },
         getNodeScreenPosition(nodeId) {
             if (!knownNodeIds(input).has(nodeId))

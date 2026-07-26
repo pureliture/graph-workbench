@@ -1,6 +1,6 @@
 import { type GraphInput, type GraphNode } from "./contract.js";
 import { type GraphSelectionState } from "./layout.js";
-import { type GraphRendererFactory, type GraphRenderObservation, type GraphScreenPosition, type GraphTransitionObservation } from "./renderer-contract.js";
+import { type GraphRendererFactory, type GraphAmbientMotionObservation, type GraphRenderObservation, type GraphScreenPosition, type GraphTransitionObservation } from "./renderer-contract.js";
 import { type GraphPresentation } from "./presentation.js";
 export interface GraphEvent {
     readonly input: GraphInput;
@@ -38,6 +38,8 @@ export interface GraphWorkbench {
     destroy(): void;
     fit(durationMs?: number): void;
     focusNode(nodeId: string | null): void;
+    /** Renderer-owned ambient-motion evidence, or null for legacy renderers. */
+    getAmbientMotionObservation(): GraphAmbientMotionObservation | null;
     getNodeScreenPosition(nodeId: string): GraphScreenPosition | null;
     /** Live Object3D evidence, or null when no enhanced renderer is mounted. */
     getRenderObservation(): GraphRenderObservation | null;

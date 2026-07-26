@@ -9,6 +9,11 @@ export interface GraphLinkDescriptor {
     readonly width?: number;
 }
 export interface GraphPresentation {
+    /**
+     * Enables renderer-owned micro motion for default Three.js objects. Omitted
+     * values normalize to true; custom renderers may ignore this optional hint.
+     */
+    readonly ambientMotion?: boolean;
     readonly selectedNodeIds?: readonly string[];
     readonly focusNodeId?: string | null;
     /** Keeps selection targets unchanged while requesting an immediate camera move. */

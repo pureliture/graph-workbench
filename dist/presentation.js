@@ -1,4 +1,5 @@
 export const EMPTY_GRAPH_PRESENTATION = Object.freeze({
+    ambientMotion: true,
     selectedNodeIds: Object.freeze([]),
     focusNodeId: null,
     reducedMotion: false,

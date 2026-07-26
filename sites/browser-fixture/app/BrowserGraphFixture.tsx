@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  type GraphAmbientMotionObservation,
   type GraphInput,
   type GraphRenderLinkObservation,
   type GraphRenderNodeObservation,
@@ -578,15 +579,33 @@ interface ObservedMotionTelemetry extends MotionTelemetryFrame {
 
 type MotionTelemetry = ObservedMotionTelemetry | UnavailableTelemetry;
 
+interface AmbientMotionFrame extends GraphAmbientMotionObservation {
+  /** Browser performance clock at the bounded diagnostic sample. */
+  readonly sampledAtMs: number;
+  readonly visibleLinkFlow: GraphAmbientMotionObservation["linkFlow"];
+  readonly visibleParticles: GraphAmbientMotionObservation["particles"];
+}
+
+interface ObservedAmbientMotionTelemetry extends AmbientMotionFrame {
+  readonly availability: "observed";
+  readonly frames: readonly AmbientMotionFrame[];
+}
+
+type AmbientMotionTelemetry = ObservedAmbientMotionTelemetry | UnavailableTelemetry | {
+  readonly availability: "pending";
+  readonly reason: string | null;
+};
+
 interface RendererState {
   readonly reason: string | null;
   readonly status: RendererStatus;
 }
 
-const projectionStabilityThresholdPx = 0.25;
-const projectionStableFrameCount = 3;
 const projectionSampleLimit = 180;
 const renderObservationSampleLimit = 180;
+// This is fixture-only evidence, never a renderer hot path. Keep it below the
+// render cadence so hidden diagnostic serialization cannot perturb motion.
+const ambientTelemetrySampleIntervalMs = 50;
 const nodeIds = graphInput.nodes.map((node) => node.id);
 const linkIds = graphInput.links.map((link) => link.id);
 const nodesById = new Map(graphInput.nodes.map((node) => [node.id, node]));
@@ -643,15 +662,20 @@ function Telemetry({ testId, value }: { readonly testId: string; readonly value:
   );
 }
 
-function observeStableScreenPosition(
+/**
+ * Renderer projections are deliberately live: ambient motion means a finite
+ * position must not be mistaken for a settled one. This probe only certifies
+ * that a current renderer-owned coordinate exists; callers that need a fresh
+ * click target read `graph-node-projections`, from the current bounded core
+ * ambient snapshot rather than any Matrix or deterministic-layout fallback.
+ */
+function observeRenderedScreenPosition(
   nodeId: string,
   getPosition: () => { readonly x: number; readonly y: number } | null,
   publish: (telemetry: ScreenPositionTelemetry) => void,
 ): () => void {
   let animationFrame: number | null = null;
   let attempts = 0;
-  let previousPosition: { readonly x: number; readonly y: number } | null = null;
-  let stableFrames = 0;
   let disposed = false;
 
   const sampleProjection = () => {
@@ -659,7 +683,7 @@ function observeStableScreenPosition(
     if (attempts === 0) {
       publish({
         availability: "pending",
-        reason: "Waiting for a finite, stable renderer projection.",
+        reason: "Waiting for a finite renderer projection.",
       });
     }
     attempts += 1;
@@ -669,31 +693,19 @@ function observeStableScreenPosition(
       && Number.isFinite(position.y);
 
     if (finite) {
-      const stable = previousPosition !== null
-        && Math.hypot(
-          position.x - previousPosition.x,
-          position.y - previousPosition.y,
-        ) <= projectionStabilityThresholdPx;
-      stableFrames = stable ? stableFrames + 1 : 0;
-      previousPosition = position;
-      if (stableFrames >= projectionStableFrameCount) {
-        publish({
-          availability: "observed",
-          nodeId,
-          x: position.x,
-          y: position.y,
-        });
-        return;
-      }
-    } else {
-      previousPosition = null;
-      stableFrames = 0;
+      publish({
+        availability: "observed",
+        nodeId,
+        x: position.x,
+        y: position.y,
+      });
+      return;
     }
 
     if (attempts >= projectionSampleLimit) {
       publish({
         availability: "unavailable",
-        reason: "A finite, stable renderer projection was not observed.",
+        reason: "A finite renderer projection was not observed.",
       });
       return;
     }
@@ -733,6 +745,16 @@ function observedLinkVisibility(link: GraphRenderLinkObservation) {
   };
 }
 
+function ambientMotionFrame(observation: GraphAmbientMotionObservation, sampledAtMs: number): AmbientMotionFrame {
+  const visibleLinkFlow = observation.linkFlow.filter(({ active, particleCount }) => active || particleCount > 0);
+  return {
+    ...observation,
+    sampledAtMs,
+    visibleLinkFlow,
+    visibleParticles: observation.particles,
+  };
+}
+
 export function BrowserGraphFixture() {
   const detailPanelRef = useRef<HTMLElement | null>(null);
   const detailWasOpenRef = useRef(false);
@@ -744,7 +766,8 @@ export function BrowserGraphFixture() {
   const motionFramesRef = useRef<MotionTelemetryFrame[]>([]);
   const motionGenerationRef = useRef<number | null>(null);
   const motionPublishedKeyRef = useRef("");
-  const nodeProjectionPublishedKeyRef = useRef("");
+  const ambientFramesRef = useRef<AmbientMotionFrame[]>([]);
+  const ambientPublishedKeyRef = useRef("");
   const reducedMotionRef = useRef(false);
   const workbenchRef = useRef<GraphWorkbench | null>(null);
   const rendererReadyRef = useRef(false);
@@ -772,6 +795,10 @@ export function BrowserGraphFixture() {
   const [motionTelemetry, setMotionTelemetry] = useState<MotionTelemetry>({
     availability: "pending",
     reason: null,
+  });
+  const [ambientMotionTelemetry, setAmbientMotionTelemetry] = useState<AmbientMotionTelemetry>({
+    availability: "pending",
+    reason: "Waiting for live ambient renderer evidence.",
   });
   const [renderObservationRevision, setRenderObservationRevision] = useState(0);
   const [renderer, setRenderer] = useState<RendererState>({ status: "pending", reason: null });
@@ -896,8 +923,10 @@ export function BrowserGraphFixture() {
       motionFramesRef.current = [];
       motionGenerationRef.current = null;
       motionPublishedKeyRef.current = "";
-      nodeProjectionPublishedKeyRef.current = "";
+      ambientFramesRef.current = [];
+      ambientPublishedKeyRef.current = "";
       setMotionTelemetry({ availability: "unavailable", reason });
+      setAmbientMotionTelemetry({ availability: "unavailable", reason });
       if (destroy) {
         workbenchRef.current?.destroy();
         workbenchRef.current = null;
@@ -927,7 +956,7 @@ export function BrowserGraphFixture() {
             setSelectedScreenPosition({
               availability: "pending",
               reason: event.nodeId
-                ? "Waiting for a finite, stable renderer projection."
+                ? "Waiting for a finite renderer projection."
                 : "No node is selected.",
             });
             setMasterScreenPosition({
@@ -1042,7 +1071,7 @@ export function BrowserGraphFixture() {
     const nodeId = observedSelection?.nodeId ?? null;
     if (renderer.status === "failed" || !rendererAvailable || !nodeId) return undefined;
 
-    return observeStableScreenPosition(
+    return observeRenderedScreenPosition(
       nodeId,
       () => workbenchRef.current?.getNodeScreenPosition(nodeId) ?? null,
       setSelectedScreenPosition,
@@ -1059,7 +1088,7 @@ export function BrowserGraphFixture() {
   useEffect(() => {
     if (renderer.status === "failed" || !rendererAvailable || !masterNodeId) return undefined;
 
-    return observeStableScreenPosition(
+    return observeRenderedScreenPosition(
       masterNodeId,
       () => workbenchRef.current?.getNodeScreenPosition(masterNodeId) ?? null,
       setMasterScreenPosition,
@@ -1204,28 +1233,69 @@ export function BrowserGraphFixture() {
 
     let animationFrame: number | null = null;
     let disposed = false;
-    const sampleNodeProjections = () => {
+    let lastAmbientSampleAt = Number.NEGATIVE_INFINITY;
+    const publishAmbientMotion = (force = false) => {
       if (disposed) return;
-      const workbench = workbenchRef.current;
-      const projections = graphInput.nodes.flatMap((node) => {
-        const position = workbench?.getNodeScreenPosition(node.id) ?? null;
-        return position && Number.isFinite(position.x) && Number.isFinite(position.y)
-          ? [{ id: node.id, x: position.x, y: position.y }]
-          : [];
-      });
-      if (projections.length === graphInput.nodes.length) {
-        const key = projections.map(({ id, x, y }) => `${id}:${x.toFixed(2)}:${y.toFixed(2)}`).join("|");
-        if (key !== nodeProjectionPublishedKeyRef.current) {
-          nodeProjectionPublishedKeyRef.current = key;
-          setNodeProjectionTelemetry({ availability: "observed", projections });
+      const observation = workbenchRef.current?.getAmbientMotionObservation() ?? null;
+      if (observation) {
+        const frame = ambientMotionFrame(observation, performance.now());
+        const latest = ambientFramesRef.current.at(-1);
+        const shouldStoreFrame = latest?.frame !== frame.frame;
+        if (shouldStoreFrame) {
+          ambientFramesRef.current = [...ambientFramesRef.current.slice(-5), frame];
         }
+        const publishedKey = [
+          frame.frame,
+          frame.phase,
+          frame.active,
+          frame.paused,
+          frame.reducedMotion,
+          frame.focusNodeId ?? "",
+          frame.visibleLinkFlow.map(({ id, particleCount }) => `${id}:${particleCount}`).join(","),
+          frame.visibleParticles.length,
+        ].join(":");
+        const shouldPublish = publishedKey !== ambientPublishedKeyRef.current
+          && (force || shouldStoreFrame || frame.frame === 0 || frame.paused || frame.reducedMotion);
+        if (shouldPublish) {
+          ambientPublishedKeyRef.current = publishedKey;
+          setNodeProjectionTelemetry({
+            availability: "observed",
+            projections: frame.renderedScreenPositions,
+          });
+          setAmbientMotionTelemetry({
+            availability: "observed",
+            frames: ambientFramesRef.current,
+            ...frame,
+          });
+        }
+      } else if (ambientPublishedKeyRef.current !== "pending") {
+        ambientPublishedKeyRef.current = "pending";
+        setNodeProjectionTelemetry({
+          availability: "unavailable",
+          reason: "The mounted renderer did not provide ambient motion evidence.",
+        });
+        setAmbientMotionTelemetry({
+          availability: "pending",
+          reason: "The mounted renderer did not provide ambient motion evidence.",
+        });
       }
-      animationFrame = window.requestAnimationFrame(sampleNodeProjections);
     };
+    const sampleAmbientMotion = () => {
+      if (disposed) return;
+      const now = performance.now();
+      if (now - lastAmbientSampleAt >= ambientTelemetrySampleIntervalMs) {
+        lastAmbientSampleAt = now;
+        publishAmbientMotion();
+      }
+      animationFrame = window.requestAnimationFrame(sampleAmbientMotion);
+    };
+    const observeVisibilityChange = () => publishAmbientMotion(true);
 
-    animationFrame = window.requestAnimationFrame(sampleNodeProjections);
+    animationFrame = window.requestAnimationFrame(sampleAmbientMotion);
+    document.addEventListener("visibilitychange", observeVisibilityChange);
     return () => {
       disposed = true;
+      document.removeEventListener("visibilitychange", observeVisibilityChange);
       if (animationFrame !== null) window.cancelAnimationFrame(animationFrame);
     };
   }, [renderer.status, rendererAvailable]);
@@ -1665,6 +1735,7 @@ export function BrowserGraphFixture() {
           <Telemetry testId="graph-camera-state" value={selectedScreenPosition} />
           <Telemetry testId="camera-transition-status" value={selectedScreenPosition} />
           <Telemetry testId="graph-motion-observation" value={motionTelemetry} />
+          <Telemetry testId="graph-ambient-motion" value={ambientMotionTelemetry} />
           <Telemetry testId="master-visibility" value={masterVisibilityTelemetry} />
           <Telemetry testId="selection-distance-visibility" value={selectionDistanceVisibilityTelemetry} />
           <Telemetry testId="host-update-status" value={hostUpdateTelemetry} />

@@ -31,6 +31,11 @@ export {
 export {
   type GraphLinkObjectFactory,
   type GraphNodeObjectFactory,
+  type GraphAmbientMotionLinkFlowObservation,
+  type GraphAmbientMotionNodePosition,
+  type GraphAmbientMotionObservation,
+  type GraphAmbientMotionParticleObservation,
+  type GraphAmbientMotionScreenPosition,
   type GraphRenderer,
   type GraphCameraTransitionOptions,
   type GraphRendererCallbacks,

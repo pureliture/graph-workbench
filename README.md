@@ -138,6 +138,32 @@ and camera target while requesting an immediate transition. Selection distance c
 node/link opacity, contrast, and label cues. Distant nodes remain present, and an
 explicit `master` role always receives the built-in readability floor.
 
+## Ambient motion and depth
+
+내장 browser renderer는 기본적으로 `ambientMotion: true`인 조용한 kinetic constellation을
+표현합니다. deterministic `targetNodePositions`와 selection/resize 계산은 그대로 앵커로
+남고, 기본 node Object3D에만 공통의 느린 float와 안정적인 node별 breathing offset을 별도로
+더합니다. 따라서 selection transaction이 끝난 뒤에도 그래프가 멈추지 않으며, legacy/custom
+renderer는 `ambientMotion` 힌트를 무시해도 호환됩니다.
+
+카메라 상대 깊이에 따라 기본 node body와 label의 opacity/scale이 달라집니다. 선택 node와
+1-hop node는 읽기 쉬운 계층을 유지하고, 관련 없는 먼 label은 거의 사라질 수 있습니다.
+명시적 `master`는 별도의 최소 가독성 계층을 유지합니다. 실제 blur나 post-processing은 사용하지
+않습니다.
+
+idle edge는 거의 보이지 않습니다. hover 또는 selected focus의 기본 incident edge만 기존의
+3-point curve 위에 2–3개의 renderer-owned token을 focus에서 이웃 방향으로 흘립니다. custom
+link factory의 geometry와 animation은 건드리지 않습니다. `reducedMotion`에서는 node offset과
+flow가 즉시 0이 되고, document가 hidden이면 motion loop가 멈췄다가 visible에서 시간 점프 없이
+재개됩니다.
+
+`getAmbientMotionObservation()`은 mount된 내장 renderer의 read-only 관찰 seam입니다. anchor와
+실제 rendered/world·screen node position, elapsed time/frame/phase, focus/lifecycle 상태, link flow와
+particle phase/position을 반환합니다. transition의 앵커 transaction은 기존
+`getTransitionObservation()`으로 계속 확인합니다. `getNodeScreenPosition()` 역시 실제 raycast
+Object3D의 live world transform을 투영하므로, host/fixture는 움직이는 node를 정확한 위치에서
+클릭할 수 있습니다. mount 전 또는 legacy custom renderer에서는 ambient observation이 `null`입니다.
+
 ## Development
 
 ```sh

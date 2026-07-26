@@ -27,6 +27,11 @@ export {
 export type {
   GraphLinkObjectFactory,
   GraphNodeObjectFactory,
+  GraphAmbientMotionLinkFlowObservation,
+  GraphAmbientMotionNodePosition,
+  GraphAmbientMotionObservation,
+  GraphAmbientMotionParticleObservation,
+  GraphAmbientMotionScreenPosition,
   GraphRenderLinkObservation,
   GraphRenderNodeLabelObservation,
   GraphRenderNodeObservation,

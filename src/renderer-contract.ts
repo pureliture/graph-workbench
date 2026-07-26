@@ -18,6 +18,57 @@ export interface GraphScreenPosition {
   readonly y: number;
 }
 
+/** A renderer-local position used by the ambient-motion observation seam. */
+export interface GraphAmbientMotionNodePosition {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+}
+
+export interface GraphAmbientMotionScreenPosition extends GraphScreenPosition {
+  readonly id: string;
+}
+
+export interface GraphAmbientMotionLinkFlowObservation {
+  readonly active: boolean;
+  readonly id: string;
+  readonly particleCount: number;
+}
+
+export interface GraphAmbientMotionParticleObservation {
+  readonly id: string;
+  readonly linkId: string;
+  /** Normalized curve progress in the focus-to-neighbor direction. */
+  readonly phase: number;
+  readonly screenX: number | null;
+  readonly screenY: number | null;
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+}
+
+/**
+ * Read-only renderer evidence for visual motion. `anchorNodePositions` are
+ * the selection/layout coordinates before micro motion; `renderedNodePositions`
+ * include only renderer-owned visual offsets.
+ */
+export interface GraphAmbientMotionObservation {
+  readonly active: boolean;
+  readonly anchorNodePositions: readonly GraphAmbientMotionNodePosition[];
+  /** Elapsed animated time, excluding visibility-hidden pauses. */
+  readonly elapsedMs: number;
+  readonly focusNodeId: string | null;
+  readonly frame: number;
+  readonly linkFlow: readonly GraphAmbientMotionLinkFlowObservation[];
+  readonly particles: readonly GraphAmbientMotionParticleObservation[];
+  readonly paused: boolean;
+  readonly phase: number;
+  readonly reducedMotion: boolean;
+  readonly renderedNodePositions: readonly GraphAmbientMotionNodePosition[];
+  readonly renderedScreenPositions: readonly GraphAmbientMotionScreenPosition[];
+}
+
 /** A renderer-local 3D coordinate sampled from the live graphData() nodes. */
 export interface GraphTransitionNodePosition {
   readonly id: string;
@@ -101,6 +152,8 @@ export interface GraphRenderer {
   focus(nodeId: string): void;
   /** Optional projection seam for the renderer's current node and camera state. */
   getNodeScreenPosition?(nodeId: string): GraphScreenPosition | null;
+  /** Optional renderer-owned micro-motion evidence. */
+  getAmbientMotionObservation?(): GraphAmbientMotionObservation | null;
   /** Optional live Object3D observation seam. Legacy renderers return no observation. */
   getRenderObservation?(): GraphRenderObservation | null;
   /** Optional live selection-transition observation seam. */

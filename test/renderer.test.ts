@@ -1,5 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BoxGeometry, Group, Mesh, MeshStandardMaterial, SpriteMaterial, type Object3D } from "three";
+import {
+  BoxGeometry,
+  Group,
+  Line,
+  LineBasicMaterial,
+  Mesh,
+  MeshBasicMaterial,
+  MeshStandardMaterial,
+  Sprite,
+  SpriteMaterial,
+  type Object3D,
+} from "three";
 
 const forceGraphFactory = vi.hoisted(() => ({
   create: undefined as unknown as () => FakeForceGraph,
@@ -52,12 +63,18 @@ class FakeCameraControls {
 
 class FakeOwnerDocument {
   readonly pointerUpListeners: PointerUpRegistration[] = [];
+  readonly visibilityListeners = new Set<() => void>();
+  visibilityState: DocumentVisibilityState = "visible";
 
   addEventListener(
     type: string,
     listener: EventListenerOrEventListenerObject | null,
     options?: boolean | AddEventListenerOptions,
   ): void {
+    if (type === "visibilitychange" && typeof listener === "function") {
+      this.visibilityListeners.add(listener as () => void);
+      return;
+    }
     if (type !== "pointerup" || typeof listener !== "function") return;
     this.pointerUpListeners.push({
       capture: typeof options === "boolean" ? options : options?.capture ?? false,
@@ -70,12 +87,21 @@ class FakeOwnerDocument {
     listener: EventListenerOrEventListenerObject | null,
     options?: boolean | EventListenerOptions,
   ): void {
+    if (type === "visibilitychange" && typeof listener === "function") {
+      this.visibilityListeners.delete(listener as () => void);
+      return;
+    }
     if (type !== "pointerup" || typeof listener !== "function") return;
     const capture = typeof options === "boolean" ? options : options?.capture ?? false;
     const index = this.pointerUpListeners.findIndex((registration) => (
       registration.listener === listener && registration.capture === capture
     ));
     if (index >= 0) this.pointerUpListeners.splice(index, 1);
+  }
+
+  setVisibility(next: DocumentVisibilityState): void {
+    this.visibilityState = next;
+    this.visibilityListeners.forEach((listener) => listener());
   }
 }
 
@@ -84,10 +110,12 @@ class FakeForceGraph {
   cameraControls = new FakeCameraControls();
   cameraProjection = { aspect: 4 / 3, fov: 50 };
   data: { links: Array<{ id: string }>; nodes: Array<Coordinates & { id: string }> } = { links: [], nodes: [] };
+  graphDataSetCalls = 0;
   linkObjectFactory: ((link: { id: string }) => Object3D) | undefined;
   linkObjects = new Map<string, Object3D>();
   nodeDragCallback: (() => void) | undefined;
   nodeObjectFactory: ((node: Coordinates & { id: string }) => Object3D) | undefined;
+  nodePositionUpdater: ((object: Object3D, coordinates: Coordinates, node: Coordinates & { id: string }) => boolean) | undefined;
   nodeObjects = new Map<string, Object3D>();
   ownerDocument = new FakeOwnerDocument();
   pose = {
@@ -108,11 +136,13 @@ class FakeForceGraph {
   }
   graphData(data?: typeof this.data): this | typeof this.data {
     if (!data) return this.data;
+    this.graphDataSetCalls += 1;
     this.data = data;
     this.sceneRoot.clear();
     data.nodes.forEach((node) => {
       const object = this.nodeObjects.get(node.id) ?? this.nodeObjectFactory?.(node);
       if (object) this.nodeObjects.set(node.id, object);
+      if (object) object.position.set(node.x, node.y, node.z);
       if (object) this.sceneRoot.add(object);
     });
     data.links.forEach((link) => {
@@ -132,6 +162,10 @@ class FakeForceGraph {
   }
   nodeId(): this { return this; }
   nodeLabel(): this { return this; }
+  nodePositionUpdate(callback: (object: Object3D, coordinates: Coordinates, node: Coordinates & { id: string }) => boolean): this {
+    this.nodePositionUpdater = callback;
+    return this;
+  }
   onNodeDrag(callback: () => void): this {
     this.nodeDragCallback = callback;
     return this;
@@ -168,6 +202,20 @@ class FakeForceGraph {
     };
     return this;
   }
+}
+
+function observeNeedsUpdateWrites(material: { needsUpdate: boolean }): () => number {
+  let writes = 0;
+  let currentValue = material.needsUpdate;
+  Object.defineProperty(material, "needsUpdate", {
+    configurable: true,
+    get: () => currentValue,
+    set: (value: boolean) => {
+      writes += 1;
+      currentValue = value;
+    },
+  });
+  return () => writes;
 }
 
 function expectAllNodeBoundsWithinViewport(
@@ -405,16 +453,298 @@ describe("Three.js camera transitions", () => {
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
     });
     renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] }));
-    const liveNode = graph.data.nodes.find((node) => node.id === "component:api")!;
-    Object.assign(liveNode, { x: 17, y: -9, z: 31 });
+    const liveObject = graph.nodeObjects.get("component:api")!;
+    liveObject.position.set(17, -9, 31);
 
-    expect(renderer.getNodeScreenPosition?.("component:api")).toEqual({ x: 117, y: 191 });
+    const projected = renderer.getNodeScreenPosition?.("component:api")!;
+    expect(projected).toEqual({ x: 117, y: 191 });
     expect(graph.projectionCalls).toEqual([{ x: 17, y: -9, z: 31 }]);
     expect(renderer.getNodeScreenPosition?.("missing")).toBeNull();
 
-    liveNode.x = Number.NaN;
+    liveObject.position.x = Number.NaN;
     expect(renderer.getNodeScreenPosition?.("component:api")).toBeNull();
     expect(graph.projectionCalls).toHaveLength(1);
+  });
+
+  it("keeps deterministic anchors stable while default objects receive continuous rendered drift", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, {}));
+    runLatestFrame(0);
+    const first = renderer.getAmbientMotionObservation!()!;
+    runLatestFrame(1_000);
+    const second = renderer.getAmbientMotionObservation!()!;
+
+    expect(second.active).toBe(true);
+    expect(second.elapsedMs).toBe(1_000);
+    expect(second.anchorNodePositions).toEqual(first.anchorNodePositions);
+    expect(second.renderedNodePositions).not.toEqual(first.renderedNodePositions);
+    expect(second.renderedScreenPositions).not.toEqual(first.renderedScreenPositions);
+    expect(renderer.getTransitionObservation!()?.nodePositions).toEqual(second.anchorNodePositions);
+    const apiAnchor = second.anchorNodePositions.find((node) => node.id === "component:api")!;
+    const apiRendered = second.renderedNodePositions.find((node) => node.id === "component:api")!;
+    const apiObject = graph.nodeObjects.get("component:api")!;
+    graph.nodePositionUpdater?.(apiObject, apiAnchor, graph.data.nodes.find((node) => node.id === "component:api")!);
+    expect(apiObject.position.toArray()).toEqual([apiRendered.x, apiRendered.y, apiRendered.z]);
+  });
+
+  it("flows two or three renderer-owned tokens outward across every focused default incident curve", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] }));
+    runLatestFrame(0);
+    const first = renderer.getAmbientMotionObservation!()!;
+    const activeLinks = first.linkFlow.filter((link) => link.active);
+    expect(activeLinks.map((link) => link.id).sort()).toEqual(["api-web", "release-api"]);
+    activeLinks.forEach((link) => expect(link.particleCount).toBeGreaterThanOrEqual(2));
+    activeLinks.forEach((link) => expect(link.particleCount).toBeLessThanOrEqual(3));
+    expect(first.particles).toHaveLength(activeLinks.reduce((total, link) => total + link.particleCount, 0));
+
+    runLatestFrame(1_000);
+    const second = renderer.getAmbientMotionObservation!()!;
+    const firstParticle = first.particles[0]!;
+    const secondParticle = second.particles.find((particle) => particle.id === firstParticle.id)!;
+    expect(secondParticle.phase).not.toBe(firstParticle.phase);
+    expect((secondParticle.phase - firstParticle.phase + 1) % 1).toBeCloseTo(0.22);
+    expect(secondParticle.screenX).not.toBeNull();
+    expect(secondParticle.screenY).not.toBeNull();
+  });
+
+  it("freezes drift and flow for reduced motion, then clears and resumes safely across visibility changes", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const selected = createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] });
+    renderer.setData(selected);
+    runLatestFrame(0);
+    expect(renderer.getAmbientMotionObservation!()?.particles.length).toBeGreaterThan(0);
+
+    graph.ownerDocument.setVisibility("hidden");
+    const hidden = renderer.getAmbientMotionObservation!()!;
+    expect(hidden).toMatchObject({ active: false, paused: true });
+    expect(hidden.particles).toEqual([]);
+    const elapsedBeforeResume = hidden.elapsedMs;
+
+    graph.ownerDocument.setVisibility("visible");
+    runLatestFrame(10_000);
+    const resumed = renderer.getAmbientMotionObservation!()!;
+    expect(resumed).toMatchObject({ active: true, paused: false });
+    expect(resumed.elapsedMs).toBe(elapsedBeforeResume);
+
+    renderer.setData(createRenderGraphData(graphFixture, {
+      reducedMotion: true,
+      selectedNodeIds: ["component:api"],
+    }));
+    const reduced = renderer.getAmbientMotionObservation!()!;
+    expect(reduced).toMatchObject({ active: false, reducedMotion: true });
+    expect(reduced.particles).toEqual([]);
+    expect(reduced.anchorNodePositions).toEqual(reduced.renderedNodePositions);
+  });
+
+  it("publishes the same selected anchors synchronously for reduced and normal selection transactions", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const initial = createRenderGraphData(graphFixture, {});
+    const normalSelected = createRenderGraphData(graphFixture, { selectedNodeIds: ["component:web"] });
+    const reducedSelected = createRenderGraphData(graphFixture, {
+      reducedMotion: true,
+      selectedNodeIds: ["component:web"],
+    });
+
+    renderer.setData(initial);
+    renderer.setData(normalSelected);
+    renderer.transitionToNode!("component:web", { reducedMotion: false });
+    runLatestFrame(0);
+    runLatestFrame(420);
+    const normalAnchors = renderer.getAmbientMotionObservation!()?.anchorNodePositions;
+
+    renderer.setData(initial);
+    renderer.cancelCameraTransition!();
+    renderer.setData(reducedSelected);
+    renderer.transitionToNode!("component:web", { reducedMotion: true });
+    const reduced = renderer.getAmbientMotionObservation!()!;
+
+    expect(normalAnchors).toEqual(normalSelected.nodes.map(({ id, x, y, z }) => ({ id, x, y, z })));
+    expect(reduced.anchorNodePositions).toEqual(normalAnchors);
+    expect(reduced.renderedNodePositions).toEqual(reduced.anchorNodePositions);
+    expect(reduced.particles).toEqual([]);
+  });
+
+  it("keeps custom node factories at their actual anchors and does not churn graph data or factories on warm ticks", () => {
+    const nodeFactory = vi.fn(() => new Group());
+    const linkFactory = vi.fn(() => new Group());
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+      linkObjectFactory: linkFactory,
+      nodeObjectFactory: nodeFactory,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, {}));
+    const graphDataSets = graph.graphDataSetCalls;
+    const nodeCalls = nodeFactory.mock.calls.length;
+    const linkCalls = linkFactory.mock.calls.length;
+    const nodeObjects = [...graph.nodeObjects.entries()];
+    const linkObjects = [...graph.linkObjects.entries()];
+    runLatestFrame(0);
+    runLatestFrame(1_000);
+    expect(graph.graphDataSetCalls).toBe(graphDataSets);
+    expect(nodeFactory).toHaveBeenCalledTimes(nodeCalls);
+    expect(linkFactory).toHaveBeenCalledTimes(linkCalls);
+    expect([...graph.nodeObjects.entries()]).toEqual(nodeObjects);
+    expect([...graph.linkObjects.entries()]).toEqual(linkObjects);
+
+    const observation = renderer.getAmbientMotionObservation!()!;
+    expect(observation.anchorNodePositions).toEqual(observation.renderedNodePositions);
+    const liveNode = graph.data.nodes.find((node) => node.id === "component:api")!;
+    Object.assign(liveNode, { x: 17, y: -9, z: 31 });
+    graph.nodeObjects.get("component:api")?.position.set(17, -9, 31);
+    expect(renderer.getNodeScreenPosition?.("component:api")).toEqual({ x: 117, y: 191 });
+  });
+
+  it("keeps default ambient RAF ticks material-stable after warm-up", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] }));
+    runLatestFrame(0);
+
+    const nodeObject = graph.nodeObjects.get("component:api")!;
+    const linkObject = graph.linkObjects.get("api-web")!;
+    const body = nodeObject.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
+    const label = nodeObject.children.find((child) => child.userData.graphVisualRole === "node-label") as Sprite;
+    expect(linkObject).toBeInstanceOf(Line);
+    expect(body.material).toBeInstanceOf(MeshStandardMaterial);
+    expect(label.material).toBeInstanceOf(SpriteMaterial);
+    const link = linkObject as Line;
+    expect(link.material).toBeInstanceOf(LineBasicMaterial);
+
+    const bodyMaterial = body.material as MeshStandardMaterial;
+    const labelMaterial = label.material as SpriteMaterial;
+    const linkMaterial = link.material as LineBasicMaterial;
+    const particleGroup = graph.sceneRoot.children.find((child) => child.name === "graph-workbench-flow-particles")!;
+    const particle = particleGroup.children[0] as Mesh;
+    const graphData = graph.data;
+    const graphDataSets = graph.graphDataSetCalls;
+    const nodeGeometry = body.geometry;
+    const linkGeometry = link.geometry;
+    const particleGeometry = particle.geometry;
+    const particleMaterial = particle.material;
+    const nodeTraverse = vi.spyOn(nodeObject, "traverse");
+    const linkTraverse = vi.spyOn(link, "traverse");
+    const bodyNeedsUpdateWrites = observeNeedsUpdateWrites(bodyMaterial);
+    const labelNeedsUpdateWrites = observeNeedsUpdateWrites(labelMaterial);
+    const linkNeedsUpdateWrites = observeNeedsUpdateWrites(linkMaterial);
+
+    runLatestFrame(125);
+    runLatestFrame(250);
+    runLatestFrame(375);
+
+    expect(graph.graphDataSetCalls).toBe(graphDataSets);
+    expect(graph.data).toBe(graphData);
+    expect(graph.nodeObjects.get("component:api")).toBe(nodeObject);
+    expect(graph.linkObjects.get("api-web")).toBe(linkObject);
+    expect(body.material).toBe(bodyMaterial);
+    expect(label.material).toBe(labelMaterial);
+    expect(link.material).toBe(linkMaterial);
+    expect(body.geometry).toBe(nodeGeometry);
+    expect(link.geometry).toBe(linkGeometry);
+    expect(particle.geometry).toBe(particleGeometry);
+    expect(particle.material).toBe(particleMaterial);
+    expect(bodyNeedsUpdateWrites()).toBe(0);
+    expect(labelNeedsUpdateWrites()).toBe(0);
+    expect(linkNeedsUpdateWrites()).toBe(0);
+    expect(nodeTraverse).not.toHaveBeenCalled();
+    expect(linkTraverse).not.toHaveBeenCalled();
+  });
+
+  it("keeps the canonical master floor above an unrelated far node after ambient RAF ticks", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const data = createRenderGraphData({
+      ...graphFixture,
+      nodes: [
+        ...graphFixture.nodes,
+        {
+          id: "concept:far",
+          kind: "concept",
+          label: "Far",
+          layoutHint: { pinned: true, x: -100, y: 0, z: 100 },
+          type: "concept",
+        },
+      ],
+    }, { selectedNodeIds: ["component:web"] });
+    // This is the real RenderGraphData shape a host can project to a renderer:
+    // it retains the canonical visual floor but deliberately omits source
+    // GraphNode roles. Ambient readability must still preserve the master.
+    renderer.setData({
+      ...data,
+      nodes: data.nodes.map(({ roles: _roles, ...node }) => node),
+    });
+    runLatestFrame(0);
+    runLatestFrame(1_000);
+
+    const observation = renderer.getRenderObservation!()!;
+    const master = observation.nodes.find((node) => node.id === "relation:release")!;
+    const far = observation.nodes.find((node) => node.id === "concept:far")!;
+    expect(master.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.45);
+    expect(master.label.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.45);
+    expect(master.label.minimumVisibleMaterialOpacity).toBeGreaterThan(far.label.minimumVisibleMaterialOpacity!);
+    expect(master.minimumVisibleMaterialOpacity).toBeGreaterThan(far.minimumVisibleMaterialOpacity!);
+  });
+
+  it("refreshes ambient default references when the vendor replaces an attached node object", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:web"] }));
+    const previousObject = graph.nodeObjects.get("relation:release")!;
+    const previousLabel = previousObject.children.find((child) => child.userData.graphVisualRole === "node-label") as Sprite;
+    const liveMaster = graph.data.nodes.find((node) => node.id === "relation:release")!;
+    const replacementObject = graph.nodeObjectFactory!(liveMaster);
+    const replacementLabel = replacementObject.children.find((child) => child.userData.graphVisualRole === "node-label") as Sprite;
+    previousLabel.material.opacity = 0.18;
+    replacementLabel.material.opacity = 0.18;
+    previousObject.removeFromParent();
+    graph.nodeObjects.set("relation:release", replacementObject);
+    graph.sceneRoot.add(replacementObject);
+
+    runLatestFrame(0);
+    runLatestFrame(1_000);
+
+    expect(replacementLabel.material.opacity).toBeGreaterThanOrEqual(0.45);
+    expect(previousLabel.material.opacity).toBe(0.18);
+  });
+
+  it("cancels the shared RAF and disposes the bounded particle resources exactly once", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] }));
+    const particleGroup = graph.sceneRoot.children.find((child) => child.name === "graph-workbench-flow-particles")!;
+    const particle = particleGroup.children[0] as Mesh;
+    const disposeGeometry = vi.spyOn(particle.geometry, "dispose");
+    const disposeMaterial = vi.spyOn(particle.material as MeshBasicMaterial, "dispose");
+    renderer.destroy();
+    renderer.destroy();
+
+    expect(cancelledFrames).toContain(1);
+    expect(frames.size).toBe(0);
+    expect(disposeGeometry).toHaveBeenCalledTimes(1);
+    expect(disposeMaterial).toHaveBeenCalledTimes(1);
+    expect(particleGroup.parent).toBeNull();
+    expect(graph.ownerDocument.visibilityListeners.size).toBe(0);
   });
 
   it("refreshes reused node, label, and restrained edge materials from the current selection visual cues", () => {
@@ -445,8 +775,8 @@ describe("Three.js camera transitions", () => {
     const distantLink = observation.links.find((link) => link.id === "release-api");
     expect(selected?.minimumVisibleMaterialOpacity).toBe(1);
     expect(neighbor?.minimumVisibleMaterialOpacity).toBeLessThan(neighbor!.visual.opacity);
-    expect(neighbor?.minimumVisibleMaterialOpacity).toBeGreaterThan(0.62);
-    expect(master?.minimumVisibleMaterialOpacity).toBe(0.62);
+    expect(neighbor?.minimumVisibleMaterialOpacity).toBeGreaterThan(0.5);
+    expect(master?.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.5);
     expect(selectedLink).toMatchObject({
       curvePointCount: 3,
       depthWriteEnabled: false,
@@ -454,9 +784,9 @@ describe("Three.js camera transitions", () => {
       visibleMaterialLineWidths: [1.25],
     });
     expect(distantLink).toMatchObject({
-      minimumVisibleMaterialOpacity: 0.1,
-      visibleMaterialLineWidths: [0.6],
+      visibleMaterialLineWidths: [0.5],
     });
+    expect(distantLink?.minimumVisibleMaterialOpacity).toBeLessThanOrEqual(0.055);
     expect(selected?.label).toMatchObject({
       objectTracked: true,
       objectVisible: true,
@@ -569,7 +899,7 @@ describe("Three.js camera transitions", () => {
     const observation = renderer.getRenderObservation!();
     const distant = observation.nodes.find((node) => node.id === "component:docs")!;
     const selectedNode = observation.nodes.find((node) => node.id === "component:api")!;
-    expect(distant.label).toMatchObject({ objectVisible: true, sceneAttached: true });
+    expect(distant.label).toMatchObject({ sceneAttached: true });
     expect(distant.worldScale!.x).toBeLessThan(selectedNode.worldScale!.x);
 
     runLatestFrame(420);
@@ -582,10 +912,10 @@ describe("Three.js camera transitions", () => {
     const farLabelOpacity = settledObservation.nodes.find((node) => node.id === "component:docs")
       ?.label.minimumVisibleMaterialOpacity;
     expect(selectedLabelOpacity).toBe(1);
-    expect(neighborLabelOpacity).toBeGreaterThanOrEqual(0.82);
-    expect(farLabelOpacity).toBe(0.72);
+    expect(neighborLabelOpacity).toBeGreaterThanOrEqual(0.68);
+    expect(farLabelOpacity ?? 0).toBeLessThan(0.35);
     expect(selectedLabelOpacity).toBeGreaterThan(neighborLabelOpacity!);
-    expect(neighborLabelOpacity).toBeGreaterThan(farLabelOpacity!);
+    expect(neighborLabelOpacity).toBeGreaterThan(farLabelOpacity ?? 0);
   });
 
   it("settles selection choreography before Orbit, node-drag, fit, zoom, or reduced-motion cancellation", () => {
@@ -930,11 +1260,10 @@ describe("Three.js camera transitions", () => {
 
     expectAllNodeBoundsWithinViewport(graph.cameraSetters.at(-1)!, selected.nodes, selectedNodeId, viewport);
     const observation = renderer.getRenderObservation!();
-    const minimumLabelScale = _device === "mobile" ? 17 * (480 / 390) : 17;
     observation.nodes.forEach((node) => {
       expect(node.label).toMatchObject({ objectVisible: true, sceneAttached: true, transparent: true });
-      expect(node.label.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.72);
-      expect(node.label.scale?.x).toBeGreaterThanOrEqual(minimumLabelScale);
+      expect(node.label.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.02);
+      expect(node.label.scale?.x).toBeGreaterThanOrEqual(8);
     });
   });
 

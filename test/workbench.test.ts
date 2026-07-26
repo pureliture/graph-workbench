@@ -114,8 +114,10 @@ describe("GraphWorkbench", () => {
 
     workbench.mount(element as unknown as HTMLElement);
     expect(renderer?.data?.nodes.map((node) => node.id)).toEqual(graphFixture.nodes.map((node) => node.id));
+    expect(renderer?.presentation?.ambientMotion).toBe(true);
     expect(states).toEqual(["mounted"]);
     expect(workbench.getNodeScreenPosition("component:api")).toBeNull();
+    expect(workbench.getAmbientMotionObservation()).toBeNull();
 
     callbacks?.onNodeClick("component:api");
     expect(clicks).toEqual(["component:api"]);
@@ -134,6 +136,10 @@ describe("GraphWorkbench", () => {
     expect(renderer?.fitCalls).toContain(0);
     expect(renderer?.zoomCalls).toEqual([1.5]);
     expect(renderer?.presentation?.theme).toBe("light");
+    expect(renderer?.presentation?.ambientMotion).toBe(true);
+
+    workbench.setPresentation({ ambientMotion: false });
+    expect(renderer?.presentation?.ambientMotion).toBe(false);
 
     workbench.unmount();
     expect(renderer?.destroyed).toBe(true);
