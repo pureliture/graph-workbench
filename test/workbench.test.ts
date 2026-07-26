@@ -91,9 +91,11 @@ describe("GraphWorkbench", () => {
     workbench.resize(640, 480);
     workbench.fit(0);
     workbench.zoom(1.5);
+    workbench.setPresentation({ theme: "light", selectedNodeIds: ["component:web"] });
     expect(renderer?.resizeCalls).toContainEqual([640, 480]);
     expect(renderer?.fitCalls).toContain(0);
     expect(renderer?.zoomCalls).toEqual([1.5]);
+    expect(renderer?.presentation?.theme).toBe("light");
 
     workbench.unmount();
     expect(renderer?.destroyed).toBe(true);

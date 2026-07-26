@@ -13,6 +13,7 @@ function normalizedPresentation(input, supplied) {
     return {
         selectedNodeIds,
         focusNodeId,
+        theme: supplied.theme === "light" ? "light" : "dark",
         nodeDescriptors: supplied.nodeDescriptors ?? {},
         linkDescriptors: supplied.linkDescriptors ?? {},
     };

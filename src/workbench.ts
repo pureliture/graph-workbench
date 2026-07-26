@@ -60,6 +60,7 @@ function normalizedPresentation(input: GraphInput, supplied: GraphPresentation):
   return {
     selectedNodeIds,
     focusNodeId,
+    theme: supplied.theme === "light" ? "light" : "dark",
     nodeDescriptors: supplied.nodeDescriptors ?? {},
     linkDescriptors: supplied.linkDescriptors ?? {},
   };

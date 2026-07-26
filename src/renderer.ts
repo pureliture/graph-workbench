@@ -149,6 +149,7 @@ export function createThreeForceGraphRenderer({
   function applyData(data: RenderGraphData): void {
     currentData = data;
     currentPresentation = data.presentation;
+    graph.backgroundColor(currentPresentation.theme === "light" ? "#edf5ff" : "#08111f");
     graph.graphData({ nodes: [...data.nodes], links: [...data.links] });
   }
 

@@ -11,6 +11,7 @@ export interface GraphLinkDescriptor {
 export interface GraphPresentation {
     readonly selectedNodeIds?: readonly string[];
     readonly focusNodeId?: string | null;
+    readonly theme?: "dark" | "light";
     readonly nodeDescriptors?: Readonly<Record<string, GraphNodeDescriptor>>;
     readonly linkDescriptors?: Readonly<Record<string, GraphLinkDescriptor>>;
 }
