@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BoxGeometry,
+  Color,
   Group,
   Line,
   LineBasicMaterial,
@@ -25,6 +26,7 @@ vi.mock("3d-force-graph", () => ({
 
 import { createRenderGraphData } from "../src/layout.js";
 import { createThreeForceGraphRenderer } from "../src/renderer.js";
+import type { GraphInput } from "../src/contract.js";
 import { graphFixture } from "./fixtures.js";
 
 interface Coordinates {
@@ -1175,6 +1177,10 @@ describe("Three.js camera transitions", () => {
     const selected = createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] });
     renderer.setData(initial);
     expect(customObjects.get("component:api")?.scale.toArray()).toEqual([2, 3, 4]);
+    const customBody = customObjects.get("component:api")?.children[0] as Mesh;
+    expect((customBody.material as MeshStandardMaterial).color.getHexString()).toBe("ffffff");
+    renderer.setPresentation({ theme: "light" });
+    expect((customBody.material as MeshStandardMaterial).color.getHexString()).toBe("ffffff");
 
     renderer.setData(selected);
     renderer.transitionToNode!("component:api", { reducedMotion: false });
@@ -1263,6 +1269,105 @@ describe("Three.js camera transitions", () => {
     )).toBeGreaterThan(160);
   });
 
+  it("applies semantic default colors across theme and input updates while preserving descriptor overrides", () => {
+    const semanticFixture: GraphInput = {
+      schemaVersion: 1,
+      layout: { seed: "semantic-palette" },
+      nodes: [
+        { id: "profile:ops", type: "profile", kind: "operating-profile", label: "Operations" },
+        { id: "relation:release", type: "relation", kind: "workflow", label: "Release" },
+        { id: "component:leaf", type: "component", kind: "skill", label: "Leaf skill" },
+        { id: "component:skill", type: "component", kind: "skill", label: "Skill" },
+        { id: "component:agent", type: "component", kind: "agent", label: "Agent" },
+        { id: "component:hook", type: "component", kind: "hook", label: "Hook" },
+        { id: "component:rule", type: "component", kind: "rule", label: "Rule" },
+        { id: "component:command", type: "component", kind: "command", label: "Command" },
+        { id: "component:composite", type: "component", kind: "composite", label: "Composite" },
+        { id: "concept:hub", type: "concept", kind: "unknown", label: "Hub" },
+        { id: "relation:unknown", type: "relation", kind: "inspection", label: "Inspect" },
+      ],
+      links: [
+        { id: "profile-hub", source: "profile:ops", target: "concept:hub", relationKind: "contains" },
+        { id: "workflow-hub", source: "relation:release", target: "concept:hub", relationKind: "runs" },
+        { id: "leaf-hub", source: "component:leaf", target: "concept:hub", relationKind: "uses" },
+        { id: "skill-agent", source: "component:skill", target: "component:agent", relationKind: "delegates" },
+        { id: "agent-hook", source: "component:agent", target: "component:hook", relationKind: "runs" },
+        { id: "hook-rule", source: "component:hook", target: "component:rule", relationKind: "checks" },
+        { id: "rule-command", source: "component:rule", target: "component:command", relationKind: "allows" },
+        { id: "command-composite", source: "component:command", target: "component:composite", relationKind: "calls" },
+        { id: "composite-skill", source: "component:composite", target: "component:skill", relationKind: "contains" },
+        { id: "unknown-hub", source: "relation:unknown", target: "concept:hub", relationKind: "inspects" },
+        { id: "unknown-composite", source: "relation:unknown", target: "component:composite", relationKind: "inspects" },
+      ],
+    };
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: {
+        onBackgroundClick() {},
+        onNodeClick() {},
+        onNodeHover() {},
+      },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const nodeColors = () => Object.fromEntries(
+      renderer.getRenderObservation!().nodes.map((node) => [node.id, node.bodyMaterialColor]),
+    );
+
+    renderer.setData(createRenderGraphData(semanticFixture, { theme: "dark" }));
+    expect(nodeColors()).toMatchObject({
+      "component:agent": "#c4b5fd",
+      "component:command": "#22d3ee",
+      "component:composite": "#facc15",
+      "component:hook": "#fb923c",
+      "component:leaf": "#f59e0b",
+      "component:rule": "#4ade80",
+      "component:skill": "#60a5fa",
+      "concept:hub": "#cbd5e1",
+      "profile:ops": "#a5b4fc",
+      "relation:release": "#fb7185",
+      "relation:unknown": "#cbd5e1",
+    });
+    const darkFallback = nodeColors()["concept:hub"];
+
+    renderer.setPresentation({ theme: "light" });
+    expect(nodeColors()).toMatchObject({
+      "component:agent": "#6d28d9",
+      "component:command": "#0e7490",
+      "component:composite": "#a16207",
+      "component:hook": "#c2410c",
+      "component:leaf": "#92400e",
+      "component:rule": "#15803d",
+      "component:skill": "#1d4ed8",
+      "concept:hub": "#334155",
+      "profile:ops": "#4338ca",
+      "relation:release": "#be123c",
+      "relation:unknown": "#334155",
+    });
+    const lightFallback = nodeColors()["concept:hub"];
+    const luminance = (color: string) => {
+      const rgb = new Color(color);
+      return (0.2126 * rgb.r) + (0.7152 * rgb.g) + (0.0722 * rgb.b);
+    };
+    expect(luminance(darkFallback ?? "#000000"))
+      .toBeGreaterThan(luminance(lightFallback ?? "#ffffff"));
+
+    renderer.setData(createRenderGraphData(semanticFixture, {
+      theme: "light",
+      nodeDescriptors: { "component:skill": { color: "#f0abfc" } },
+    }));
+    expect(nodeColors()["component:skill"]).toBe("#f0abfc");
+
+    renderer.setData(createRenderGraphData({
+      ...semanticFixture,
+      links: [
+        ...semanticFixture.links,
+        { id: "leaf-rule", source: "component:leaf", target: "component:rule", relationKind: "uses" },
+      ],
+    }, { theme: "light" }));
+    // The input update gives the former leaf degree two, so it falls back to
+    // its routine semantic kind instead of retaining the leaf amber.
+    expect(nodeColors()["component:leaf"]).toBe("#1d4ed8");
+  });
+
   it("uses routine-harness light materials without an outline shell or selection ring", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
@@ -1277,7 +1382,7 @@ describe("Three.js camera transitions", () => {
     const object = graph.nodeObjects.get("component:api")!;
     const body = object.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
     const label = object.children.find((child) => child.userData.graphVisualRole === "node-label") as Mesh;
-    expect((body.material as MeshStandardMaterial).color.getHexString()).toBe("64748b");
+    expect((body.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
     expect((label.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
     expect((label.material as MeshStandardMaterial).transparent).toBe(true);
     expect(object.children.some((child) => child.userData.graphVisualRole === "outline")).toBe(false);

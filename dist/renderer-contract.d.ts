@@ -117,6 +117,8 @@ export interface GraphRenderNodeLabelObservation extends GraphRenderObjectObserv
     readonly transparent: boolean | null;
 }
 export interface GraphRenderNodeObservation extends GraphRenderObjectObservation {
+    /** Default node body's current material color, or null for custom objects. */
+    readonly bodyMaterialColor: string | null;
     /** Scene-level Sprite label, anchored above the node and camera-facing. */
     readonly label: GraphRenderNodeLabelObservation;
     /** Renderer-local position used for perspective and distance cues. */

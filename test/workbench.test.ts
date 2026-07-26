@@ -80,6 +80,7 @@ class ObservationRenderer extends FakeRenderer {
       })),
       nodeIds: this.data.nodes.map((node) => node.id),
       nodes: this.data.nodes.map((node) => ({
+        bodyMaterialColor: null,
         id: node.id,
         minimumVisibleMaterialOpacity: null,
         objectTracked: false,

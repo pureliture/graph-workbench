@@ -168,6 +168,7 @@ interface RenderNodeLabelObservation extends RenderObjectObservation {
 }
 
 interface RenderNodeObservation extends RenderObjectObservation {
+  readonly bodyMaterialColor: string | null;
   readonly label: RenderNodeLabelObservation;
   readonly worldPosition: RenderTransformObservation;
   readonly worldScale: RenderTransformObservation | null;
@@ -711,6 +712,31 @@ test("mounts a real WebGL canvas and keeps input/render identities exact", async
   expect(observation.links.map(({ id }) => id)).toEqual(inputLinks);
   expect(observation.nodes.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)).toBe(true);
   expect(observation.links.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)).toBe(true);
+});
+
+test("actual WebGL scene exposes semantic default node colors across system themes", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await openFixture(page);
+
+  const dark = (await waitForRenderObservation(page)).observation.nodes;
+  const darkColor = (nodeId: string) => dark.find(({ id }) => id === nodeId)?.bodyMaterialColor;
+  expect(darkColor("relation:release")).toBe("#fb7185");
+  expect(darkColor("profile:platform")).toBe("#a5b4fc");
+  expect(darkColor("component:web")).toBe("#f59e0b");
+  expect(darkColor("relation:ingest")).toBe("#cbd5e1");
+
+  await page.emulateMedia({ colorScheme: "light" });
+  await expect.poll(async () => {
+    const telemetry = await readTelemetry<ObservedRenderTelemetry>(page, "graph-render-observation");
+    if (telemetry.availability !== "observed") return null;
+    return telemetry.observation.nodes.find(({ id }) => id === "profile:platform")?.bodyMaterialColor ?? null;
+  }).toBe("#4338ca");
+
+  const light = await waitForRenderObservation(page);
+  const lightColor = (nodeId: string) => light.observation.nodes.find(({ id }) => id === nodeId)?.bodyMaterialColor;
+  expect(lightColor("relation:release")).toBe("#be123c");
+  expect(lightColor("component:web")).toBe("#92400e");
+  expect(lightColor("relation:ingest")).toBe("#334155");
 });
 
 test("keeps ambient motion live while deterministic anchors stay fixed", async ({ page }) => {

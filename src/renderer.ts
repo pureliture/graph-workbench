@@ -84,26 +84,76 @@ function stableUnit(value: string): number {
 
 interface GraphThemePalette {
   readonly background: string;
-  readonly body: string;
   readonly edge: string;
+  readonly node: Readonly<Record<GraphNodeVisualKind, string>>;
   readonly outline: string;
   readonly rim: string;
 }
+
+type GraphNodeVisualKind =
+  | "agent"
+  | "command"
+  | "composite"
+  | "fallback"
+  | "hook"
+  | "leaf"
+  | "profile"
+  | "rule"
+  | "skill"
+  | "workflow";
+
+interface LinkEndpoints {
+  readonly source: string;
+  readonly target: string;
+}
+
+const ROUTINE_COMPONENT_KINDS = new Set<GraphNodeVisualKind>([
+  "agent",
+  "command",
+  "composite",
+  "hook",
+  "rule",
+  "skill",
+]);
 
 // These are the semantic Three.js colors from routine-harness's Tauri graph.
 // The interaction choreography is intentionally independent of the palette.
 const THEME_PALETTES: Readonly<Record<"dark" | "light", GraphThemePalette>> = {
   dark: {
     background: "#19192b",
-    body: "#475569",
     edge: "#aaa7c2",
+    node: {
+      agent: "#c4b5fd",
+      command: "#22d3ee",
+      composite: "#facc15",
+      fallback: "#cbd5e1",
+      hook: "#fb923c",
+      // Keep leaves distinct from the routine-harness composite yellow.
+      leaf: "#f59e0b",
+      profile: "#a5b4fc",
+      rule: "#4ade80",
+      skill: "#60a5fa",
+      workflow: "#fb7185",
+    },
     outline: "#cbd5e1",
     rim: "#f8fafc",
   },
   light: {
     background: "#f6f9fe",
-    body: "#64748b",
     edge: "#4b5a70",
+    node: {
+      agent: "#6d28d9",
+      command: "#0e7490",
+      composite: "#a16207",
+      fallback: "#334155",
+      hook: "#c2410c",
+      // This darker amber stays separate from the composite brown.
+      leaf: "#92400e",
+      profile: "#4338ca",
+      rule: "#15803d",
+      skill: "#1d4ed8",
+      workflow: "#be123c",
+    },
     outline: "#334155",
     rim: "#0f172a",
   },
@@ -131,8 +181,35 @@ function themePalette(theme: GraphPresentation["theme"]): GraphThemePalette {
   return theme === "light" ? THEME_PALETTES.light : THEME_PALETTES.dark;
 }
 
-function defaultNodeColor(_node: GraphNode, descriptor: GraphNodeDescriptor | undefined): string {
-  return descriptor?.color ?? THEME_PALETTES.dark.body;
+function nodeDegree(nodeId: string, links: readonly LinkEndpoints[]): number {
+  return links.reduce((degree, link) => (
+    degree + Number(link.source === nodeId) + Number(link.target === nodeId)
+  ), 0);
+}
+
+function routineComponentKind(node: GraphNode): GraphNodeVisualKind | null {
+  const candidate = node.kind.toLowerCase();
+  return ROUTINE_COMPONENT_KINDS.has(candidate as GraphNodeVisualKind)
+    ? candidate as GraphNodeVisualKind
+    : null;
+}
+
+function resolvedNodeVisualKind(node: GraphNode, links: readonly LinkEndpoints[]): GraphNodeVisualKind {
+  // These identities must remain visible even where a profile or workflow is
+  // incident to exactly one relationship.
+  if (node.type === "profile") return "profile";
+  if (node.type === "workflow" || node.kind === "workflow") return "workflow";
+  if (nodeDegree(node.id, links) === 1) return "leaf";
+  return routineComponentKind(node) ?? "fallback";
+}
+
+function defaultNodeColor(
+  node: GraphNode,
+  descriptor: GraphNodeDescriptor | undefined,
+  theme: GraphPresentation["theme"] = "dark",
+  links: readonly LinkEndpoints[] = [],
+): string {
+  return descriptor?.color ?? themePalette(theme).node[resolvedNodeVisualKind(node, links)];
 }
 
 function defaultLinkColor(descriptor: GraphLinkDescriptor | undefined): string {
@@ -170,6 +247,11 @@ function materialLineWidth(material: unknown): number | null {
   if (!material || typeof material !== "object" || !("linewidth" in material)) return null;
   const lineWidth = material.linewidth;
   return typeof lineWidth === "number" && Number.isFinite(lineWidth) ? lineWidth : null;
+}
+
+function materialColor(material: unknown): string | null {
+  if (!material || typeof material !== "object" || !("color" in material)) return null;
+  return material.color instanceof Color ? `#${material.color.getHexString()}` : null;
 }
 
 function materialDepthWrite(material: unknown): boolean | null {
@@ -938,6 +1020,14 @@ function setObjectMaterialColor(object: Object3D | null, color: string): void {
   });
 }
 
+function objectMaterialColor(object: Object3D | null): string | null {
+  if (!object) return null;
+  return materialsForObject(object)
+    .map((material) => materialColor(material))
+    .find((color): color is string => color !== null)
+    ?? null;
+}
+
 function setObjectMaterialOpacity(object: Object3D | null, opacity: number): void {
   if (!object) return;
   updateObjectMaterials(object, { opacity });
@@ -1064,6 +1154,10 @@ export function createThreeForceGraphRenderer({
     .nodeThreeObject((node) => {
       const object = nodeObjectFactory(node, nodeDescriptor(node));
       renderedNodeObjects.set(node.id, object);
+      // ThreeForceGraph may instantiate this object after the synchronous
+      // setData palette pass. Resolve degree-based colors once it is attached
+      // so a default leaf never remains at the factory's fallback color.
+      applyNodePalette(node);
       const ambientState = ambientNodes.get(node.id);
       if (ambientState) refreshAmbientNodeObject(ambientState, object);
       return object;
@@ -1121,7 +1215,10 @@ export function createThreeForceGraphRenderer({
     if (!object || object.userData.graphDefaultNodeObject !== true) return;
     const palette = themePalette(currentPresentation.theme);
     const descriptor = nodeDescriptor(node);
-    setObjectMaterialColor(graphChildWithRole(object, "body"), descriptor.color ?? palette.body);
+    setObjectMaterialColor(
+      graphChildWithRole(object, "body"),
+      defaultNodeColor(node, descriptor, currentPresentation.theme, currentData?.links ?? []),
+    );
     setObjectMaterialColor(graphChildWithRole(object, "outline"), palette.outline);
     setObjectMaterialColor(graphChildWithRole(object, "focus-rim"), palette.rim);
     setObjectMaterialColor(graphChildWithRole(object, "node-label"), palette.outline);
@@ -2149,6 +2246,9 @@ export function createThreeForceGraphRenderer({
       const livePosition = nodePosition(liveNode) ?? nodePosition(node)!;
       nodes.push({
         ...observeGraphObject(id, object, scene),
+        bodyMaterialColor: object?.userData.graphDefaultNodeObject === true
+          ? objectMaterialColor(graphChildWithRole(object, "body"))
+          : null,
         label: nodeLabelObservation(id, object ? graphChildWithRole(object, "node-label") : null, scene),
         worldPosition: { id, ...livePosition },
         worldScale: objectTransformObservation(id, object).scale,

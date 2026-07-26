@@ -614,17 +614,14 @@ const masterNodeId = graphInput.nodes.find((node) => node.roles?.includes("maste
 const graphPresentationByMode = {
   light: {
     linkColor: "#4b5a70",
-    nodeColor: "#64748b",
   },
   dark: {
     linkColor: "#aaa7c2",
-    nodeColor: "#475569",
   },
 } as const satisfies Record<
   ResolvedMode,
   {
     readonly linkColor: string;
-    readonly nodeColor: string;
   }
 >;
 
@@ -643,9 +640,6 @@ function applySystemPresentation(
     focusNodeId: selection.nodeId,
     linkDescriptors: Object.fromEntries(
       graphInput.links.map((link) => [link.id, { color: palette.linkColor }]),
-    ),
-    nodeDescriptors: Object.fromEntries(
-      graphInput.nodes.map((node) => [node.id, { color: palette.nodeColor }]),
     ),
     reducedMotion,
     selectedNodeIds: selection.nodeId ? [selection.nodeId] : [],
