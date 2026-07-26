@@ -659,8 +659,12 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         transparent: true,
     });
     const projectedWorldPosition = new Vector3();
-    const flowStart = { x: 0, y: 0, z: 0 };
-    const flowEnd = { x: 0, y: 0, z: 0 };
+    const linkStartLocalPosition = new Vector3();
+    const linkEndLocalPosition = new Vector3();
+    const curvePointLocalPosition = new Vector3();
+    const curvePointWorldPosition = new Vector3();
+    const particleLocalPosition = new Vector3();
+    const lineEndpointWorldPosition = new Vector3();
     const flowParticles = Array.from({ length: MAX_FLOW_PARTICLES }, (_unused, index) => {
         const object = new Mesh(particleGeometry, particleMaterial);
         object.visible = false;
@@ -737,7 +741,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             refreshAmbientLinkObject(ambientState, object);
         return object;
     })
-        .linkPositionUpdate((object, coordinates) => updateLinkObject(object, coordinates.start, coordinates.end))
+        .linkPositionUpdate((object, coordinates, link) => updateLinkObjectForRenderedNodes(object, link, coordinates.start, coordinates.end))
         .onNodeClick((node) => callbacks.onNodeClick(node.id))
         .onNodeHover((node) => {
         hoverNodeId = node?.id ?? null;
@@ -1114,7 +1118,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         return ambientNodes.get(id) ?? null;
     }
     function actualNodeWorldPosition(state) {
-        const object = state.object ?? renderedNodeObjects.get(state.id);
+        const object = renderedNodeObjects.get(state.id) ?? state.object;
         if (object) {
             object.getWorldPosition(projectedWorldPosition);
             return {
@@ -1124,6 +1128,48 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             };
         }
         return { x: state.renderedX, y: state.renderedY, z: state.renderedZ };
+    }
+    function objectLocalPositionForWorld(object, worldPosition, output) {
+        object.updateWorldMatrix(true, false);
+        output.set(worldPosition.x, worldPosition.y, worldPosition.z);
+        return object.worldToLocal(output);
+    }
+    function updateLinkObjectFromWorldEndpoints(object, startWorldPosition, endWorldPosition) {
+        objectLocalPositionForWorld(object, startWorldPosition, linkStartLocalPosition);
+        objectLocalPositionForWorld(object, endWorldPosition, linkEndLocalPosition);
+        return updateLinkObject(object, linkStartLocalPosition, linkEndLocalPosition);
+    }
+    function updateLinkObjectForRenderedNodes(object, link, fallbackStart, fallbackEnd) {
+        const linkId = typeof object.userData.graphLinkId === "string" ? object.userData.graphLinkId : link.id;
+        const canonicalLink = ambientLinks.get(linkId)?.link;
+        const source = canonicalLink ? renderedState(canonicalLink.source) : null;
+        const target = canonicalLink ? renderedState(canonicalLink.target) : null;
+        if (!source || !target)
+            return updateLinkObject(object, fallbackStart, fallbackEnd);
+        return updateLinkObjectFromWorldEndpoints(object, actualNodeWorldPosition(source), actualNodeWorldPosition(target));
+    }
+    function defaultLinkEndpointObservation(state) {
+        const object = state.object;
+        const positions = object?.geometry.getAttribute("position");
+        if (!object || !positions || positions.itemSize !== 3 || positions.count < 2)
+            return null;
+        object.updateWorldMatrix(true, false);
+        const positionAt = (index) => {
+            lineEndpointWorldPosition.set(positions.getX(index), positions.getY(index), positions.getZ(index));
+            object.localToWorld(lineEndpointWorldPosition);
+            return {
+                x: lineEndpointWorldPosition.x,
+                y: lineEndpointWorldPosition.y,
+                z: lineEndpointWorldPosition.z,
+            };
+        };
+        return {
+            end: positionAt(positions.count - 1),
+            id: state.id,
+            sourceId: state.link.source,
+            start: positionAt(0),
+            targetId: state.link.target,
+        };
     }
     function applyFocusedLinkFlow() {
         const focusNodeId = ambientFocusNodeId();
@@ -1143,13 +1189,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             state.particleCount = 0;
             if (!source || !target || !state.object)
                 continue;
-            flowStart.x = source.renderedX;
-            flowStart.y = source.renderedY;
-            flowStart.z = source.renderedZ;
-            flowEnd.x = target.renderedX;
-            flowEnd.y = target.renderedY;
-            flowEnd.z = target.renderedZ;
-            updateLinkObject(state.object, flowStart, flowEnd);
+            updateLinkObjectFromWorldEndpoints(state.object, actualNodeWorldPosition(source), actualNodeWorldPosition(target));
             applyAmbientDefaultLinkVisual(state, incident ? Math.max(selectedFocus ? 0.52 : 0.38, state.baseOpacity) : Math.min(0.055, state.baseOpacity * 0.22), incident ? Math.max(selectedFocus ? 1.1 : 0.9, state.baseWidth) : 0.5);
             if (!state.active)
                 continue;
@@ -1166,11 +1206,17 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                     + state.flowPhase;
                 const outwardPhase = basePhase - Math.floor(basePhase);
                 const curveProgress = outwardFromSource ? outwardPhase : 1 - outwardPhase;
-                pointOnThreePointCurve(positions, curveProgress, particle);
-                particle.object.position.set(particle.x, particle.y, particle.z);
+                pointOnThreePointCurve(positions, curveProgress, curvePointLocalPosition);
+                state.object.updateWorldMatrix(true, false);
+                state.object.localToWorld(curvePointWorldPosition.copy(curvePointLocalPosition));
+                particleGroup.updateWorldMatrix(true, false);
+                particle.object.position.copy(particleGroup.worldToLocal(particleLocalPosition.copy(curvePointWorldPosition)));
                 particle.object.visible = true;
                 particle.linkId = state.id;
                 particle.phase = outwardPhase;
+                particle.x = curvePointWorldPosition.x;
+                particle.y = curvePointWorldPosition.y;
+                particle.z = curvePointWorldPosition.z;
                 state.particleCount += 1;
             }
         }
@@ -1744,6 +1790,10 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 id: state.id,
                 particleCount: state.particleCount,
             }));
+            const linkEndpoints = [...ambientLinks.values()].flatMap((state) => {
+                const endpoint = defaultLinkEndpointObservation(state);
+                return endpoint ? [endpoint] : [];
+            });
             const particles = [];
             flowParticles.forEach((particle) => {
                 if (!particle.object.visible || !particle.linkId)
@@ -1766,6 +1816,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 elapsedMs: ambientElapsedMs,
                 focusNodeId: ambientFocusNodeId(),
                 frame: ambientFrameCount,
+                linkEndpoints,
                 linkFlow,
                 particles,
                 paused: ambientPaused,

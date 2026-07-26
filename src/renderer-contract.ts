@@ -18,12 +18,15 @@ export interface GraphScreenPosition {
   readonly y: number;
 }
 
-/** A renderer-local position used by the ambient-motion observation seam. */
-export interface GraphAmbientMotionNodePosition {
-  readonly id: string;
+/** A three-axis position used by the ambient-motion observation seam. */
+export interface GraphAmbientMotionPosition {
   readonly x: number;
   readonly y: number;
   readonly z: number;
+}
+
+export interface GraphAmbientMotionNodePosition extends GraphAmbientMotionPosition {
+  readonly id: string;
 }
 
 export interface GraphAmbientMotionScreenPosition extends GraphScreenPosition {
@@ -34,6 +37,18 @@ export interface GraphAmbientMotionLinkFlowObservation {
   readonly active: boolean;
   readonly id: string;
   readonly particleCount: number;
+}
+
+/**
+ * World-space endpoints read from a default Line geometry after its local
+ * positions have been transformed through the Line's current world matrix.
+ */
+export interface GraphAmbientMotionLinkEndpointObservation {
+  readonly end: GraphAmbientMotionPosition;
+  readonly id: string;
+  readonly sourceId: string;
+  readonly start: GraphAmbientMotionPosition;
+  readonly targetId: string;
 }
 
 export interface GraphAmbientMotionParticleObservation {
@@ -51,7 +66,8 @@ export interface GraphAmbientMotionParticleObservation {
 /**
  * Read-only renderer evidence for visual motion. `anchorNodePositions` are
  * the selection/layout coordinates before micro motion; `renderedNodePositions`
- * include only renderer-owned visual offsets.
+ * are the live world-space positions of the rendered node objects. Default Line
+ * endpoints remain available in reduced-motion mode while flow particles pause.
  */
 export interface GraphAmbientMotionObservation {
   readonly active: boolean;
@@ -60,6 +76,7 @@ export interface GraphAmbientMotionObservation {
   readonly elapsedMs: number;
   readonly focusNodeId: string | null;
   readonly frame: number;
+  readonly linkEndpoints: readonly GraphAmbientMotionLinkEndpointObservation[];
   readonly linkFlow: readonly GraphAmbientMotionLinkFlowObservation[];
   readonly particles: readonly GraphAmbientMotionParticleObservation[];
   readonly paused: boolean;

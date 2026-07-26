@@ -90,6 +90,14 @@ interface AmbientLinkFlow {
   readonly particleCount: number;
 }
 
+interface AmbientLinkEndpoint {
+  readonly end: AmbientPosition;
+  readonly id: string;
+  readonly sourceId: string;
+  readonly start: AmbientPosition;
+  readonly targetId: string;
+}
+
 interface AmbientParticle extends AmbientPosition {
   readonly linkId: string;
   readonly phase: number;
@@ -103,6 +111,7 @@ interface AmbientMotionFrame {
   readonly elapsedMs: number;
   readonly focusNodeId: string | null;
   readonly frame: number;
+  readonly linkEndpoints: readonly AmbientLinkEndpoint[];
   readonly linkFlow: readonly AmbientLinkFlow[];
   readonly particles: readonly AmbientParticle[];
   readonly paused: boolean;
@@ -451,6 +460,25 @@ function ambientScreenPosition(frame: AmbientMotionFrame, nodeId: string) {
   return position;
 }
 
+function expectLinkEndpointsAttachedToRenderedNodes(
+  frame: AmbientMotionFrame,
+  linkIds: readonly string[],
+  focusedNodeId?: string,
+): void {
+  const endpointsById = new Map(frame.linkEndpoints.map((endpoint) => [endpoint.id, endpoint]));
+  for (const linkId of linkIds) {
+    const endpoint = endpointsById.get(linkId);
+    if (!endpoint) throw new Error(`${linkId} did not expose live default Line endpoints.`);
+    if (focusedNodeId) {
+      expect([endpoint.sourceId, endpoint.targetId]).toContain(focusedNodeId);
+    }
+    expect(spatialDistance(endpoint.start, ambientPosition(frame, endpoint.sourceId, "renderedNodePositions")))
+      .toBeLessThan(0.001);
+    expect(spatialDistance(endpoint.end, ambientPosition(frame, endpoint.targetId, "renderedNodePositions")))
+      .toBeLessThan(0.001);
+  }
+}
+
 function averageScreenMotion(
   before: AmbientMotionFrame,
   after: AmbientMotionFrame,
@@ -764,6 +792,40 @@ test("actual canvas hover exposes only outbound flow particles without selecting
   expect(selectionAfterHover.nodeId ?? null).toBeNull();
 });
 
+test("keeps hovered active link curves attached to rendered node positions across frames", async ({ page }) => {
+  await openFixture(page);
+
+  await hoverProjectedCanvasNode(page, "relation:query");
+  const hover = await waitForAmbientMotion(page, (motion) => (
+    motion.active
+    && !motion.reducedMotion
+    && motion.focusNodeId === "relation:query"
+    && motion.visibleLinkFlow.some(({ active }) => active)
+  ));
+  const activeLinkIds = hover.visibleLinkFlow.filter(({ active }) => active).map(({ id }) => id);
+  expect(activeLinkIds).not.toHaveLength(0);
+  expectLinkEndpointsAttachedToRenderedNodes(hover, activeLinkIds, "relation:query");
+
+  // The endpoint observation is sampled again after a later renderer frame,
+  // rather than comparing the curve to a static layout snapshot. This catches
+  // ambient node offsets that leave the active Line geometry behind.
+  const laterHover = await waitForAmbientMotionAfter(
+    page,
+    hover.frame,
+    1,
+    (motion) => (
+      motion.active
+      && !motion.reducedMotion
+      && motion.focusNodeId === "relation:query"
+      && motion.visibleLinkFlow.some(({ active }) => active)
+    ),
+  );
+  expect(laterHover.frame).toBeGreaterThan(hover.frame);
+  const laterActiveLinkIds = laterHover.visibleLinkFlow.filter(({ active }) => active).map(({ id }) => id);
+  expect(laterActiveLinkIds).not.toHaveLength(0);
+  expectLinkEndpointsAttachedToRenderedNodes(laterHover, laterActiveLinkIds, "relation:query");
+});
+
 test("observes the master floor and selection-distance opacity in attached scene objects", async ({ page }) => {
   await openFixture(page);
   const beforeMotion = await waitForMotionSettled(page);
@@ -1064,6 +1126,20 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
     12,
     (motion) => motion.focusNodeId === "relation:query" && motion.active,
   );
+  // This follows the actual mouse-selection path above. Active link endpoints
+  // must keep their source/target identities and stay attached to the live
+  // ambient node transforms, rather than the deterministic layout anchors.
+  expect(ambientAfterSelection.reducedMotion).toBe(false);
+  const selectedActiveLinkIds = ambientAfterSelection.visibleLinkFlow
+    .filter(({ active }) => active)
+    .map(({ id }) => id);
+  expect(selectedActiveLinkIds).not.toHaveLength(0);
+  expectLinkEndpointsAttachedToRenderedNodes(ambientAfterSelection, selectedActiveLinkIds, "relation:query");
+  const laterSelectedActiveLinkIds = ambientLater.visibleLinkFlow
+    .filter(({ active }) => active)
+    .map(({ id }) => id);
+  expect(laterSelectedActiveLinkIds).toEqual(selectedActiveLinkIds);
+  expectLinkEndpointsAttachedToRenderedNodes(ambientLater, laterSelectedActiveLinkIds, "relation:query");
   for (const nodeId of ["relation:query", "concept:index", "concept:session"]) {
     expect(ambientPosition(ambientLater, nodeId, "anchorNodePositions")).toEqual(
       ambientPosition(ambientAfterSelection, nodeId, "anchorNodePositions"),
@@ -1245,6 +1321,11 @@ test("reduced motion reaches the same public selection target and deterministic 
   )).toEqual({ ...reduced, reducedMotion: true });
   expect(reducedAmbient.anchorNodePositions).toEqual(normalAmbient.anchorNodePositions);
   expect(reducedAmbient.renderedNodePositions).toEqual(reducedAmbient.anchorNodePositions);
+  expect(reducedAmbient.linkEndpoints).toHaveLength(fixtureLinkCount);
+  expectLinkEndpointsAttachedToRenderedNodes(
+    reducedAmbient,
+    reducedAmbient.linkEndpoints.map(({ id }) => id),
+  );
   expect(reducedAmbient.visibleLinkFlow).toHaveLength(0);
   expect(reducedAmbient.visibleParticles).toHaveLength(0);
   expect(laterNormalAmbient.frame).toBeGreaterThan(normalAmbient.frame);

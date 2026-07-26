@@ -9,6 +9,7 @@ import {
   MeshStandardMaterial,
   Sprite,
   SpriteMaterial,
+  Vector3,
   type Object3D,
 } from "three";
 
@@ -113,6 +114,11 @@ class FakeForceGraph {
   graphDataSetCalls = 0;
   linkObjectFactory: ((link: { id: string }) => Object3D) | undefined;
   linkObjects = new Map<string, Object3D>();
+  linkPositionUpdater: ((
+    object: Object3D,
+    coordinates: { end: Coordinates; start: Coordinates },
+    link: { id: string; source: unknown; target: unknown },
+  ) => boolean) | undefined;
   nodeDragCallback: (() => void) | undefined;
   nodeObjectFactory: ((node: Coordinates & { id: string }) => Object3D) | undefined;
   nodePositionUpdater: ((object: Object3D, coordinates: Coordinates, node: Coordinates & { id: string }) => boolean) | undefined;
@@ -153,7 +159,14 @@ class FakeForceGraph {
     return this;
   }
   height(): this { return this; }
-  linkPositionUpdate(): this { return this; }
+  linkPositionUpdate(callback: (
+    object: Object3D,
+    coordinates: { end: Coordinates; start: Coordinates },
+    link: { id: string; source: unknown; target: unknown },
+  ) => boolean): this {
+    this.linkPositionUpdater = callback;
+    return this;
+  }
   linkSource(): this { return this; }
   linkTarget(): this { return this; }
   linkThreeObject(factory: (link: { id: string }) => Object3D): this {
@@ -514,6 +527,73 @@ describe("Three.js camera transitions", () => {
     expect(secondParticle.screenY).not.toBeNull();
   });
 
+  it("attaches focused default links to the actual world positions of ambient node objects", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] }));
+
+    const ambientRoot = new Group();
+    ambientRoot.position.set(23, -17, 11);
+    graph.sceneRoot.add(ambientRoot);
+    const source = graph.nodeObjects.get("component:api")!;
+    const target = graph.nodeObjects.get("component:web")!;
+    ambientRoot.add(source, target);
+
+    runLatestFrame(0);
+    runLatestFrame(1_000);
+
+    const link = graph.linkObjects.get("api-web") as Line;
+    const positions = link.geometry.getAttribute("position");
+    const lineEndpointInWorld = (index: number) => link.localToWorld(new Vector3().fromBufferAttribute(positions, index));
+    const sourceWorld = source.getWorldPosition(new Vector3());
+    const targetWorld = target.getWorldPosition(new Vector3());
+    const liveLink = graph.data.links.find((candidate) => candidate.id === "api-web") as {
+      id: string;
+      source: string;
+      target: string;
+    };
+    const sourceAnchor = graph.data.nodes.find((node) => node.id === liveLink.source)!;
+    const targetAnchor = graph.data.nodes.find((node) => node.id === liveLink.target)!;
+    graph.linkPositionUpdater!(link, {
+      end: targetAnchor,
+      start: sourceAnchor,
+    }, {
+      ...liveLink,
+      // d3-force-3d mutates this vendor callback input from ids to live node
+      // objects. The renderer must resolve the canonical ids from its own link
+      // state instead of falling back to these stale anchor coordinates.
+      source: sourceAnchor,
+      target: targetAnchor,
+    });
+    const ambient = renderer.getAmbientMotionObservation!()!;
+    const endpoint = ambient.linkEndpoints.find((candidate) => candidate.id === "api-web")!;
+
+    expect(lineEndpointInWorld(0).distanceTo(sourceWorld)).toBeLessThan(0.0001);
+    expect(lineEndpointInWorld(positions.count - 1).distanceTo(targetWorld)).toBeLessThan(0.0001);
+    expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z).distanceTo(sourceWorld)).toBeLessThan(0.0001);
+    expect(new Vector3(endpoint.end.x, endpoint.end.y, endpoint.end.z).distanceTo(targetWorld)).toBeLessThan(0.0001);
+    const renderedNodes = new Map(ambient.renderedNodePositions.map((node) => [node.id, node]));
+    const renderedSource = renderedNodes.get(endpoint.sourceId)!;
+    const renderedTarget = renderedNodes.get(endpoint.targetId)!;
+    expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z).distanceTo(renderedSource)).toBeLessThan(0.0001);
+    expect(new Vector3(endpoint.end.x, endpoint.end.y, endpoint.end.z).distanceTo(renderedTarget)).toBeLessThan(0.0001);
+
+    const flow = ambient.particles.find((particle) => particle.linkId === "api-web")!;
+    const particleIndex = Number.parseInt(flow.id.slice("flow:".length), 10);
+    const particleGroup = graph.sceneRoot.children.find((child) => child.name === "graph-workbench-flow-particles")!;
+    const particle = particleGroup.children[particleIndex] as Mesh;
+    const progress = flow.phase;
+    const inverse = 1 - progress;
+    const expectedParticleWorld = link.localToWorld(new Vector3(
+      (inverse * inverse * positions.getX(0)) + (2 * inverse * progress * positions.getX(1)) + (progress * progress * positions.getX(2)),
+      (inverse * inverse * positions.getY(0)) + (2 * inverse * progress * positions.getY(1)) + (progress * progress * positions.getY(2)),
+      (inverse * inverse * positions.getZ(0)) + (2 * inverse * progress * positions.getZ(1)) + (progress * progress * positions.getZ(2)),
+    ));
+    expect(particle.getWorldPosition(new Vector3()).distanceTo(expectedParticleWorld)).toBeLessThan(0.0001);
+  });
+
   it("freezes drift and flow for reduced motion, then clears and resumes safely across visibility changes", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
@@ -544,6 +624,14 @@ describe("Three.js camera transitions", () => {
     expect(reduced).toMatchObject({ active: false, reducedMotion: true });
     expect(reduced.particles).toEqual([]);
     expect(reduced.anchorNodePositions).toEqual(reduced.renderedNodePositions);
+    expect(reduced.linkEndpoints).toHaveLength(graphFixture.links.length);
+    const reducedNodes = new Map(reduced.renderedNodePositions.map((node) => [node.id, node]));
+    reduced.linkEndpoints.forEach((endpoint) => {
+      const source = reducedNodes.get(endpoint.sourceId)!;
+      const target = reducedNodes.get(endpoint.targetId)!;
+      expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z).distanceTo(source)).toBeLessThan(0.0001);
+      expect(new Vector3(endpoint.end.x, endpoint.end.y, endpoint.end.z).distanceTo(target)).toBeLessThan(0.0001);
+    });
   });
 
   it("publishes the same selected anchors synchronously for reduced and normal selection transactions", () => {

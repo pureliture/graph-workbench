@@ -23,8 +23,10 @@ import type { RenderGraphData, RenderLink, RenderNode } from "./layout.js";
 import type { GraphLinkDescriptor, GraphNodeDescriptor, GraphPresentation } from "./presentation.js";
 import type {
   GraphCameraTransitionOptions,
+  GraphAmbientMotionLinkEndpointObservation,
   GraphAmbientMotionLinkFlowObservation,
   GraphAmbientMotionNodePosition,
+  GraphAmbientMotionPosition,
   GraphAmbientMotionObservation,
   GraphAmbientMotionParticleObservation,
   GraphAmbientMotionScreenPosition,
@@ -45,8 +47,10 @@ import type {
 
 export type {
   GraphLinkObjectFactory,
+  GraphAmbientMotionLinkEndpointObservation,
   GraphAmbientMotionLinkFlowObservation,
   GraphAmbientMotionNodePosition,
+  GraphAmbientMotionPosition,
   GraphAmbientMotionObservation,
   GraphAmbientMotionParticleObservation,
   GraphAmbientMotionScreenPosition,
@@ -990,8 +994,12 @@ export function createThreeForceGraphRenderer({
     transparent: true,
   });
   const projectedWorldPosition = new Vector3();
-  const flowStart = { x: 0, y: 0, z: 0 };
-  const flowEnd = { x: 0, y: 0, z: 0 };
+  const linkStartLocalPosition = new Vector3();
+  const linkEndLocalPosition = new Vector3();
+  const curvePointLocalPosition = new Vector3();
+  const curvePointWorldPosition = new Vector3();
+  const particleLocalPosition = new Vector3();
+  const lineEndpointWorldPosition = new Vector3();
   const flowParticles: FlowParticle[] = Array.from({ length: MAX_FLOW_PARTICLES }, (_unused, index) => {
     const object = new Mesh(particleGeometry, particleMaterial);
     object.visible = false;
@@ -1067,8 +1075,9 @@ export function createThreeForceGraphRenderer({
       if (ambientState) refreshAmbientLinkObject(ambientState, object);
       return object;
     })
-    .linkPositionUpdate((object, coordinates) => updateLinkObject(
+    .linkPositionUpdate((object, coordinates, link) => updateLinkObjectForRenderedNodes(
       object,
+      link,
       coordinates.start,
       coordinates.end,
     ))
@@ -1486,7 +1495,7 @@ export function createThreeForceGraphRenderer({
   }
 
   function actualNodeWorldPosition(state: AmbientNodeState): Coordinates {
-    const object = state.object ?? renderedNodeObjects.get(state.id);
+    const object = renderedNodeObjects.get(state.id) ?? state.object;
     if (object) {
       object.getWorldPosition(projectedWorldPosition);
       return {
@@ -1496,6 +1505,67 @@ export function createThreeForceGraphRenderer({
       };
     }
     return { x: state.renderedX, y: state.renderedY, z: state.renderedZ };
+  }
+
+  function objectLocalPositionForWorld(
+    object: Object3D,
+    worldPosition: Coordinates,
+    output: Vector3,
+  ): Vector3 {
+    object.updateWorldMatrix(true, false);
+    output.set(worldPosition.x, worldPosition.y, worldPosition.z);
+    return object.worldToLocal(output);
+  }
+
+  function updateLinkObjectFromWorldEndpoints(
+    object: Object3D,
+    startWorldPosition: Coordinates,
+    endWorldPosition: Coordinates,
+  ): boolean {
+    objectLocalPositionForWorld(object, startWorldPosition, linkStartLocalPosition);
+    objectLocalPositionForWorld(object, endWorldPosition, linkEndLocalPosition);
+    return updateLinkObject(object, linkStartLocalPosition, linkEndLocalPosition);
+  }
+
+  function updateLinkObjectForRenderedNodes(
+    object: Object3D,
+    link: RenderLink,
+    fallbackStart: Coordinates,
+    fallbackEnd: Coordinates,
+  ): boolean {
+    const linkId = typeof object.userData.graphLinkId === "string" ? object.userData.graphLinkId : link.id;
+    const canonicalLink = ambientLinks.get(linkId)?.link;
+    const source = canonicalLink ? renderedState(canonicalLink.source) : null;
+    const target = canonicalLink ? renderedState(canonicalLink.target) : null;
+    if (!source || !target) return updateLinkObject(object, fallbackStart, fallbackEnd);
+    return updateLinkObjectFromWorldEndpoints(
+      object,
+      actualNodeWorldPosition(source),
+      actualNodeWorldPosition(target),
+    );
+  }
+
+  function defaultLinkEndpointObservation(state: AmbientLinkState): GraphAmbientMotionLinkEndpointObservation | null {
+    const object = state.object;
+    const positions = object?.geometry.getAttribute("position");
+    if (!object || !positions || positions.itemSize !== 3 || positions.count < 2) return null;
+    object.updateWorldMatrix(true, false);
+    const positionAt = (index: number): GraphAmbientMotionPosition => {
+      lineEndpointWorldPosition.set(positions.getX(index), positions.getY(index), positions.getZ(index));
+      object.localToWorld(lineEndpointWorldPosition);
+      return {
+        x: lineEndpointWorldPosition.x,
+        y: lineEndpointWorldPosition.y,
+        z: lineEndpointWorldPosition.z,
+      };
+    };
+    return {
+      end: positionAt(positions.count - 1),
+      id: state.id,
+      sourceId: state.link.source,
+      start: positionAt(0),
+      targetId: state.link.target,
+    };
   }
 
   function applyFocusedLinkFlow(): void {
@@ -1515,13 +1585,11 @@ export function createThreeForceGraphRenderer({
       state.active = Boolean(incident && state.object && ambientMotionEnabled());
       state.particleCount = 0;
       if (!source || !target || !state.object) continue;
-      flowStart.x = source.renderedX;
-      flowStart.y = source.renderedY;
-      flowStart.z = source.renderedZ;
-      flowEnd.x = target.renderedX;
-      flowEnd.y = target.renderedY;
-      flowEnd.z = target.renderedZ;
-      updateLinkObject(state.object, flowStart, flowEnd);
+      updateLinkObjectFromWorldEndpoints(
+        state.object,
+        actualNodeWorldPosition(source),
+        actualNodeWorldPosition(target),
+      );
       applyAmbientDefaultLinkVisual(
         state,
         incident ? Math.max(selectedFocus ? 0.52 : 0.38, state.baseOpacity) : Math.min(0.055, state.baseOpacity * 0.22),
@@ -1540,11 +1608,17 @@ export function createThreeForceGraphRenderer({
           + state.flowPhase;
         const outwardPhase = basePhase - Math.floor(basePhase);
         const curveProgress = outwardFromSource ? outwardPhase : 1 - outwardPhase;
-        pointOnThreePointCurve(positions, curveProgress, particle);
-        particle.object.position.set(particle.x, particle.y, particle.z);
+        pointOnThreePointCurve(positions, curveProgress, curvePointLocalPosition);
+        state.object.updateWorldMatrix(true, false);
+        state.object.localToWorld(curvePointWorldPosition.copy(curvePointLocalPosition));
+        particleGroup.updateWorldMatrix(true, false);
+        particle.object.position.copy(particleGroup.worldToLocal(particleLocalPosition.copy(curvePointWorldPosition)));
         particle.object.visible = true;
         particle.linkId = state.id;
         particle.phase = outwardPhase;
+        particle.x = curvePointWorldPosition.x;
+        particle.y = curvePointWorldPosition.y;
+        particle.z = curvePointWorldPosition.z;
         state.particleCount += 1;
       }
     }
@@ -2166,6 +2240,10 @@ export function createThreeForceGraphRenderer({
         id: state.id,
         particleCount: state.particleCount,
       }));
+      const linkEndpoints = [...ambientLinks.values()].flatMap((state) => {
+        const endpoint = defaultLinkEndpointObservation(state);
+        return endpoint ? [endpoint] : [];
+      });
       const particles: GraphAmbientMotionParticleObservation[] = [];
       flowParticles.forEach((particle) => {
         if (!particle.object.visible || !particle.linkId) return;
@@ -2187,6 +2265,7 @@ export function createThreeForceGraphRenderer({
         elapsedMs: ambientElapsedMs,
         focusNodeId: ambientFocusNodeId(),
         frame: ambientFrameCount,
+        linkEndpoints,
         linkFlow,
         particles,
         paused: ambientPaused,
