@@ -8,10 +8,11 @@ invoke backend commands, or infer domain semantics from the rendered scene.
 ## Install
 
 ```sh
-npm install @pureliture/graph-workbench
+npm install git+https://github.com/pureliture/graph-workbench.git#2b40f3936dc05bcf6493cad82009d254825a156f
 ```
 
-For a Git-based integration, pin an immutable commit rather than a moving branch.
+This first release is consumed from Git rather than a package registry. Pin an immutable
+commit rather than a moving branch.
 
 ```json
 {
