@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Group, Mesh, MeshStandardMaterial, type Object3D } from "three";
+import { BoxGeometry, Group, Mesh, MeshStandardMaterial, type Object3D } from "three";
 
 const forceGraphFactory = vi.hoisted(() => ({
   create: undefined as unknown as () => FakeForceGraph,
@@ -82,6 +82,7 @@ class FakeOwnerDocument {
 class FakeForceGraph {
   cameraSetters: Array<{ duration: number | undefined; lookAt: Coordinates | undefined; position: Coordinates }> = [];
   cameraControls = new FakeCameraControls();
+  cameraProjection = { aspect: 4 / 3, fov: 50 };
   data: { links: Array<{ id: string }>; nodes: Array<Coordinates & { id: string }> } = { links: [], nodes: [] };
   linkObjectFactory: ((link: { id: string }) => Object3D) | undefined;
   linkObjects = new Map<string, Object3D>();
@@ -99,6 +100,7 @@ class FakeForceGraph {
 
   _destructor(): void {}
   backgroundColor(): this { return this; }
+  camera(): typeof this.cameraProjection { return this.cameraProjection; }
   controls(): FakeCameraControls { return this.cameraControls; }
   graph2ScreenCoords(x: number, y: number, z: number): Coordinates {
     this.projectionCalls.push({ x, y, z });
@@ -195,6 +197,35 @@ describe("Three.js camera transitions", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
+
+  function runLatestFrame(timestamp: number): number {
+    const frameId = Math.max(...frames.keys());
+    if (!Number.isFinite(frameId)) throw new Error("Expected a scheduled animation frame");
+    const callback = frames.get(frameId)!;
+    frames.delete(frameId);
+    callback(timestamp);
+    return frameId;
+  }
+
+  function moveSelectionHalfway(
+    renderer: ReturnType<typeof createThreeForceGraphRenderer>,
+    data: ReturnType<typeof createRenderGraphData>,
+    nodeId: string,
+  ): void {
+    renderer.setData(data);
+    // GraphWorkbench syncs the normalized presentation immediately after data.
+    // An equivalent presentation must not consume the pending scene transaction.
+    renderer.setPresentation(data.presentation);
+    renderer.transitionToNode!(nodeId, { reducedMotion: false });
+    runLatestFrame(0);
+    runLatestFrame(210);
+  }
+
+  function expectLiveNodesAt(data: ReturnType<typeof createRenderGraphData>): void {
+    expect(graph.data.nodes.map(({ id, x, y, z }) => ({ id, x, y, z }))).toEqual(
+      data.nodes.map(({ id, x, y, z }) => ({ id, x, y, z })),
+    );
+  }
 
   it("cancels stale focus, fit, zoom, and restore frames without starting vendor tweens", () => {
     const renderer = createThreeForceGraphRenderer({
@@ -329,6 +360,9 @@ describe("Three.js camera transitions", () => {
     const initialApiLinkObject = graph.linkObjects.get("api-web");
 
     renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:web"] }));
+    renderer.transitionToNode!("component:web", { reducedMotion: false });
+    frames.get(1)!(0);
+    frames.get(2)!(420);
 
     expect(graph.nodeObjects.get("component:web")).toBe(initialWebObject);
     expect(graph.linkObjects.get("api-web")).toBe(initialApiLinkObject);
@@ -351,7 +385,332 @@ describe("Three.js camera transitions", () => {
     });
 
     const selectedBody = initialWebObject?.children.find((child) => child instanceof Mesh) as Mesh | undefined;
-    expect((selectedBody?.material as MeshStandardMaterial).emissiveIntensity).toBeCloseTo(0.4);
+    const selectedMaterial = selectedBody?.material as MeshStandardMaterial;
+    expect(selectedMaterial.emissiveIntensity).toBe(0);
+    expect(selectedMaterial.metalness).toBeCloseTo(0.22);
+    expect(selectedMaterial.roughness).toBeCloseTo(0.58);
+  });
+
+  it("moves live node coordinates, links, focus rim, and camera through one cancellable selection transaction", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: {
+        onBackgroundClick() {},
+        onNodeClick() {},
+        onNodeHover() {},
+      },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const initial = createRenderGraphData(graphFixture, {});
+    const selected = createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] });
+    renderer.setData(initial);
+    const startById = new Map(graph.data.nodes.map((node) => [node.id, { x: node.x, y: node.y, z: node.z }]));
+    const targetById = new Map(selected.nodes.map((node) => [node.id, { x: node.x, y: node.y, z: node.z }]));
+    expect(startById.get("component:api")).not.toEqual(targetById.get("component:api"));
+
+    renderer.setData(selected);
+    renderer.transitionToNode!("component:api", { reducedMotion: false });
+    frames.get(1)!(0);
+    frames.get(2)!(210);
+
+    const halfway = graph.data.nodes.find((node) => node.id === "component:api")!;
+    const observation = renderer.getTransitionObservation?.();
+    expect(observation).toMatchObject({ active: true, durationMs: 420, progress: 0.5, reducedMotion: false });
+    expect(observation?.nodePositions.find((node) => node.id === "component:api")).toEqual({
+      id: "component:api",
+      x: halfway.x,
+      y: halfway.y,
+      z: halfway.z,
+    });
+    expect(graph.data.nodes.every((node) => {
+      const current = { x: node.x, y: node.y, z: node.z };
+      return JSON.stringify(current) !== JSON.stringify(startById.get(node.id))
+        && JSON.stringify(current) !== JSON.stringify(targetById.get(node.id));
+    })).toBe(true);
+    expect(graph.cameraSetters.at(-1)?.duration).toBe(0);
+    const selectedObject = graph.nodeObjects.get("component:api")!;
+    const focusRim = selectedObject.children.find((child) => child.userData.graphVisualRole === "focus-rim")!;
+    expect(focusRim.visible).toBe(false);
+
+    frames.get(3)!(420);
+    const settled = graph.data.nodes.find((node) => node.id === "component:api")!;
+    expect({ x: settled.x, y: settled.y, z: settled.z }).toEqual(targetById.get("component:api"));
+    expect(renderer.getTransitionObservation?.()).toMatchObject({ active: false, progress: 1 });
+    expect(focusRim.visible).toBe(true);
+
+    renderer.setData(selected);
+    expect(graph.data.nodes.map((node) => ({ id: node.id, x: node.x, y: node.y, z: node.z }))).toEqual(
+      selected.nodes.map((node) => ({ id: node.id, x: node.x, y: node.y, z: node.z })),
+    );
+
+    renderer.setData(initial);
+    renderer.transitionToNode!("component:api", { reducedMotion: true });
+    expect(renderer.getTransitionObservation?.()).toMatchObject({
+      active: false,
+      durationMs: 0,
+      progress: 1,
+      reducedMotion: true,
+    });
+  });
+
+  it("settles selection choreography before Orbit, node-drag, fit, zoom, or reduced-motion cancellation", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: {
+        onBackgroundClick() {},
+        onNodeClick() {},
+        onNodeHover() {},
+      },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const initial = createRenderGraphData(graphFixture, {});
+    const selectedApi = createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] });
+    const selectedWeb = createRenderGraphData(graphFixture, { selectedNodeIds: ["component:web"] });
+    renderer.setData(initial);
+
+    moveSelectionHalfway(renderer, selectedApi, "component:api");
+    const orbitStaleFrame = [...frames.values()][0]!;
+    graph.cameraControls.dispatch("start");
+    expectLiveNodesAt(selectedApi);
+    expect(graph.nodeObjects.get("component:api")?.scale.toArray()).toEqual([1.06, 1.06, 1.06]);
+    expect(renderer.getTransitionObservation?.()).toMatchObject({
+      active: false,
+      durationMs: 420,
+      progress: 1,
+    });
+    const orbitSettled = JSON.stringify(graph.data.nodes);
+    orbitStaleFrame(420);
+    expect(JSON.stringify(graph.data.nodes)).toBe(orbitSettled);
+    graph.cameraControls.dispatch("end");
+
+    moveSelectionHalfway(renderer, selectedWeb, "component:web");
+    graph.nodeDragCallback?.();
+    expectLiveNodesAt(selectedWeb);
+    expect(graph.nodeObjects.get("component:web")?.scale.toArray()).toEqual([1.06, 1.06, 1.06]);
+
+    moveSelectionHalfway(renderer, selectedApi, "component:api");
+    renderer.fit(250);
+    expectLiveNodesAt(selectedApi);
+    expect(renderer.getTransitionObservation?.()).toMatchObject({ active: true, progress: 0 });
+    renderer.cancelCameraTransition!();
+    expect(renderer.getTransitionObservation?.()).toMatchObject({
+      active: false,
+      durationMs: 250,
+      progress: 0,
+    });
+
+    moveSelectionHalfway(renderer, selectedWeb, "component:web");
+    renderer.zoom(1.4);
+    expectLiveNodesAt(selectedWeb);
+    expect(renderer.getTransitionObservation?.()).toMatchObject({ active: true, progress: 0 });
+    renderer.cancelCameraTransition!();
+    expect(renderer.getTransitionObservation?.()).toMatchObject({
+      active: false,
+      durationMs: 180,
+      progress: 0,
+    });
+
+    moveSelectionHalfway(renderer, selectedApi, "component:api");
+    renderer.transitionToNode!("component:api", { reducedMotion: true });
+    expectLiveNodesAt(selectedApi);
+    expect(renderer.getTransitionObservation?.()).toMatchObject({
+      active: false,
+      durationMs: 0,
+      progress: 1,
+      reducedMotion: true,
+    });
+  });
+
+  it("queues only the latest resize layout while applying semantic updates during an active scene", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: {
+        onBackgroundClick() {},
+        onNodeClick() {},
+        onNodeHover() {},
+      },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const initial = createRenderGraphData(graphFixture, {});
+    const selectedApi = createRenderGraphData(
+      graphFixture,
+      { selectedNodeIds: ["component:api"] },
+      { viewport: { height: 540, width: 720 } },
+    );
+    const firstResizedApi = createRenderGraphData(
+      graphFixture,
+      { selectedNodeIds: ["component:api"] },
+      { viewport: { height: 480, width: 480 } },
+    );
+    const latestResizedApi = createRenderGraphData(
+      graphFixture,
+      { selectedNodeIds: ["component:api"] },
+      { viewport: { height: 320, width: 960 } },
+    );
+    renderer.setData(initial);
+    moveSelectionHalfway(renderer, selectedApi, "component:api");
+    const activeGeneration = renderer.getTransitionObservation?.().generation;
+
+    renderer.setData(firstResizedApi);
+    renderer.setData(latestResizedApi);
+    expect(renderer.getTransitionObservation?.()).toMatchObject({
+      active: true,
+      generation: activeGeneration,
+      progress: 0.5,
+    });
+    runLatestFrame(420);
+    expectLiveNodesAt(latestResizedApi);
+
+    const selectedWeb = createRenderGraphData(graphFixture, { selectedNodeIds: ["component:web"] });
+    moveSelectionHalfway(renderer, selectedWeb, "component:web");
+    const staleSemanticFrame = [...frames.values()][0]!;
+    const updatedInput = {
+      ...graphFixture,
+      links: graphFixture.links.map((link) => (
+        link.id === "api-web" ? { ...link, relationKind: "serves-v2" } : link
+      )),
+      nodes: graphFixture.nodes.map((node) => (
+        node.id === "component:api" ? { ...node, label: "API v2" } : node
+      )),
+    };
+    const updatedWeb = createRenderGraphData(updatedInput, {
+      nodeDescriptors: {
+        "component:web": { label: "Web v2", opacity: 0.74 },
+      },
+      selectedNodeIds: ["component:web"],
+    });
+
+    renderer.setData(updatedWeb);
+    expect(renderer.getTransitionObservation?.()).toMatchObject({
+      active: false,
+      durationMs: 420,
+      progress: 1,
+    });
+    expectLiveNodesAt(updatedWeb);
+    expect((graph.data.nodes.find((node) => node.id === "component:api") as typeof graph.data.nodes[number] & {
+      label: string;
+    }).label).toBe("API v2");
+    expect((graph.data.links.find((link) => link.id === "api-web") as typeof graph.data.links[number] & {
+      relationKind: string;
+    }).relationKind).toBe("serves-v2");
+    expect(renderer.getRenderObservation?.().nodes.find((node) => node.id === "component:web"))
+      .toMatchObject({ minimumVisibleMaterialOpacity: 0.74 });
+    const appliedSemanticUpdate = JSON.stringify(graph.data);
+    staleSemanticFrame(420);
+    expect(JSON.stringify(graph.data)).toBe(appliedSemanticUpdate);
+  });
+
+  it("preserves a custom node factory's nonuniform baseline scale throughout selection", () => {
+    const customObjects = new Map<string, Group>();
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: {
+        onBackgroundClick() {},
+        onNodeClick() {},
+        onNodeHover() {},
+      },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+      nodeObjectFactory(node) {
+        const object = new Group();
+        object.scale.set(2, 3, 4);
+        object.add(new Mesh(
+          new BoxGeometry(2, 2, 2),
+          new MeshStandardMaterial({ opacity: 1, transparent: true }),
+        ));
+        customObjects.set(node.id, object);
+        return object;
+      },
+    });
+    const initial = createRenderGraphData(graphFixture, {});
+    const selected = createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] });
+    renderer.setData(initial);
+    expect(customObjects.get("component:api")?.scale.toArray()).toEqual([2, 3, 4]);
+
+    renderer.setData(selected);
+    renderer.transitionToNode!("component:api", { reducedMotion: false });
+    runLatestFrame(0);
+    expect(customObjects.get("component:api")?.scale.toArray()).toEqual([2, 3, 4]);
+    runLatestFrame(210);
+    expect(customObjects.get("component:api")?.scale.toArray()).toEqual([2, 3, 4]);
+    runLatestFrame(420);
+    expect(customObjects.get("component:api")?.scale.toArray()).toEqual([2, 3, 4]);
+  });
+
+  it("fits the initial deterministic base graph once after its first resize", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: {
+        onBackgroundClick() {},
+        onNodeClick() {},
+        onNodeHover() {},
+      },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, {}));
+    renderer.resize();
+    renderer.resize();
+
+    expect(graph.zoomToFitDurations).toEqual([0]);
+    expect((graph.data.nodes as Array<Coordinates & { fx?: number; fy?: number; fz?: number }>).every((node) => (
+      node.fx === node.x && node.fy === node.y && node.fz === node.z
+    ))).toBe(true);
+  });
+
+  it("frames the selected node, deterministic one-hop context, and explicit master together", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: {
+        onBackgroundClick() {},
+        onNodeClick() {},
+        onNodeHover() {},
+      },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const selected = createRenderGraphData(graphFixture, { selectedNodeIds: ["component:web"] });
+    renderer.setData(selected);
+    renderer.transitionToNode!("component:web", { reducedMotion: true });
+
+    const contextIds = new Set(["component:web", "component:api", "relation:release"]);
+    const extents = selected.nodes.filter((node) => contextIds.has(node.id)).map((node) => {
+      const bodyRadius = node.type === "relation" ? 7.5 : 3;
+      const radius = bodyRadius * 1.16 * (node.id === "component:web" ? 1.06 : 1);
+      return {
+        maximum: { x: node.x + radius, y: node.y + radius, z: node.z + radius },
+        minimum: { x: node.x - radius, y: node.y - radius, z: node.z - radius },
+      };
+    });
+    const expectedCenter = {
+      x: (Math.min(...extents.map(({ minimum }) => minimum.x))
+        + Math.max(...extents.map(({ maximum }) => maximum.x))) / 2,
+      y: (Math.min(...extents.map(({ minimum }) => minimum.y))
+        + Math.max(...extents.map(({ maximum }) => maximum.y))) / 2,
+      z: (Math.min(...extents.map(({ minimum }) => minimum.z))
+        + Math.max(...extents.map(({ maximum }) => maximum.z))) / 2,
+    };
+    const targetCamera = graph.cameraSetters.at(-1)!;
+    expect(targetCamera.lookAt?.x).toBeCloseTo(expectedCenter.x);
+    expect(targetCamera.lookAt?.y).toBeCloseTo(expectedCenter.y);
+    expect(targetCamera.lookAt?.z).toBeCloseTo(expectedCenter.z);
+    expect(targetCamera.lookAt).not.toEqual({ x: 0, y: 0, z: 0 });
+    expect(Math.hypot(
+      targetCamera.position.x - expectedCenter.x,
+      targetCamera.position.y - expectedCenter.y,
+      targetCamera.position.z - expectedCenter.z,
+    )).toBeGreaterThan(160);
+  });
+
+  it("updates default node depth materials to the routine-harness light semantic palette", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: {
+        onBackgroundClick() {},
+        onNodeClick() {},
+        onNodeHover() {},
+      },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, { theme: "light" }));
+
+    const object = graph.nodeObjects.get("component:api")!;
+    const body = object.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
+    const outline = object.children.find((child) => child.userData.graphVisualRole === "outline") as Mesh;
+    const rim = object.children.find((child) => child.userData.graphVisualRole === "focus-rim") as Mesh;
+    expect((body.material as MeshStandardMaterial).color.getHexString()).toBe("64748b");
+    expect((outline.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
+    expect((rim.material as MeshStandardMaterial).color.getHexString()).toBe("0f172a");
   });
 
   it("reports only current graphData objects that remain attached to the public scene", () => {

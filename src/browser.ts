@@ -32,4 +32,6 @@ export type {
   GraphRenderObjectObservation,
   GraphRenderObservation,
   GraphScreenPosition,
+  GraphTransitionNodePosition,
+  GraphTransitionObservation,
 } from "./renderer-contract.js";

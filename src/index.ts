@@ -41,6 +41,8 @@ export {
   type GraphRenderObjectObservation,
   type GraphRenderObservation,
   type GraphScreenPosition,
+  type GraphTransitionNodePosition,
+  type GraphTransitionObservation,
 } from "./renderer-contract.js";
 export {
   createGraphWorkbench,

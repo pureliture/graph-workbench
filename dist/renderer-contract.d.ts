@@ -13,6 +13,26 @@ export interface GraphScreenPosition {
     readonly x: number;
     readonly y: number;
 }
+/** A renderer-local 3D coordinate sampled from the live graphData() nodes. */
+export interface GraphTransitionNodePosition {
+    readonly id: string;
+    readonly x: number;
+    readonly y: number;
+    readonly z: number;
+}
+/**
+ * Read-only evidence of the renderer-owned selection transaction. Positions are
+ * live values, so callers can distinguish an actual intermediate frame from a
+ * final layout snapshot.
+ */
+export interface GraphTransitionObservation {
+    readonly active: boolean;
+    readonly durationMs: number;
+    readonly generation: number;
+    readonly nodePositions: readonly GraphTransitionNodePosition[];
+    readonly progress: number;
+    readonly reducedMotion: boolean;
+}
 /**
  * A read-only snapshot of a factory-return Object3D. It reports scene attachment
  * and material state, not whether a node is visible in rendered pixels.
@@ -53,6 +73,8 @@ export interface GraphRenderer {
     getNodeScreenPosition?(nodeId: string): GraphScreenPosition | null;
     /** Optional live Object3D observation seam. Legacy renderers return no observation. */
     getRenderObservation?(): GraphRenderObservation | null;
+    /** Optional live selection-transition observation seam. */
+    getTransitionObservation?(): GraphTransitionObservation | null;
     resize(width?: number, height?: number): void;
     restoreCamera(): void;
     setData(data: RenderGraphData): void;

@@ -81,7 +81,8 @@ Bundled links can preserve more than one ordered occurrence through `occurrences
 - `mount`, `unmount`, `destroy`
 - `setInput`, `setPresentation`, `setReducedMotion`
 - `resize`, `fit`, `zoom`, `selectNode`, `focusNode`, `getSelectionState`,
-  `getNodeScreenPosition`, `getRenderObservation`, `restoreCamera`
+  `getNodeScreenPosition`, `getRenderObservation`, `getTransitionObservation`,
+  `restoreCamera`
 - `onNodeClick`, `onNodeHover`, `onFocusChange`, `onSelectionChange`,
   `onBackgroundClick`, `onRendererStateChange`
 
@@ -121,6 +122,16 @@ and line-width values of visible materials. It is `null` before mount and for le
 is scene/object evidence only; it does not claim that a node is visible in rendered
 pixels. Detached stale factory objects are reported as not scene-attached and do not
 contribute material-opacity evidence.
+
+내장 renderer는 선택을 하나의 취소 가능한 transaction으로 처리합니다. 모든 live node는
+현재 renderer-local 위치에서 deterministic target까지 보간되고, link emphasis, focus rim,
+scale, camera reframe은 같은 bounded animation frame에서 진행됩니다. 명시적 선택은 420 ms
+cubic transition, 선택 해제 복원은 250 ms를 사용하며 reduced motion에서는 즉시 settled
+상태가 됩니다. 기본 node material은 routine-harness Tauri의 semantic light/dark palette,
+Standard Material roughness/metalness, outline shell, focus rim을 사용합니다. host는
+`getTransitionObservation()`으로 active generation, progress, duration, motion mode,
+실제 live node coordinates를 확인할 수 있습니다. mount 전과 legacy custom renderer에서는
+`null`을 반환합니다.
 
 `setReducedMotion(true)` (or `GraphPresentation.reducedMotion`) keeps the same selection
 and camera target while requesting an immediate transition. Selection distance controls

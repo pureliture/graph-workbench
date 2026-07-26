@@ -9,6 +9,7 @@ import {
   type GraphSelectionEvent,
   type GraphSelectionSource,
   type GraphSelectionState,
+  type GraphTransitionObservation,
   type GraphWorkbench,
 } from "@pureliture/graph-workbench";
 
@@ -91,6 +92,7 @@ const graphInput = {
 
 type RendererStatus = "failed" | "mounted" | "pending";
 type TelemetryAvailability = "observed" | "pending" | "unavailable";
+type ResolvedMode = "dark" | "light";
 
 interface ObservedSelectionTelemetry {
   readonly availability: "observed";
@@ -129,6 +131,22 @@ interface ObservedRenderTelemetry {
 
 type RenderTelemetry = ObservedRenderTelemetry | UnavailableTelemetry | UnknownTelemetry;
 
+interface MotionTelemetryFrame {
+  readonly positions: readonly {
+    readonly id: string;
+    readonly x: number;
+    readonly y: number;
+  }[];
+  readonly transition: GraphTransitionObservation;
+}
+
+interface ObservedMotionTelemetry extends MotionTelemetryFrame {
+  readonly availability: "observed";
+  readonly frames: readonly MotionTelemetryFrame[];
+}
+
+type MotionTelemetry = ObservedMotionTelemetry | UnavailableTelemetry;
+
 interface RendererState {
   readonly reason: string | null;
   readonly status: RendererStatus;
@@ -143,8 +161,56 @@ const linkIds = graphInput.links.map((link) => link.id);
 const nodesById = new Map(graphInput.nodes.map((node) => [node.id, node]));
 const masterNodeId = graphInput.nodes.find((node) => node.roles?.includes("master"))?.id ?? null;
 
+const graphPresentationByMode = {
+  light: {
+    linkColor: "#4b5a70",
+    nodeColors: {
+      "component:api": "#64748b",
+      "component:web": "#64748b",
+      "profile:platform": "#64748b",
+      "relation:release": "#64748b",
+    },
+  },
+  dark: {
+    linkColor: "#aaa7c2",
+    nodeColors: {
+      "component:api": "#475569",
+      "component:web": "#475569",
+      "profile:platform": "#475569",
+      "relation:release": "#475569",
+    },
+  },
+} as const satisfies Record<
+  ResolvedMode,
+  {
+    readonly linkColor: string;
+    readonly nodeColors: Readonly<Record<(typeof graphInput.nodes)[number]["id"], string>>;
+  }
+>;
+
 function testIdForNode(prefix: string, nodeId: string): string {
   return `${prefix}-${nodeId.replace(/:/g, "-")}`;
+}
+
+function applySystemPresentation(
+  workbench: GraphWorkbench,
+  mode: ResolvedMode,
+  reducedMotion: boolean,
+) {
+  const selection = workbench.getSelectionState();
+  const palette = graphPresentationByMode[mode];
+  workbench.setPresentation({
+    focusNodeId: selection.nodeId,
+    linkDescriptors: Object.fromEntries(
+      graphInput.links.map((link) => [link.id, { color: palette.linkColor }]),
+    ),
+    nodeDescriptors: Object.fromEntries(
+      graphInput.nodes.map((node) => [node.id, { color: palette.nodeColors[node.id] }]),
+    ),
+    reducedMotion,
+    selectedNodeIds: selection.nodeId ? [selection.nodeId] : [],
+    theme: mode,
+  });
 }
 
 function Telemetry({ testId, value }: { readonly testId: string; readonly value: unknown }) {
@@ -247,7 +313,17 @@ function observedLinkVisibility(link: GraphRenderLinkObservation) {
 }
 
 export function BrowserGraphFixture() {
+  const detailPanelRef = useRef<HTMLElement | null>(null);
+  const detailWasOpenRef = useRef(false);
   const graphHostRef = useRef<HTMLDivElement | null>(null);
+  const matrixPaletteRef = useRef<HTMLElement | null>(null);
+  const matrixReturnFocusRef = useRef<HTMLElement | null>(null);
+  const matrixSearchInputRef = useRef<HTMLInputElement | null>(null);
+  const matrixTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const motionFramesRef = useRef<MotionTelemetryFrame[]>([]);
+  const motionGenerationRef = useRef<number | null>(null);
+  const motionPublishedKeyRef = useRef("");
+  const reducedMotionRef = useRef(false);
   const workbenchRef = useRef<GraphWorkbench | null>(null);
   const rendererReadyRef = useRef(false);
   const [selectionState, setSelectionState] = useState<GraphSelectionState | null>(null);
@@ -267,14 +343,26 @@ export function BrowserGraphFixture() {
     availability: "pending",
     reason: null,
   });
+  const [motionTelemetry, setMotionTelemetry] = useState<MotionTelemetry>({
+    availability: "pending",
+    reason: null,
+  });
   const [renderObservationRevision, setRenderObservationRevision] = useState(0);
   const [renderer, setRenderer] = useState<RendererState>({ status: "pending", reason: null });
   const [webglState, setWebglState] = useState("pending");
+  const [resolvedMode, setResolvedMode] = useState<ResolvedMode | null>(null);
   const [reducedMotion, setReducedMotion] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
+  const [matrixOpen, setMatrixOpen] = useState(false);
+  const [matrixQuery, setMatrixQuery] = useState("");
   const [hostUpdate, setHostUpdate] = useState({ setInputSafe: false, collapseSafe: false });
   const rendererAvailable = renderer.status === "mounted" && webglState === "mounted";
   const observedSelection = selectionTelemetry.availability === "observed" ? selectionTelemetry : null;
+  const filteredNodes = graphInput.nodes.filter((node) => {
+    const query = matrixQuery.trim().toLocaleLowerCase();
+    return query.length === 0 || [node.label, node.id, node.kind, node.type]
+      .some((value) => value.toLocaleLowerCase().includes(query));
+  });
 
   const selectNode = useCallback((nodeId: string | null, source: GraphSelectionSource) => {
     if (!rendererReadyRef.current) return;
@@ -283,17 +371,90 @@ export function BrowserGraphFixture() {
 
   const updateReducedMotion = useCallback((nextReducedMotion: boolean) => {
     if (!rendererReadyRef.current) return;
+    reducedMotionRef.current = nextReducedMotion;
     setReducedMotion(nextReducedMotion);
     workbenchRef.current?.setReducedMotion(nextReducedMotion);
   }, []);
+
+  const updateCollapsed = useCallback((nextCollapsed: boolean) => {
+    setCollapsed(nextCollapsed);
+    setHostUpdate((current) => ({ ...current, collapseSafe: true }));
+  }, []);
+
+  const openMatrixPalette = useCallback(() => {
+    matrixReturnFocusRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : matrixTriggerRef.current;
+    setMatrixOpen(true);
+    window.setTimeout(() => matrixSearchInputRef.current?.focus(), 0);
+  }, []);
+
+  const captureMatrixSearchInput = useCallback((input: HTMLInputElement | null) => {
+    matrixSearchInputRef.current = input;
+    if (input && matrixOpen) input.focus();
+  }, [matrixOpen]);
+
+  useEffect(() => {
+    const openMatrix = (event: KeyboardEvent) => {
+      const target = event.target;
+      const isTextInput = target instanceof HTMLInputElement
+        || target instanceof HTMLTextAreaElement
+        || (target instanceof HTMLElement && target.isContentEditable);
+      const commandShortcut = (event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === "k";
+      const slashShortcut = event.key === "/" && !isTextInput && !event.metaKey && !event.ctrlKey && !event.altKey;
+      if (!commandShortcut && !slashShortcut) return;
+      event.preventDefault();
+      openMatrixPalette();
+    };
+    document.addEventListener("keydown", openMatrix);
+    return () => document.removeEventListener("keydown", openMatrix);
+  }, [openMatrixPalette]);
+
+  useEffect(() => {
+    if (!matrixOpen) return undefined;
+
+    const previouslyFocused = matrixReturnFocusRef.current
+      ?? (document.activeElement instanceof HTMLElement ? document.activeElement : matrixTriggerRef.current);
+    matrixSearchInputRef.current?.focus();
+    const isolatePaletteKeyboard = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setMatrixOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...(matrixPaletteRef.current?.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex="-1"])',
+      ) ?? [])];
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", isolatePaletteKeyboard, true);
+    return () => {
+      document.removeEventListener("keydown", isolatePaletteKeyboard, true);
+      previouslyFocused?.focus();
+    };
+  }, [matrixOpen]);
 
   useEffect(() => {
     const host = graphHostRef.current;
     if (!host) return undefined;
 
     let animationFrame = 0;
+    let colorSchemeMedia: MediaQueryList | null = null;
     let disposed = false;
+    let fitFrame: number | null = null;
     let resizeObserver: ResizeObserver | null = null;
+    let syncColorScheme: ((event: MediaQueryListEvent) => void) | null = null;
 
     const markRendererUnavailable = (reason: string, destroy = false) => {
       if (disposed) return;
@@ -305,6 +466,10 @@ export function BrowserGraphFixture() {
       setSelectedScreenPosition({ availability: "unavailable", reason });
       setMasterScreenPosition({ availability: "unavailable", reason });
       setRenderTelemetry({ availability: "unavailable", reason });
+      motionFramesRef.current = [];
+      motionGenerationRef.current = null;
+      motionPublishedKeyRef.current = "";
+      setMotionTelemetry({ availability: "unavailable", reason });
       if (destroy) {
         workbenchRef.current?.destroy();
         workbenchRef.current = null;
@@ -330,6 +495,7 @@ export function BrowserGraphFixture() {
             if (!rendererReadyRef.current) return;
             const next = workbenchRef.current?.getSelectionState();
             if (next) setSelectionState(next);
+            if (event.nodeId) setCollapsed(false);
             setSelectedScreenPosition({
               availability: "pending",
               reason: event.nodeId
@@ -357,8 +523,24 @@ export function BrowserGraphFixture() {
         workbenchRef.current = workbench;
         workbench.mount(host);
         const defaultReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        reducedMotionRef.current = defaultReducedMotion;
         setReducedMotion(defaultReducedMotion);
-        workbench.setReducedMotion(defaultReducedMotion);
+        colorSchemeMedia = window.matchMedia("(prefers-color-scheme: dark)");
+        const initialMode: ResolvedMode = colorSchemeMedia.matches ? "dark" : "light";
+        setResolvedMode(initialMode);
+        applySystemPresentation(workbench, initialMode, defaultReducedMotion);
+        syncColorScheme = (event) => {
+          const nextMode: ResolvedMode = event.matches ? "dark" : "light";
+          setResolvedMode(nextMode);
+          applySystemPresentation(workbench, nextMode, reducedMotionRef.current);
+          setSelectionState(workbench.getSelectionState());
+          setRenderTelemetry({
+            availability: "pending",
+            reason: "Waiting for the system-theme renderer scene observation.",
+          });
+          setRenderObservationRevision((revision) => revision + 1);
+        };
+        colorSchemeMedia.addEventListener("change", syncColorScheme);
 
         let attempts = 0;
         const markCanvas = () => {
@@ -379,6 +561,11 @@ export function BrowserGraphFixture() {
             rendererReadyRef.current = true;
             setWebglState("mounted");
             setSelectionState(workbench.getSelectionState());
+            fitFrame = window.requestAnimationFrame(() => {
+              fitFrame = window.requestAnimationFrame(() => {
+                if (!disposed && rendererReadyRef.current) workbench.fit(0);
+              });
+            });
             return;
           }
           attempts += 1;
@@ -410,6 +597,10 @@ export function BrowserGraphFixture() {
       disposed = true;
       rendererReadyRef.current = false;
       resizeObserver?.disconnect();
+      if (colorSchemeMedia && syncColorScheme) {
+        colorSchemeMedia.removeEventListener("change", syncColorScheme);
+      }
+      if (fitFrame !== null) window.cancelAnimationFrame(fitFrame);
       window.cancelAnimationFrame(animationFrame);
       workbenchRef.current?.destroy();
       workbenchRef.current = null;
@@ -470,7 +661,10 @@ export function BrowserGraphFixture() {
             && observation.links.length === observation.linkIds.length
             && observation.nodes.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)
             && observation.links.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached);
-          if (allSceneObjectsObserved) {
+          const transition = workbenchRef.current?.getTransitionObservation() ?? null;
+          const transitionSettled = transition === null
+            || (!transition.active && transition.progress === 1);
+          if (allSceneObjectsObserved && transitionSettled) {
             setRenderTelemetry({
               availability: "observed",
               observation,
@@ -505,6 +699,74 @@ export function BrowserGraphFixture() {
       if (animationFrame !== null) window.cancelAnimationFrame(animationFrame);
     };
   }, [renderObservationRevision, renderer.status, rendererAvailable]);
+
+  useEffect(() => {
+    if (renderer.status === "failed" || !rendererAvailable) return undefined;
+
+    let animationFrame: number | null = null;
+    let disposed = false;
+    const sampleMotion = () => {
+      if (disposed) return;
+      const workbench = workbenchRef.current;
+      const transition = workbench?.getTransitionObservation() ?? null;
+      const position = workbench?.getNodeScreenPosition("profile:platform") ?? null;
+      if (
+        transition
+        && position
+        && Number.isFinite(position.x)
+        && Number.isFinite(position.y)
+      ) {
+        if (transition.generation !== motionGenerationRef.current) {
+          motionGenerationRef.current = transition.generation;
+          motionFramesRef.current = [];
+        }
+        const liveFrame: MotionTelemetryFrame = {
+          positions: [{ id: "profile:platform", x: position.x, y: position.y }],
+          transition,
+        };
+        if (transition.active && transition.progress > 0 && transition.progress < 1) {
+          motionFramesRef.current = [
+            ...motionFramesRef.current.slice(-47),
+            liveFrame,
+          ];
+        }
+        const publishedKey = [
+          transition.generation,
+          transition.active,
+          transition.progress.toFixed(4),
+          position.x.toFixed(3),
+          position.y.toFixed(3),
+          motionFramesRef.current.length,
+        ].join(":");
+        if (publishedKey !== motionPublishedKeyRef.current) {
+          motionPublishedKeyRef.current = publishedKey;
+          setMotionTelemetry({
+            availability: "observed",
+            frames: motionFramesRef.current,
+            ...liveFrame,
+          });
+        }
+      } else {
+        const publishedKey = transition ? "pending:projection" : "pending:transition";
+        if (publishedKey !== motionPublishedKeyRef.current) {
+          motionPublishedKeyRef.current = publishedKey;
+          setMotionTelemetry({
+            availability: "pending",
+            reason: transition
+              ? "Waiting for the profile node renderer projection."
+              : "Waiting for live renderer transition evidence.",
+          });
+        }
+      }
+      animationFrame = window.requestAnimationFrame(sampleMotion);
+    };
+
+    animationFrame = window.requestAnimationFrame(sampleMotion);
+    return () => {
+      disposed = true;
+      if (animationFrame !== null) window.cancelAnimationFrame(animationFrame);
+    };
+  }, [renderer.status, rendererAvailable]);
 
   const selectedNode = observedSelection?.nodeId ? nodesById.get(observedSelection.nodeId) ?? null : null;
   const layoutTelemetry = rendererAvailable && selectionState
@@ -604,49 +866,127 @@ export function BrowserGraphFixture() {
     rendererAvailable,
     selectedNodeId: observedSelection?.nodeId ?? null,
   };
+  const detailOpen = selectedNode !== null && !collapsed;
+  const rendererStatus = renderer.status === "failed"
+    ? "WebGL unavailable"
+    : rendererAvailable
+      ? "Renderer ready"
+      : "Preparing renderer";
+
+  useEffect(() => {
+    const wasOpen = detailWasOpenRef.current;
+    detailWasOpenRef.current = detailOpen;
+    if (!wasOpen || detailOpen) return undefined;
+
+    const activeElement = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const focusWasInDrawer = activeElement !== null
+      && detailPanelRef.current?.contains(activeElement) === true;
+    const focusWasLost = activeElement === null
+      || activeElement === document.body
+      || activeElement.closest("[inert]") !== null;
+    if (!focusWasInDrawer && !focusWasLost) return undefined;
+
+    const focusFrame = window.requestAnimationFrame(() => {
+      const matrixIsOpen = matrixPaletteRef.current
+        ?.closest<HTMLElement>(".command-backdrop")
+        ?.dataset.open === "true";
+      if (!matrixIsOpen) graphHostRef.current?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [detailOpen]);
 
   return (
-    <main className="fixture-page" data-reduced-motion={reducedMotion ? "true" : "false"}>
-      <header className="fixture-header">
-        <div>
-          <p className="eyebrow">Browser evidence · deterministic selection</p>
-          <h1>Graph Workbench</h1>
-          <p className="intro">
-            Public <code>@pureliture/graph-workbench/browser</code> surface mounted against a realistic release workflow.
-          </p>
+    <main
+      className="fixture-page"
+      data-detail-open={detailOpen ? "true" : "false"}
+      data-reduced-motion={reducedMotion ? "true" : "false"}
+      data-resolved-mode={resolvedMode ?? undefined}
+    >
+      <h1 className="sr-only">Graph Workbench Browser Fixture</h1>
+
+      <header className="fixture-chrome">
+        <div className="app-identity">
+          <span className="app-mark" aria-hidden="true">GW</span>
+          <div>
+            <strong>Graph Workbench</strong>
+            <span>selection-driven fixture</span>
+          </div>
         </div>
+
         <div className="status-cluster" aria-label="Fixture runtime status">
           <span className={`status-dot ${rendererAvailable ? "is-ready" : ""}`} />
-          <span>{renderer.status === "failed" ? "WebGL unavailable" : rendererAvailable ? "WebGL mounted" : "Preparing WebGL"}</span>
-          <span className="status-divider" />
+          <span>{rendererStatus}</span>
+          <span className="status-divider" aria-hidden="true" />
           <span>{reducedMotion ? "Reduced motion" : "Motion enabled"}</span>
         </div>
+
+        <nav className="toolbar-actions" aria-label="Graph controls">
+          <button
+            aria-expanded={matrixOpen}
+            aria-haspopup="dialog"
+            aria-label="Open Matrix command palette"
+            className="command-trigger"
+            data-testid="matrix-command-trigger"
+            onClick={() => {
+              if (matrixOpen) setMatrixOpen(false);
+              else openMatrixPalette();
+            }}
+            ref={matrixTriggerRef}
+            type="button"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="m20 20-4.6-4.6m2.1-5.15a7.25 7.25 0 1 1-14.5 0 7.25 7.25 0 0 1 14.5 0Z" />
+            </svg>
+            <span>Find node</span>
+            <kbd>⌘K</kbd>
+          </button>
+          <button
+            aria-label="Reset graph selection and layout"
+            className="icon-control"
+            data-testid="reset-layout"
+            disabled={!rendererAvailable}
+            onClick={() => selectNode(null, "programmatic")}
+            title="Reset graph selection"
+            type="button"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M4.75 9A8 8 0 1 1 4 13.45M4.75 9V4.5m0 4.5h4.5" />
+            </svg>
+          </button>
+          <label className="motion-toggle" title={reducedMotion ? "Enable motion" : "Reduce motion"}>
+            <input
+              aria-label={reducedMotion ? "Enable motion" : "Reduce motion"}
+              checked={reducedMotion}
+              data-testid="reduced-motion-toggle"
+              disabled={!rendererAvailable}
+              onChange={(event) => updateReducedMotion(event.target.checked)}
+              type="checkbox"
+            />
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M6 8.5h12M8.5 12h7M10 15.5h4M4 5h16v14H4z" />
+            </svg>
+          </label>
+          <button
+            aria-expanded={detailOpen}
+            aria-label={detailOpen ? "Close selected node details" : "Open selected node details"}
+            className="icon-control"
+            data-testid="host-toggle-collapse"
+            disabled={!selectedNode}
+            onClick={() => updateCollapsed(detailOpen)}
+            title={detailOpen ? "Close details" : "Open details"}
+            type="button"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M5 4h14v16H5zM14 4v16M9 9h1m-1 3h1m-1 3h1" />
+            </svg>
+          </button>
+        </nav>
       </header>
 
-      <section className="workbench-grid" aria-label="Selection-driven graph workbench">
+      <section className="graph-stage" aria-label="Selection-driven graph workbench">
         <section className="graph-panel" aria-label="3D graph canvas">
-          <div className="graph-toolbar">
-            <div>
-              <p className="panel-kicker">Live graph</p>
-              <p className="panel-title">Release topology</p>
-            </div>
-            <div className="toolbar-actions">
-              <button data-testid="reset-layout" disabled={!rendererAvailable} onClick={() => selectNode(null, "programmatic")} type="button">
-                Reset layout
-              </button>
-              <label className="motion-toggle">
-                <input
-                  checked={reducedMotion}
-                  data-testid="reduced-motion-toggle"
-                  disabled={!rendererAvailable}
-                  onChange={(event) => updateReducedMotion(event.target.checked)}
-                  type="checkbox"
-                />
-                <span>Reduce motion</span>
-              </label>
-            </div>
-          </div>
-
           <div
             className="graph-shell"
             data-mounted={renderer.status}
@@ -657,111 +997,195 @@ export function BrowserGraphFixture() {
 
           {renderer.status === "failed" && (
             <div className="renderer-failure" data-testid="graph-renderer-failure" role="alert">
-              <strong>WebGL unavailable</strong>
-              <span data-testid="graph-renderer-failure-reason">{renderer.reason}</span>
+              <span className="failure-mark" aria-hidden="true">!</span>
+              <div>
+                <strong>WebGL unavailable</strong>
+                <span data-testid="graph-renderer-failure-reason">{renderer.reason}</span>
+              </div>
             </div>
           )}
 
-          <div className="canvas-probes" aria-label="Graph interaction guidance">
+          <div className="canvas-probes" aria-live="polite">
             <span>{rendererAvailable
-              ? "Select a node in the canvas or Matrix. Canvas events retain the public mouse source."
-              : "Graph interactions are disabled until a WebGL renderer is available."}
+              ? selectedNode
+                ? `${selectedNode.label} selected · ${observedSelection?.neighborNodeIds.length ?? 0} one-hop neighbors`
+                : "Select a node on the canvas, or open Find node."
+              : "Graph interactions are unavailable until the renderer is ready."}
             </span>
+            <span aria-hidden="true">Drag to orbit · Scroll to zoom · Arrows to navigate</span>
           </div>
         </section>
-
-        <aside className="detail-panel" data-collapsed={collapsed ? "true" : "false"} data-testid="graph-detail-panel">
-          <div className="detail-heading">
-            <div>
-              <p className="panel-kicker">Shared selection</p>
-              <h2>{selectedNode?.label ?? "No node selected"}</h2>
-            </div>
-            <button
-              data-testid="host-toggle-collapse"
-              onClick={() => {
-                setCollapsed((current) => !current);
-                setHostUpdate((current) => ({ ...current, collapseSafe: true }));
-              }}
-              type="button"
-            >
-              {collapsed ? "Expand" : "Collapse"}
-            </button>
-          </div>
-
-          {!collapsed && (
-            <div className="detail-content">
-              <dl>
-                <div><dt>Identity</dt><dd>{selectedNode?.id ?? "—"}</dd></div>
-                <div><dt>Kind</dt><dd>{selectedNode?.kind ?? "—"}</dd></div>
-                <div><dt>Neighbors</dt><dd>{observedSelection?.neighborNodeIds.length ?? "—"}</dd></div>
-                <div><dt>Source</dt><dd>{observedSelection?.source ?? "—"}</dd></div>
-              </dl>
-              <button
-                className="host-update"
-                data-testid="host-set-input"
-                onClick={() => {
-                  if (!rendererReadyRef.current || !workbenchRef.current) return;
-                  workbenchRef.current.setInput({
-                    ...graphInput,
-                    metadata: { fixtureRevision: "host-safe-update" },
-                  });
-                  setSelectionState(workbenchRef.current.getSelectionState());
-                  setRenderTelemetry({
-                    availability: "pending",
-                    reason: "Waiting for the host-updated renderer scene observation.",
-                  });
-                  setRenderObservationRevision((revision) => revision + 1);
-                  setHostUpdate((current) => ({ ...current, setInputSafe: true }));
-                }}
-                disabled={!rendererAvailable}
-                type="button"
-              >
-                Apply host-safe input update
-              </button>
-            </div>
-          )}
-        </aside>
       </section>
 
-      <section className="matrix-panel" aria-label="Matrix selector">
-        <div className="matrix-heading">
+      <aside
+        aria-hidden={!detailOpen}
+        aria-label="Selected node details"
+        className="detail-panel"
+        data-active={detailOpen ? "true" : "false"}
+        data-collapsed={collapsed ? "true" : "false"}
+        data-testid="graph-detail-panel"
+        inert={detailOpen ? undefined : true}
+        ref={detailPanelRef}
+      >
+        <div className="detail-heading">
           <div>
-            <p className="panel-kicker">Matrix selector</p>
-            <h2>Input identity stays host-owned</h2>
+            <p className="panel-kicker">Selected node</p>
+            <h2>{selectedNode?.label ?? "No node selected"}</h2>
           </div>
-          <p>Every row selects the same identity used by the graph and detail panel.</p>
+          <button
+            aria-label="Close selected node details"
+            className="drawer-close"
+            data-testid="detail-drawer-close"
+            disabled={!selectedNode}
+            onClick={() => updateCollapsed(true)}
+            type="button"
+          >
+            ×
+          </button>
         </div>
-        <div className="matrix-table">
-          <div className="matrix-row matrix-labels">
-            <span>Node</span>
-            <span>Type</span>
-            <span>Selection</span>
+
+        <div className="detail-content">
+          <dl>
+            <div><dt>Identity</dt><dd>{selectedNode?.id ?? "—"}</dd></div>
+            <div><dt>Kind</dt><dd>{selectedNode?.kind ?? "—"}</dd></div>
+            <div><dt>Neighbors</dt><dd>{observedSelection?.neighborNodeIds.length ?? "—"}</dd></div>
+            <div><dt>Source</dt><dd>{observedSelection?.source ?? "—"}</dd></div>
+          </dl>
+          <button
+            className="host-update"
+            data-testid="host-set-input"
+            onClick={() => {
+              if (!rendererReadyRef.current || !workbenchRef.current) return;
+              workbenchRef.current.setInput({
+                ...graphInput,
+                metadata: { fixtureRevision: "host-safe-update" },
+              });
+              setSelectionState(workbenchRef.current.getSelectionState());
+              setRenderTelemetry({
+                availability: "pending",
+                reason: "Waiting for the host-updated renderer scene observation.",
+              });
+              setRenderObservationRevision((revision) => revision + 1);
+              setHostUpdate((current) => ({ ...current, setInputSafe: true }));
+            }}
+            disabled={!rendererAvailable}
+            type="button"
+          >
+            Apply host-safe input update
+          </button>
+        </div>
+      </aside>
+
+      <div
+        aria-hidden={!matrixOpen}
+        className="command-backdrop"
+        data-open={matrixOpen ? "true" : "false"}
+        onPointerDown={(event) => {
+          if (event.target === event.currentTarget) setMatrixOpen(false);
+        }}
+      >
+        <section
+          aria-label="Matrix node selector"
+          aria-modal={matrixOpen || undefined}
+          className="matrix-panel"
+          data-testid="matrix-command-palette"
+          inert={matrixOpen ? undefined : true}
+          ref={matrixPaletteRef}
+          role="dialog"
+        >
+          <div className="matrix-heading">
+            <div>
+              <p className="panel-kicker">Matrix selector</p>
+              <h2>Find an input identity</h2>
+            </div>
+            <button aria-label="Close Matrix selector" onClick={() => setMatrixOpen(false)} type="button">×</button>
           </div>
-          {graphInput.nodes.map((node) => {
-            const selected = node.id === observedSelection?.nodeId;
-            return (
-              <button
-                aria-pressed={selected}
-                className={`matrix-row ${selected ? "is-selected" : ""}`}
-                data-testid={testIdForNode("matrix-row", node.id)}
-                key={node.id}
-                onClick={() => selectNode(node.id, "matrix")}
-                disabled={!rendererAvailable}
-                type="button"
-              >
-                <span>{node.label}</span>
-                <span>{node.kind}</span>
-                <span>{selected ? "selected" : "inspect"}</span>
-              </button>
-            );
-          })}
-        </div>
-      </section>
+          <label className="matrix-search">
+            <span className="sr-only">Filter graph nodes</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="m20 20-4.6-4.6m2.1-5.15a7.25 7.25 0 1 1-14.5 0 7.25 7.25 0 0 1 14.5 0Z" />
+            </svg>
+            <input
+              autoComplete="off"
+              onChange={(event) => setMatrixQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowDown") {
+                  event.preventDefault();
+                  matrixPaletteRef.current?.querySelector<HTMLButtonElement>(".matrix-row:not(:disabled)")?.focus();
+                }
+                if (event.key === "Enter" && rendererAvailable && filteredNodes[0]) {
+                  event.preventDefault();
+                  selectNode(filteredNodes[0].id, "matrix");
+                  setMatrixOpen(false);
+                }
+              }}
+              placeholder="Label, identity, or kind"
+              ref={captureMatrixSearchInput}
+              type="search"
+              value={matrixQuery}
+            />
+            <kbd>ESC</kbd>
+          </label>
+          <div className="matrix-meta">
+            <span>{filteredNodes.length} identities</span>
+            <span>Shared graph + detail selection</span>
+          </div>
+          <div className="matrix-table" role="listbox" aria-label="Graph node identities">
+            {filteredNodes.map((node) => {
+              const selected = node.id === observedSelection?.nodeId;
+              return (
+                <button
+                  aria-selected={selected}
+                  className={`matrix-row ${selected ? "is-selected" : ""}`}
+                  data-testid={testIdForNode("matrix-row", node.id)}
+                  key={node.id}
+                  onClick={() => {
+                    selectNode(node.id, "matrix");
+                    setMatrixOpen(false);
+                  }}
+                  onKeyDown={(event) => {
+                    if (!["ArrowDown", "ArrowUp", "End", "Home"].includes(event.key)) return;
+                    event.preventDefault();
+                    const rows = [...(matrixPaletteRef.current?.querySelectorAll<HTMLButtonElement>(
+                      ".matrix-row:not(:disabled)",
+                    ) ?? [])];
+                    const currentIndex = rows.indexOf(event.currentTarget);
+                    const nextIndex = event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? rows.length - 1
+                        : event.key === "ArrowDown"
+                          ? (currentIndex + 1) % rows.length
+                          : (currentIndex - 1 + rows.length) % rows.length;
+                    rows[nextIndex]?.focus();
+                  }}
+                  disabled={!rendererAvailable}
+                  role="option"
+                  type="button"
+                >
+                  <span className="node-mark" aria-hidden="true" />
+                  <span className="matrix-node-copy">
+                    <strong>{node.label}</strong>
+                    <small>{node.id}</small>
+                  </span>
+                  <span className="matrix-kind">{node.kind}</span>
+                  <span className="matrix-state">{selected ? "Selected" : "Inspect"}</span>
+                </button>
+              );
+            })}
+            {filteredNodes.length === 0 && (
+              <p className="matrix-empty">No matching graph identity.</p>
+            )}
+          </div>
+          <p className="matrix-footer">Use ↑↓ to move, Enter to select, Escape to return to the graph.</p>
+        </section>
+      </div>
 
       <section className="telemetry-panel" aria-label="Deterministic fixture telemetry">
         <div className="telemetry-heading">
-          <p className="panel-kicker">Observable state</p>
-          <p>Stable browser evidence only; no host IPC, filesystem scan, or snapshot reload.</p>
+          <span className={`status-dot ${rendererAvailable ? "is-ready" : ""}`} />
+          <strong>Evidence</strong>
+          <span>{rendererAvailable ? "live renderer state" : rendererStatus}</span>
         </div>
         <div className="telemetry-grid">
           <Telemetry testId="graph-input-node-ids" value={nodeIds} />
@@ -777,6 +1201,7 @@ export function BrowserGraphFixture() {
           <Telemetry testId="graph-master-screen-position" value={masterScreenPosition} />
           <Telemetry testId="graph-camera-state" value={selectedScreenPosition} />
           <Telemetry testId="camera-transition-status" value={selectedScreenPosition} />
+          <Telemetry testId="graph-motion-observation" value={motionTelemetry} />
           <Telemetry testId="master-visibility" value={masterVisibilityTelemetry} />
           <Telemetry testId="selection-distance-visibility" value={selectionDistanceVisibilityTelemetry} />
           <Telemetry testId="host-update-status" value={hostUpdateTelemetry} />

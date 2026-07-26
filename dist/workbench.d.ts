@@ -1,6 +1,6 @@
 import { type GraphInput, type GraphNode } from "./contract.js";
 import { type GraphSelectionState } from "./layout.js";
-import { type GraphRendererFactory, type GraphRenderObservation, type GraphScreenPosition } from "./renderer-contract.js";
+import { type GraphRendererFactory, type GraphRenderObservation, type GraphScreenPosition, type GraphTransitionObservation } from "./renderer-contract.js";
 import { type GraphPresentation } from "./presentation.js";
 export interface GraphEvent {
     readonly input: GraphInput;
@@ -41,6 +41,8 @@ export interface GraphWorkbench {
     getNodeScreenPosition(nodeId: string): GraphScreenPosition | null;
     /** Live Object3D evidence, or null when no enhanced renderer is mounted. */
     getRenderObservation(): GraphRenderObservation | null;
+    /** Live renderer-owned selection transition evidence, when supported. */
+    getTransitionObservation(): GraphTransitionObservation | null;
     getSelectionState(): GraphSelectionState;
     mount(container: HTMLElement): void;
     resize(width?: number, height?: number): void;

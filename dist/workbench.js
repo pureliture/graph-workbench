@@ -166,6 +166,9 @@ export function createGraphWorkbench(options) {
         getRenderObservation() {
             return renderer?.getRenderObservation?.() ?? null;
         },
+        getTransitionObservation() {
+            return renderer?.getTransitionObservation?.() ?? null;
+        },
         getSelectionState() {
             return selectionState;
         },

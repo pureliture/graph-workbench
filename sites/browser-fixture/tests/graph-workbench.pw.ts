@@ -33,6 +33,37 @@ interface ObservedScreenPosition {
   readonly y: number;
 }
 
+interface MotionTelemetryFrame {
+  readonly positions: readonly {
+    readonly id: string;
+    readonly x: number;
+    readonly y: number;
+  }[];
+  readonly transition: {
+    readonly active: boolean;
+    readonly durationMs: number;
+    readonly generation: number;
+    readonly nodePositions: readonly {
+      readonly id: string;
+      readonly x: number;
+      readonly y: number;
+      readonly z: number;
+    }[];
+    readonly progress: number;
+    readonly reducedMotion: boolean;
+  };
+}
+
+interface ObservedMotionTelemetry extends MotionTelemetryFrame {
+  readonly availability: "observed";
+  readonly frames: readonly MotionTelemetryFrame[];
+}
+
+type MotionTelemetry = ObservedMotionTelemetry | {
+  readonly availability: "pending" | "unavailable";
+  readonly reason: string | null;
+};
+
 interface RenderVisualCue {
   readonly contrast?: number;
   readonly labelCue?: "muted" | "primary" | "visible";
@@ -177,6 +208,173 @@ async function waitForRenderedIds(page: Page, testId: string): Promise<ObservedR
   return readTelemetry<ObservedRenderedIds>(page, testId);
 }
 
+function matrixRowTestId(nodeId: string): string {
+  return `matrix-row-${nodeId.replace(/:/g, "-")}`;
+}
+
+async function matrixPaletteIsOpen(page: Page): Promise<boolean> {
+  return page.getByTestId("matrix-command-palette").evaluate(
+    (element) => element.parentElement?.getAttribute("data-open") === "true",
+  );
+}
+
+async function selectMatrixNode(page: Page, nodeId: string): Promise<void> {
+  const row = page.getByTestId(matrixRowTestId(nodeId));
+  if (!await matrixPaletteIsOpen(page)) await openMatrixPalette(page);
+  await row.click();
+}
+
+async function openMatrixPalette(page: Page): Promise<void> {
+  const palette = page.getByTestId("matrix-command-palette");
+  if (await matrixPaletteIsOpen(page)) return;
+  await page.getByTestId("matrix-command-trigger").click();
+  await expect.poll(() => matrixPaletteIsOpen(page)).toBe(true);
+  await expect(palette).toBeVisible();
+}
+
+async function waitForMotionFrames(page: Page, afterGeneration?: number): Promise<readonly MotionTelemetryFrame[]> {
+  let observed: readonly MotionTelemetryFrame[] = [];
+  await expect.poll(async () => {
+    const candidate = await readTelemetry<MotionTelemetry>(page, "graph-motion-observation");
+    if (candidate.availability !== "observed") return false;
+    const activeFrames = candidate.frames
+      .filter((frame) => (
+        frame.transition.active
+        && frame.transition.progress > 0
+        && frame.transition.progress < 1
+        && (afterGeneration === undefined || frame.transition.generation > afterGeneration)
+      ));
+    if (activeFrames.length > 0) observed = activeFrames;
+    const generation = activeFrames[0]?.transition.generation;
+    return activeFrames.length > 0
+      && !candidate.transition.active
+      && candidate.transition.progress === 1
+      && candidate.transition.generation === generation;
+  }).toBe(true);
+  if (observed.length === 0) throw new Error("An active renderer motion frame was not observed.");
+  return observed;
+}
+
+async function waitForMotionSettled(page: Page, generation?: number): Promise<ObservedMotionTelemetry> {
+  let observed: ObservedMotionTelemetry | null = null;
+  await expect.poll(async () => {
+    const candidate = await readTelemetry<MotionTelemetry>(page, "graph-motion-observation");
+    if (candidate.availability !== "observed") return false;
+    const settled = !candidate.transition.active
+      && candidate.transition.progress === 1
+      && (generation === undefined || candidate.transition.generation === generation);
+    if (settled) observed = candidate;
+    return settled;
+  }).toBe(true);
+  if (!observed) throw new Error("A settled renderer motion observation was not observed.");
+  return observed;
+}
+
+async function waitForNewerMotionSettled(page: Page, afterGeneration: number): Promise<ObservedMotionTelemetry> {
+  let observed: ObservedMotionTelemetry | null = null;
+  await expect.poll(async () => {
+    const candidate = await readTelemetry<MotionTelemetry>(page, "graph-motion-observation");
+    if (candidate.availability !== "observed") return false;
+    const settled = !candidate.transition.active
+      && candidate.transition.progress === 1
+      && candidate.transition.generation > afterGeneration;
+    if (settled) observed = candidate;
+    return settled;
+  }).toBe(true);
+  if (!observed) throw new Error("A newer settled renderer motion observation was not observed.");
+  return observed;
+}
+
+function profileScreenPosition(telemetry: MotionTelemetryFrame) {
+  const position = telemetry.positions.find(({ id }) => id === "profile:platform");
+  if (!position) throw new Error("Profile screen position was absent from live motion telemetry.");
+  return position;
+}
+
+function nodeWorldPosition(telemetry: MotionTelemetryFrame, nodeId: string) {
+  const position = telemetry.transition.nodePositions.find(({ id }) => id === nodeId);
+  if (!position) throw new Error(`${nodeId} world position was absent from live motion telemetry.`);
+  return position;
+}
+
+function distanceBetween(
+  left: { readonly x: number; readonly y: number },
+  right: { readonly x: number; readonly y: number },
+): number {
+  return Math.hypot(left.x - right.x, left.y - right.y);
+}
+
+function spatialDistance(
+  left: { readonly x: number; readonly y: number; readonly z: number },
+  right: { readonly x: number; readonly y: number; readonly z: number },
+): number {
+  return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z);
+}
+
+function mostInteriorMotionFrame(
+  frames: readonly MotionTelemetryFrame[],
+  nodeId: string,
+  start: { readonly x: number; readonly y: number; readonly z: number },
+  end: { readonly x: number; readonly y: number; readonly z: number },
+): MotionTelemetryFrame {
+  const best = frames.reduce<{ readonly frame: MotionTelemetryFrame; readonly score: number } | null>((current, frame) => {
+    const position = nodeWorldPosition(frame, nodeId);
+    const score = Math.min(spatialDistance(start, position), spatialDistance(position, end));
+    return !current || score > current.score ? { frame, score } : current;
+  }, null);
+  if (!best) throw new Error("No active renderer motion frames were available.");
+  return best.frame;
+}
+
+function expectWorldPositionOnTargetPath(
+  start: { readonly x: number; readonly y: number; readonly z: number },
+  middle: { readonly x: number; readonly y: number; readonly z: number },
+  end: { readonly x: number; readonly y: number; readonly z: number },
+): void {
+  const targetVector = {
+    x: end.x - start.x,
+    y: end.y - start.y,
+    z: end.z - start.z,
+  };
+  const intermediateVector = {
+    x: middle.x - start.x,
+    y: middle.y - start.y,
+    z: middle.z - start.z,
+  };
+  const targetLengthSquared = (targetVector.x ** 2) + (targetVector.y ** 2) + (targetVector.z ** 2);
+  expect(targetLengthSquared).toBeGreaterThan(0);
+  const pathProgress = (
+    (intermediateVector.x * targetVector.x)
+    + (intermediateVector.y * targetVector.y)
+    + (intermediateVector.z * targetVector.z)
+  ) / targetLengthSquared;
+  expect(pathProgress).toBeGreaterThan(0);
+  expect(pathProgress).toBeLessThan(1);
+  const projected = {
+    x: start.x + (targetVector.x * pathProgress),
+    y: start.y + (targetVector.y * pathProgress),
+    z: start.z + (targetVector.z * pathProgress),
+  };
+  expect(spatialDistance(middle, projected)).toBeLessThan(0.001);
+}
+
+function expectLiveTransitionTargets(
+  motion: ObservedMotionTelemetry,
+  layout: ObservedSettledLayout,
+  nodeIds: readonly string[],
+): void {
+  const liveById = new Map(motion.transition.nodePositions.map((position) => [position.id, position]));
+  const targetById = new Map(layout.targetNodePositions.map((position) => [position.id, position]));
+  for (const nodeId of nodeIds) {
+    const live = liveById.get(nodeId);
+    const target = targetById.get(nodeId);
+    if (!live || !target) throw new Error(`Live or target position was absent for ${nodeId}.`);
+    expect(live.x).toBeCloseTo(target.x, 3);
+    expect(live.y).toBeCloseTo(target.y, 3);
+    expect(live.z).toBeCloseTo(target.z, 3);
+  }
+}
+
 async function openFixture(page: Page): Promise<void> {
   await page.goto("/");
   await expect(page.getByTestId("graph-shell")).toBeVisible();
@@ -230,11 +428,13 @@ test("mounts a real WebGL canvas and keeps input/render identities exact", async
 
 test("observes the master floor and selection-distance opacity in attached scene objects", async ({ page }) => {
   await openFixture(page);
-  await page.getByTestId("matrix-row-component-web").click();
+  const beforeMotion = await waitForMotionSettled(page);
+  await selectMatrixNode(page, "component:web");
   expect(await waitForSelection(page, "matrix")).toMatchObject({
     nodeId: "component:web",
     neighborNodeIds: ["component:api"],
   });
+  await waitForNewerMotionSettled(page, beforeMotion.transition.generation);
 
   await expect.poll(async () => readTelemetry<ObservedMasterVisibility>(page, "master-visibility"))
     .toMatchObject({
@@ -331,7 +531,7 @@ test("observes the master floor and selection-distance opacity in attached scene
 test("reproduces selected target positions from the same seed and viewport", async ({ page }) => {
   await openFixture(page);
 
-  await page.getByTestId("matrix-row-component-api").click();
+  await selectMatrixNode(page, "component:api");
   const selection = await waitForSelection(page, "matrix");
   expect(selection).toMatchObject({
     nodeId: "component:api",
@@ -342,17 +542,88 @@ test("reproduces selected target positions from the same seed and viewport", asy
 
   await page.getByTestId("reset-layout").click();
   await waitForSelection(page, "programmatic");
-  await page.getByTestId("matrix-row-component-api").click();
+  await selectMatrixNode(page, "component:api");
   await waitForSelection(page, "matrix");
   const second = await waitForSettledLayout(page);
 
   expect(second).toEqual(first);
 });
 
+test("moves a non-selected node through a real renderer-owned intermediate frame", async ({ page }) => {
+  await openFixture(page);
+  const before = await waitForMotionSettled(page);
+  const beforeProfile = profileScreenPosition(before);
+  const beforeProfileWorld = nodeWorldPosition(before, "profile:platform");
+
+  await openMatrixPalette(page);
+  const activeFramesPromise = waitForMotionFrames(page, before.transition.generation);
+  await page.getByTestId("matrix-row-component-api").click();
+  const activeFrames = await activeFramesPromise;
+
+  expect(await waitForSelection(page, "matrix")).toMatchObject({ nodeId: "component:api" });
+  const layout = await waitForSettledLayout(page);
+  const after = await waitForMotionSettled(page, activeFrames[0]?.transition.generation);
+  const afterProfileWorld = nodeWorldPosition(after, "profile:platform");
+  const middle = mostInteriorMotionFrame(
+    activeFrames,
+    "profile:platform",
+    beforeProfileWorld,
+    afterProfileWorld,
+  );
+  expect(middle.transition.reducedMotion).toBe(false);
+  expect(middle.transition.durationMs).toBeGreaterThan(0);
+  expect(middle.transition.nodePositions.map(({ id }) => id)).toContain("profile:platform");
+  const middleProfile = profileScreenPosition(middle);
+  const middleProfileWorld = nodeWorldPosition(middle, "profile:platform");
+  const afterProfile = profileScreenPosition(after);
+
+  // `profile:platform` is a one-hop neighbor, but it is not the selected node.
+  // These three projections are sampled from the live renderer API, not a timer
+  // or an expected-layout snapshot. The middle sample is retained from a real
+  // requestAnimationFrame before the transaction settles.
+  expect(distanceBetween(beforeProfile, afterProfile)).toBeGreaterThan(1);
+  expect(distanceBetween(beforeProfile, middleProfile)).toBeGreaterThan(0.25);
+  expect(distanceBetween(middleProfile, afterProfile)).toBeGreaterThan(0.25);
+  expect(spatialDistance(beforeProfileWorld, afterProfileWorld)).toBeGreaterThan(0.01);
+  expect(spatialDistance(beforeProfileWorld, middleProfileWorld)).toBeGreaterThan(0.01);
+  expect(spatialDistance(middleProfileWorld, afterProfileWorld)).toBeGreaterThan(0.01);
+  expectWorldPositionOnTargetPath(beforeProfileWorld, middleProfileWorld, afterProfileWorld);
+  expect(after.transition).toMatchObject({ active: false, progress: 1, reducedMotion: false });
+  const profileTarget = layout.targetNodePositions.find(({ id }) => id === "profile:platform");
+  if (!profileTarget) throw new Error("Profile target position was absent from the settled layout.");
+  expect(afterProfileWorld.x).toBeCloseTo(profileTarget.x, 3);
+  expect(afterProfileWorld.y).toBeCloseTo(profileTarget.y, 3);
+  expect(afterProfileWorld.z).toBeCloseTo(profileTarget.z, 3);
+  expectLiveTransitionTargets(after, layout, ["component:api", "relation:release", "component:web", "profile:platform"]);
+
+  // The selected-node drawer is part of the same responsive scene: closing it
+  // must not let a force simulation drift a layout that has already settled or
+  // strand keyboard focus inside the now-inert drawer.
+  const drawerClose = page.getByTestId("detail-drawer-close");
+  await expect(drawerClose).toBeVisible();
+  await expect(drawerClose).toBeEnabled();
+  await drawerClose.focus();
+  await expect(drawerClose).toBeFocused();
+  await drawerClose.click();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+  await expect.poll(async () => readTelemetry<{ readonly collapsed: boolean }>(page, "collapse-status"))
+    .toMatchObject({ collapsed: true });
+  const graphShell = page.getByTestId("graph-shell");
+  await expect(graphShell).toHaveAttribute("role", "application");
+  await expect(graphShell).toBeFocused();
+  expectLiveTransitionTargets(await waitForMotionSettled(page, activeFrames[0]?.transition.generation), layout, [
+    "component:api",
+    "relation:release",
+    "component:web",
+    "profile:platform",
+  ]);
+});
+
 test("preserves one selection identity across Matrix, actual canvas mouse, keyboard, and re-selection", async ({ page }) => {
+  test.slow();
   await openFixture(page);
 
-  await page.getByTestId("matrix-row-component-api").click();
+  await selectMatrixNode(page, "component:api");
   expect(await waitForSelection(page, "matrix")).toMatchObject({ nodeId: "component:api" });
   await expect(page.getByTestId("graph-detail-panel")).toContainText("component:api");
 
@@ -367,7 +638,7 @@ test("preserves one selection identity across Matrix, actual canvas mouse, keybo
   expect(await waitForSelection(page, "keyboard")).toMatchObject({ nodeId: "component:web" });
   await expect(page.getByTestId("graph-detail-panel")).toContainText("component:web");
 
-  await page.getByTestId("matrix-row-component-web").click();
+  await selectMatrixNode(page, "component:web");
   expect(await waitForSelection(page, "matrix")).toMatchObject({ nodeId: "component:web" });
   await expect(page.getByTestId("matrix-selection")).toContainText("component:web");
   await expect(page.getByTestId("graph-detail-panel")).toContainText("component:web");
@@ -375,7 +646,7 @@ test("preserves one selection identity across Matrix, actual canvas mouse, keybo
 
 test("actual canvas hover preserves the current public selection identity", async ({ page }) => {
   await openFixture(page);
-  await page.getByTestId("matrix-row-component-api").click();
+  await selectMatrixNode(page, "component:api");
   const beforeSelection = await waitForSelection(page, "matrix");
   const beforeCamera = await waitForCameraObservation(page, "component:api");
 
@@ -391,7 +662,7 @@ test("actual canvas navigation drag preserves the selected public identity", asy
   const box = await canvas.boundingBox();
   if (!box) throw new Error("graph canvas does not have a measurable bounding box");
 
-  await page.getByTestId("matrix-row-component-api").click();
+  await selectMatrixNode(page, "component:api");
   const beforeSelection = await waitForSelection(page, "matrix");
 
   await page.mouse.move(box.x + box.width - 32, box.y + box.height - 32);
@@ -404,22 +675,33 @@ test("actual canvas navigation drag preserves the selected public identity", asy
 });
 
 test("reduced motion reaches the same public selection target and deterministic layout", async ({ browser }) => {
+  test.slow();
   const normalContext = await browser.newContext();
   const normalPage = await normalContext.newPage();
   await openFixture(normalPage);
-  await normalPage.getByTestId("matrix-row-component-web").click();
+  await selectMatrixNode(normalPage, "component:web");
   const normal = await waitForSelection(normalPage, "matrix");
   const normalLayout = await waitForSettledLayout(normalPage);
 
   const reducedContext = await browser.newContext({ reducedMotion: "reduce" });
   const reducedPage = await reducedContext.newPage();
   await openFixture(reducedPage);
-  await reducedPage.getByTestId("matrix-row-component-web").click();
+  await selectMatrixNode(reducedPage, "component:web");
   const reduced = await waitForSelection(reducedPage, "matrix");
   const reducedLayout = await waitForSettledLayout(reducedPage);
 
   expect(reduced).toEqual(normal);
   expect(reducedLayout).toEqual(normalLayout);
+  expect((await waitForMotionSettled(normalPage)).transition).toMatchObject({
+    active: false,
+    progress: 1,
+    reducedMotion: false,
+  });
+  expect((await waitForMotionSettled(reducedPage)).transition).toMatchObject({
+    active: false,
+    progress: 1,
+    reducedMotion: true,
+  });
   expect(await readTelemetry<ObservedSelectionState & { readonly reducedMotion: boolean }>(
     reducedPage,
     "reduced-motion-selection",
@@ -431,7 +713,7 @@ test("reduced motion reaches the same public selection target and deterministic 
 
 test("does not claim unobserved camera transitions and survives setInput/collapse host updates", async ({ page }) => {
   await openFixture(page);
-  await page.getByTestId("matrix-row-component-api").click();
+  await selectMatrixNode(page, "component:api");
   await waitForSelection(page, "matrix");
   await waitForCameraObservation(page, "component:api");
 
@@ -515,6 +797,7 @@ test("reports forced WebGL context failure without selection or camera success t
   expect(distanceVisibility).toMatchObject({ availability: "unavailable" });
   expect(distanceVisibility).not.toHaveProperty("selected");
 
+  await openMatrixPalette(page);
   await expect(page.getByTestId("matrix-row-component-api")).toBeDisabled();
   await expect(page.getByTestId("host-set-input")).toBeDisabled();
 });

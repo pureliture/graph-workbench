@@ -3,7 +3,7 @@ import { headers } from "next/headers";
 import "./globals.css";
 
 const title = "Graph Workbench Browser Fixture";
-const description = "A deterministic browser fixture for selection-driven 3D graph workbench evidence.";
+const description = "A full-viewport browser fixture for selection-driven 3D graph interaction and live evidence.";
 
 const trustedHostPattern = /^(?:localhost|(?:\d{1,3}\.){3}\d{1,3}|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::\d{1,5})?$/i;
 

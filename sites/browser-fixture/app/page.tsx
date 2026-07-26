@@ -3,7 +3,7 @@ import { BrowserGraphFixture } from "./BrowserGraphFixture";
 
 export const metadata: Metadata = {
   title: "Graph Workbench Browser Fixture",
-  description: "A deterministic browser fixture for selection-driven 3D graph workbench evidence.",
+  description: "A full-viewport browser fixture for selection-driven 3D graph interaction and live evidence.",
 };
 
 export default function Home() {

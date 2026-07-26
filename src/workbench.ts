@@ -10,6 +10,7 @@ import {
   type GraphRendererFactoryOptions,
   type GraphRenderObservation,
   type GraphScreenPosition,
+  type GraphTransitionObservation,
 } from "./renderer-contract.js";
 import { EMPTY_GRAPH_PRESENTATION, type GraphPresentation } from "./presentation.js";
 
@@ -64,6 +65,8 @@ export interface GraphWorkbench {
   getNodeScreenPosition(nodeId: string): GraphScreenPosition | null;
   /** Live Object3D evidence, or null when no enhanced renderer is mounted. */
   getRenderObservation(): GraphRenderObservation | null;
+  /** Live renderer-owned selection transition evidence, when supported. */
+  getTransitionObservation(): GraphTransitionObservation | null;
   getSelectionState(): GraphSelectionState;
   mount(container: HTMLElement): void;
   resize(width?: number, height?: number): void;
@@ -240,6 +243,9 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
     },
     getRenderObservation() {
       return renderer?.getRenderObservation?.() ?? null;
+    },
+    getTransitionObservation() {
+      return renderer?.getTransitionObservation?.() ?? null;
     },
     getSelectionState() {
       return selectionState;
