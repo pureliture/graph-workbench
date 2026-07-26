@@ -4,6 +4,8 @@ const requiredNodeIds = ["relation:release", "component:api", "component:web", "
 const requiredLinkIds = ["release-api", "api-web", "release-profile", "profile-api"];
 const fixtureNodeCount = 49;
 const fixtureLinkCount = 60;
+const canvasHitAttemptLimit = 3;
+const canvasSelectionConfirmationTimeoutMs = 1_000;
 
 interface ObservedSelectionState {
   readonly availability: "observed";
@@ -621,6 +623,23 @@ async function waitForRendererPointerSample(page: Page): Promise<void> {
   }));
 }
 
+async function clickReachedRequestedNode(
+  page: Page,
+  nodeId: string,
+  previous: Partial<ObservedSelectionState>,
+): Promise<boolean> {
+  const deadline = Date.now() + canvasSelectionConfirmationTimeoutMs;
+  while (Date.now() < deadline) {
+    const candidate = await readTelemetry<Partial<ObservedSelectionState>>(page, "graph-selection");
+    if (candidate.availability === "observed") {
+      if (candidate.nodeId === nodeId && candidate.source === "mouse") return true;
+      if (candidate.nodeId !== previous.nodeId || candidate.source !== previous.source) return false;
+    }
+    await page.waitForTimeout(50);
+  }
+  return false;
+}
+
 async function advanceAnimationFrames(page: Page, frameCount: number): Promise<void> {
   await page.evaluate((count) => new Promise<void>((resolve) => {
     let remaining = count;
@@ -635,10 +654,22 @@ async function advanceAnimationFrames(page: Page, frameCount: number): Promise<v
 
 async function clickProjectedCanvasNode(page: Page, nodeId: string): Promise<void> {
   const canvas = page.getByTestId("graph-canvas");
-  const { x, y } = await waitForProjectedNodeSeparation(page, nodeId, 22);
-  await canvas.hover({ position: { x, y } });
-  await waitForRendererPointerSample(page);
-  await canvas.click({ position: { x, y } });
+  for (let attempt = 1; attempt <= canvasHitAttemptLimit; attempt += 1) {
+    const previous = await readTelemetry<Partial<ObservedSelectionState>>(page, "graph-selection");
+    const { x, y } = await waitForProjectedNodeSeparation(page, nodeId, 22);
+    await canvas.hover({ position: { x, y } });
+    await waitForRendererPointerSample(page);
+    await canvas.click({ position: { x, y } });
+    // The initial fit/zoom and vendor raycast cache can make a fresh projection
+    // miss on first mount. Preserve the real canvas path, then accept it only
+    // when its own mouse-selection telemetry identifies the requested node.
+    if (await clickReachedRequestedNode(page, nodeId, previous)) {
+      return;
+    }
+  }
+  throw new Error(
+    `Canvas clicks did not select ${nodeId} after ${canvasHitAttemptLimit} fresh projection attempts.`,
+  );
 }
 
 async function hoverProjectedCanvasNode(page: Page, nodeId: string): Promise<void> {
