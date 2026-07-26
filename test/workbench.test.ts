@@ -55,6 +55,43 @@ class FakeRenderer implements GraphRenderer {
   zoom(scale: number): void { this.zoomCalls.push(scale); }
 }
 
+class ProjectionRenderer extends FakeRenderer {
+  projectionCalls: string[] = [];
+
+  getNodeScreenPosition(nodeId: string) {
+    this.projectionCalls.push(nodeId);
+    return { x: 121.5, y: 84.25 };
+  }
+}
+
+class ObservationRenderer extends FakeRenderer {
+  getRenderObservation() {
+    if (!this.data) return null;
+    return {
+      linkIds: this.data.links.map((link) => link.id),
+      links: this.data.links.map((link) => ({
+        id: link.id,
+        minimumVisibleMaterialOpacity: null,
+        objectTracked: false,
+        objectVisible: null,
+        sceneAttached: false,
+        visibleMaterialOpacities: [],
+        visual: link.visual,
+      })),
+      nodeIds: this.data.nodes.map((node) => node.id),
+      nodes: this.data.nodes.map((node) => ({
+        id: node.id,
+        minimumVisibleMaterialOpacity: null,
+        objectTracked: false,
+        objectVisible: null,
+        sceneAttached: false,
+        visibleMaterialOpacities: [],
+        visual: node.visual,
+      })),
+    };
+  }
+}
+
 describe("GraphWorkbench", () => {
   it("connects renderer events and keyboard focus to host-observable stable identities", () => {
     let renderer: FakeRenderer | null = null;
@@ -78,6 +115,7 @@ describe("GraphWorkbench", () => {
     workbench.mount(element as unknown as HTMLElement);
     expect(renderer?.data?.nodes.map((node) => node.id)).toEqual(graphFixture.nodes.map((node) => node.id));
     expect(states).toEqual(["mounted"]);
+    expect(workbench.getNodeScreenPosition("component:api")).toBeNull();
 
     callbacks?.onNodeClick("component:api");
     expect(clicks).toEqual(["component:api"]);
@@ -100,5 +138,44 @@ describe("GraphWorkbench", () => {
     workbench.unmount();
     expect(renderer?.destroyed).toBe(true);
     expect(states).toEqual(["mounted", "unmounted"]);
+  });
+
+  it("delegates screen projection for known identities and otherwise returns null", () => {
+    const renderer = new ProjectionRenderer();
+    const workbench = createGraphWorkbench({
+      input: graphFixture,
+      rendererFactory: () => renderer,
+    });
+    const element = new FakeElement();
+
+    expect(workbench.getNodeScreenPosition("component:api")).toBeNull();
+    workbench.mount(element as unknown as HTMLElement);
+    expect(workbench.getNodeScreenPosition("component:api")).toEqual({ x: 121.5, y: 84.25 });
+    expect(workbench.getNodeScreenPosition("missing")).toBeNull();
+    expect(renderer.projectionCalls).toEqual(["component:api"]);
+
+    workbench.unmount();
+    expect(workbench.getNodeScreenPosition("component:api")).toBeNull();
+  });
+
+  it("exposes enhanced live render evidence only while its renderer is mounted", () => {
+    const renderer = new ObservationRenderer();
+    const workbench = createGraphWorkbench({
+      input: graphFixture,
+      rendererFactory: () => renderer,
+    });
+    const element = new FakeElement();
+
+    expect(workbench.getRenderObservation()).toBeNull();
+    workbench.mount(element as unknown as HTMLElement);
+    const observation = workbench.getRenderObservation();
+    expect(observation).toMatchObject({
+      linkIds: graphFixture.links.map((link) => link.id),
+      nodeIds: graphFixture.nodes.map((node) => node.id),
+    });
+    expect(observation?.nodes[0]).toMatchObject({ id: "relation:release", objectTracked: false });
+
+    workbench.unmount();
+    expect(workbench.getRenderObservation()).toBeNull();
   });
 });

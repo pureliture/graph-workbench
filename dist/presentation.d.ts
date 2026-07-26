@@ -11,6 +11,8 @@ export interface GraphLinkDescriptor {
 export interface GraphPresentation {
     readonly selectedNodeIds?: readonly string[];
     readonly focusNodeId?: string | null;
+    /** Keeps selection targets unchanged while requesting an immediate camera move. */
+    readonly reducedMotion?: boolean;
     readonly theme?: "dark" | "light";
     readonly nodeDescriptors?: Readonly<Record<string, GraphNodeDescriptor>>;
     readonly linkDescriptors?: Readonly<Record<string, GraphLinkDescriptor>>;

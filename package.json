@@ -25,8 +25,11 @@
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "check": "npm run build && npm test",
+    "check:issue-1": "npm run check && npm --prefix sites/browser-fixture run lint && npm run site:build && node --test sites/browser-fixture/tests/rendered-html.test.mjs && npm run test:browser",
     "demo": "vite --host 127.0.0.1",
-    "test": "vitest run"
+    "site:build": "npm --prefix sites/browser-fixture run build",
+    "test": "vitest run",
+    "test:browser": "npm --prefix sites/browser-fixture run test:browser"
   },
   "engines": {
     "node": ">=20"

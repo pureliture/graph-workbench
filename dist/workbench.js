@@ -1,8 +1,11 @@
 import { validateGraphInput } from "./contract.js";
-import { createRenderGraphData } from "./layout.js";
+import { createRenderGraphData, } from "./layout.js";
 import { EMPTY_GRAPH_PRESENTATION } from "./presentation.js";
 function knownNodeIds(input) {
     return new Set(input.nodes.map((node) => node.id));
+}
+function selectedNodeId(presentation) {
+    return presentation.selectedNodeIds?.[0] ?? null;
 }
 function normalizedPresentation(input, supplied) {
     const known = knownNodeIds(input);
@@ -13,6 +16,7 @@ function normalizedPresentation(input, supplied) {
     return {
         selectedNodeIds,
         focusNodeId,
+        reducedMotion: supplied.reducedMotion === true,
         theme: supplied.theme === "light" ? "light" : "dark",
         nodeDescriptors: supplied.nodeDescriptors ?? {},
         linkDescriptors: supplied.linkDescriptors ?? {},
@@ -28,40 +32,83 @@ function keyboardTarget(input, current, direction) {
         : (currentIndex + direction + nodeIds.length) % nodeIds.length;
     return nodeIds[nextIndex] ?? null;
 }
+function viewportFor(container, width, height) {
+    if (width !== undefined || height !== undefined) {
+        return {
+            width: Math.max(1, Math.floor(width ?? container?.clientWidth ?? 1)),
+            height: Math.max(1, Math.floor(height ?? container?.clientHeight ?? 1)),
+        };
+    }
+    if (!container)
+        return undefined;
+    return {
+        width: Math.max(1, Math.floor(container.clientWidth ?? 1)),
+        height: Math.max(1, Math.floor(container.clientHeight ?? 1)),
+    };
+}
 export function createGraphWorkbench(options) {
     let input = validateGraphInput(options.input);
     let presentation = normalizedPresentation(input, EMPTY_GRAPH_PRESENTATION);
     let renderer = null;
     let container = null;
+    let viewport;
+    let selectionState = createRenderGraphData(input, presentation, { viewport }).selection;
     let destroyed = false;
     const rendererFactory = options.rendererFactory;
     const sync = () => {
+        const data = createRenderGraphData(input, presentation, { viewport });
+        selectionState = data.selection;
         if (!renderer)
             return;
-        renderer.setData(createRenderGraphData(input, presentation));
+        renderer.setData(data);
         renderer.setPresentation(presentation);
     };
-    const emitFocus = (nodeId) => {
-        presentation = normalizedPresentation(input, { ...presentation, focusNodeId: nodeId });
-        renderer?.setPresentation(presentation);
-        options.onFocusChange?.({ input, nodeId: presentation.focusNodeId ?? null });
+    const transitionToSelection = (nodeId) => {
+        if (!renderer || !nodeId)
+            return;
+        renderer.cancelCameraTransition?.();
+        if (renderer.transitionToNode) {
+            renderer.transitionToNode(nodeId, { reducedMotion: presentation.reducedMotion === true });
+            return;
+        }
+        renderer.focus(nodeId);
+    };
+    const emitSelection = (source) => {
+        const nodeId = selectionState.nodeId;
+        const node = nodeId ? input.nodes.find((candidate) => candidate.id === nodeId) ?? null : null;
+        options.onFocusChange?.({ input, nodeId });
+        options.onSelectionChange?.({
+            input,
+            node,
+            nodeId,
+            neighborNodeIds: selectionState.neighborNodeIds,
+            settled: selectionState.settled,
+            source,
+        });
+    };
+    const selectNode = (nodeId, source) => {
+        const nextNodeId = nodeId && knownNodeIds(input).has(nodeId) ? nodeId : null;
+        if (!nextNodeId)
+            renderer?.cancelCameraTransition?.();
+        presentation = normalizedPresentation(input, {
+            ...presentation,
+            focusNodeId: nextNodeId,
+            selectedNodeIds: nextNodeId ? [nextNodeId] : [],
+        });
+        sync();
+        if (nextNodeId)
+            transitionToSelection(nextNodeId);
+        emitSelection(source);
     };
     const callbacks = {
         onBackgroundClick() {
-            presentation = normalizedPresentation(input, { ...presentation, focusNodeId: null, selectedNodeIds: [] });
-            renderer?.setPresentation(presentation);
+            selectNode(null, "background");
             options.onBackgroundClick?.();
         },
         onNodeClick(nodeId) {
             if (!knownNodeIds(input).has(nodeId))
                 return;
-            presentation = normalizedPresentation(input, {
-                ...presentation,
-                focusNodeId: nodeId,
-                selectedNodeIds: [nodeId],
-            });
-            renderer?.setPresentation(presentation);
-            options.onFocusChange?.({ input, nodeId });
+            selectNode(nodeId, "mouse");
             options.onNodeClick?.({ input, nodeId });
         },
         onNodeHover(nodeId) {
@@ -71,25 +118,21 @@ export function createGraphWorkbench(options) {
     const onKeyDown = (event) => {
         if (event.key === "ArrowRight" || event.key === "ArrowDown") {
             event.preventDefault();
-            const next = keyboardTarget(input, presentation.focusNodeId ?? null, 1);
-            if (next) {
-                emitFocus(next);
-                renderer?.focus(next);
-            }
+            const next = keyboardTarget(input, selectionState.nodeId ?? presentation.focusNodeId ?? null, 1);
+            if (next)
+                selectNode(next, "keyboard");
             return;
         }
         if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
             event.preventDefault();
-            const previous = keyboardTarget(input, presentation.focusNodeId ?? null, -1);
-            if (previous) {
-                emitFocus(previous);
-                renderer?.focus(previous);
-            }
+            const previous = keyboardTarget(input, selectionState.nodeId ?? presentation.focusNodeId ?? null, -1);
+            if (previous)
+                selectNode(previous, "keyboard");
             return;
         }
-        if (event.key === "Enter" && presentation.focusNodeId) {
+        if (event.key === "Enter" && selectionState.nodeId) {
             event.preventDefault();
-            callbacks.onNodeClick(presentation.focusNodeId);
+            callbacks.onNodeClick(selectionState.nodeId);
             return;
         }
         if (event.key === "Escape") {
@@ -108,10 +151,23 @@ export function createGraphWorkbench(options) {
             renderer?.fit(durationMs);
         },
         focusNode(nodeId) {
-            const next = nodeId && knownNodeIds(input).has(nodeId) ? nodeId : null;
-            emitFocus(next);
-            if (next)
-                renderer?.focus(next);
+            const nextNodeId = nodeId && knownNodeIds(input).has(nodeId) ? nodeId : null;
+            presentation = normalizedPresentation(input, { ...presentation, focusNodeId: nextNodeId });
+            renderer?.setPresentation(presentation);
+            if (nextNodeId)
+                transitionToSelection(nextNodeId);
+            options.onFocusChange?.({ input, nodeId: nextNodeId });
+        },
+        getNodeScreenPosition(nodeId) {
+            if (!knownNodeIds(input).has(nodeId))
+                return null;
+            return renderer?.getNodeScreenPosition?.(nodeId) ?? null;
+        },
+        getRenderObservation() {
+            return renderer?.getRenderObservation?.() ?? null;
+        },
+        getSelectionState() {
+            return selectionState;
         },
         mount(nextContainer) {
             if (destroyed)
@@ -120,6 +176,7 @@ export function createGraphWorkbench(options) {
                 return;
             this.unmount();
             container = nextContainer;
+            viewport = viewportFor(container);
             if (container.tabIndex < 0)
                 container.tabIndex = 0;
             container.setAttribute("role", "application");
@@ -132,6 +189,7 @@ export function createGraphWorkbench(options) {
                 renderer = rendererFactory({ callbacks, container });
                 sync();
                 renderer.resize();
+                transitionToSelection(selectionState.nodeId);
                 options.onRendererStateChange?.({ status: "mounted" });
             }
             catch (error) {
@@ -144,19 +202,50 @@ export function createGraphWorkbench(options) {
             }
         },
         resize(width, height) {
+            viewport = viewportFor(container, width, height);
             renderer?.resize(width, height);
+            sync();
         },
         restoreCamera() {
             renderer?.restoreCamera();
         },
+        selectNode(nodeId, source = "programmatic") {
+            selectNode(nodeId, source);
+        },
         setInput(nextInput) {
-            input = validateGraphInput(nextInput);
-            presentation = normalizedPresentation(input, presentation);
+            const validatedInput = validateGraphInput(nextInput);
+            const nextPresentation = normalizedPresentation(validatedInput, presentation);
+            const previousNodeId = selectionState.nodeId;
+            const nextNodeId = selectedNodeId(nextPresentation);
+            if (previousNodeId && !nextNodeId)
+                renderer?.cancelCameraTransition?.();
+            input = validatedInput;
+            presentation = nextPresentation;
             sync();
+            if (selectionState.nodeId !== previousNodeId) {
+                if (selectionState.nodeId)
+                    transitionToSelection(selectionState.nodeId);
+                emitSelection("programmatic");
+            }
         },
         setPresentation(nextPresentation) {
-            presentation = normalizedPresentation(input, nextPresentation);
-            renderer?.setPresentation(presentation);
+            const previousNodeId = selectionState.nodeId;
+            const normalized = normalizedPresentation(input, nextPresentation);
+            const nextNodeId = selectedNodeId(normalized);
+            if (previousNodeId && !nextNodeId)
+                renderer?.cancelCameraTransition?.();
+            presentation = normalized;
+            sync();
+            if (selectionState.nodeId !== previousNodeId) {
+                if (selectionState.nodeId)
+                    transitionToSelection(selectionState.nodeId);
+                emitSelection("programmatic");
+            }
+        },
+        setReducedMotion(reducedMotion) {
+            presentation = normalizedPresentation(input, { ...presentation, reducedMotion });
+            sync();
+            transitionToSelection(selectionState.nodeId);
         },
         unmount() {
             if (!container && !renderer)
@@ -165,6 +254,7 @@ export function createGraphWorkbench(options) {
             renderer?.destroy();
             renderer = null;
             container = null;
+            viewport = undefined;
             options.onRendererStateChange?.({ status: "unmounted" });
         },
         zoom(scale) {

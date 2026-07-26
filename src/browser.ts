@@ -8,7 +8,15 @@ import {
 export interface BrowserGraphWorkbenchOptions extends Omit<GraphWorkbenchOptions, "rendererFactory"> {}
 
 export function createBrowserGraphWorkbench(options: BrowserGraphWorkbenchOptions): GraphWorkbench {
-  return createGraphWorkbench({ ...options, rendererFactory: createThreeForceGraphRenderer });
+  const workbench = createGraphWorkbench({ ...options, rendererFactory: createThreeForceGraphRenderer });
+  if (
+    typeof window !== "undefined"
+    && typeof window.matchMedia === "function"
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  ) {
+    workbench.setReducedMotion(true);
+  }
+  return workbench;
 }
 
 export {
@@ -19,4 +27,9 @@ export {
 export type {
   GraphLinkObjectFactory,
   GraphNodeObjectFactory,
+  GraphRenderLinkObservation,
+  GraphRenderNodeObservation,
+  GraphRenderObjectObservation,
+  GraphRenderObservation,
+  GraphScreenPosition,
 } from "./renderer-contract.js";

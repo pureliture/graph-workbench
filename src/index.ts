@@ -12,6 +12,12 @@ export {
 } from "./contract.js";
 export {
   createRenderGraphData,
+  type GraphLayoutOptions,
+  type GraphLinkVisualCue,
+  type GraphNodeVisualCue,
+  type GraphSelectionState,
+  type GraphTargetNodePosition,
+  type GraphViewport,
   type RenderGraphData,
   type RenderLink,
   type RenderNode,
@@ -26,9 +32,15 @@ export {
   type GraphLinkObjectFactory,
   type GraphNodeObjectFactory,
   type GraphRenderer,
+  type GraphCameraTransitionOptions,
   type GraphRendererCallbacks,
   type GraphRendererFactory,
   type GraphRendererFactoryOptions,
+  type GraphRenderLinkObservation,
+  type GraphRenderNodeObservation,
+  type GraphRenderObjectObservation,
+  type GraphRenderObservation,
+  type GraphScreenPosition,
 } from "./renderer-contract.js";
 export {
   createGraphWorkbench,
@@ -36,6 +48,8 @@ export {
   type GraphHoverEvent,
   type GraphNodeEvent,
   type GraphRendererState,
+  type GraphSelectionEvent,
+  type GraphSelectionSource,
   type GraphWorkbench,
   type GraphWorkbenchOptions,
 } from "./workbench.js";
