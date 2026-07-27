@@ -94,13 +94,21 @@ export interface GraphTransitionNodePosition {
   readonly z: number;
 }
 
+/** The live camera pose sampled as a selection transition is observed. */
+export interface GraphTransitionCameraPoseObservation {
+  readonly lookAt: GraphAmbientMotionPosition;
+  readonly position: GraphAmbientMotionPosition;
+}
+
 /**
- * Read-only evidence of the renderer-owned selection transaction. Positions are
- * live values, so callers can distinguish an actual intermediate frame from a
- * final layout snapshot.
+ * Read-only evidence of the renderer-owned selection transaction. Positions
+ * and camera pose are live values, so callers can distinguish an actual
+ * intermediate frame from a final layout snapshot.
  */
 export interface GraphTransitionObservation {
   readonly active: boolean;
+  /** Enhanced renderers may expose the live camera pose for this transition. */
+  readonly camera?: GraphTransitionCameraPoseObservation | null;
   readonly durationMs: number;
   readonly generation: number;
   readonly nodePositions: readonly GraphTransitionNodePosition[];

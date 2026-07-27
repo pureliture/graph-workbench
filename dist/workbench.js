@@ -47,6 +47,15 @@ function viewportFor(container, width, height) {
         height: Math.max(1, Math.floor(container.clientHeight ?? 1)),
     };
 }
+function sameTargetNodePositions(left, right) {
+    return left.length === right.length && left.every((position, index) => {
+        const other = right[index];
+        return other?.id === position.id
+            && other.x === position.x
+            && other.y === position.y
+            && other.z === position.z;
+    });
+}
 export function createGraphWorkbench(options) {
     let input = validateGraphInput(options.input);
     let presentation = normalizedPresentation(input, EMPTY_GRAPH_PRESENTATION);
@@ -227,16 +236,26 @@ export function createGraphWorkbench(options) {
         setInput(nextInput) {
             const validatedInput = validateGraphInput(nextInput);
             const nextPresentation = normalizedPresentation(validatedInput, presentation);
-            const previousNodeId = selectionState.nodeId;
+            const previousSelection = selectionState;
+            const previousNodeId = previousSelection.nodeId;
             const nextNodeId = selectedNodeId(nextPresentation);
             if (previousNodeId && !nextNodeId)
                 renderer?.cancelCameraTransition?.();
             input = validatedInput;
             presentation = nextPresentation;
             sync();
-            if (selectionState.nodeId !== previousNodeId) {
+            const selectionChanged = selectionState.nodeId !== previousNodeId;
+            const relationshipLayoutChanged = selectionState.nodeId !== null
+                && !sameTargetNodePositions(previousSelection.targetNodePositions, selectionState.targetNodePositions);
+            // A host can update links or layout hints without changing the selected
+            // identity. Reframe only when those actual targets changed, so the
+            // camera follows the new relationship constellation while metadata-only
+            // updates, collapse state, and a user's current camera remain untouched.
+            if (selectionChanged || relationshipLayoutChanged) {
                 if (selectionState.nodeId)
                     transitionToSelection(selectionState.nodeId);
+            }
+            if (selectionChanged) {
                 emitSelection("programmatic");
             }
         },

@@ -172,10 +172,21 @@ const AMBIENT_NODE_BREATHING = Object.freeze({ x: 2.8, y: 3.4, z: 1.2 });
 const AMBIENT_MAX_OFFSET = 12;
 const AMBIENT_RADIANS_PER_SECOND = 0.42;
 const FLOW_SPEED_CYCLES_PER_SECOND = 0.22;
+// Idle flow is deliberately much slower and smaller than an interaction flow.
+// It lets a settled graph read as a living system without turning every edge
+// into a competing animation.
+const IDLE_FLOW_SPEED_CYCLES_PER_SECOND = 0.075;
+const MAX_IDLE_FLOW_PARTICLES = 5;
+const IDLE_FLOW_PARTICLE_SCALE = 0.46;
+const INTERACTION_FLOW_PARTICLE_SCALE = 1;
 const MAX_FLOW_PARTICLES = 24;
 const AMBIENT_VISUAL_EPSILON = 0.0001;
 const AMBIENT_MASTER_BODY_OPACITY_FLOOR = 0.5;
-const AMBIENT_MASTER_LABEL_OPACITY_FLOOR = 0.48;
+const AMBIENT_MASTER_LABEL_OPACITY_FLOOR = 0.5;
+// Distant labels remain part of the interaction surface even at their most
+// subdued depth tier. Fading them below this would make the sprite invisible,
+// which breaks the graph's persistent node hierarchy.
+const AMBIENT_FAR_LABEL_OPACITY_FLOOR = 0.02;
 
 function themePalette(theme: GraphPresentation["theme"]): GraphThemePalette {
   return theme === "light" ? THEME_PALETTES.light : THEME_PALETTES.dark;
@@ -877,6 +888,7 @@ interface AmbientNodeState {
 }
 
 interface AmbientLinkState {
+  ambientFlow: boolean;
   readonly baseOpacity: number;
   readonly baseWidth: number;
   readonly flowParticleCount: number;
@@ -1106,7 +1118,7 @@ export function createThreeForceGraphRenderer({
     };
   });
   let particleResourcesDisposed = false;
-  let transitionObservation: GraphTransitionObservation = {
+  let transitionObservation: Omit<GraphTransitionObservation, "camera"> = {
     active: false,
     durationMs: 0,
     generation: 0,
@@ -1461,6 +1473,7 @@ export function createThreeForceGraphRenderer({
       const object = renderedLinkObjects.get(link.id);
       const descriptor = linkDescriptor(link);
       ambientLinks.set(link.id, {
+        ambientFlow: false,
         baseOpacity: boundedOpacity(descriptor.opacity, link.visual.opacity),
         baseWidth: descriptor.width ?? link.visual.width,
         flowParticleCount: stableUnit(`${link.id}:flow`) >= 0.45 ? 3 : 2,
@@ -1477,6 +1490,19 @@ export function createThreeForceGraphRenderer({
       const state = ambientLinks.get(link.id)!;
       cacheAmbientDefaultLinkMaterial(state);
     }
+    // Pick a stable, bounded subset rather than animating every idle edge.
+    // The id-derived rank keeps the same quiet relationships alive across
+    // frames, data reapplication, and object replacement without adding a
+    // renderer-owned public state surface.
+    [...ambientLinks.values()]
+      .sort((left, right) => {
+        const rankDifference = stableUnit(`${left.id}:ambient-flow`) - stableUnit(`${right.id}:ambient-flow`);
+        return rankDifference || left.id.localeCompare(right.id);
+      })
+      .slice(0, MAX_IDLE_FLOW_PARTICLES)
+      .forEach((state) => {
+        state.ambientFlow = true;
+      });
     if (particleGroup.parent !== graph.scene()) graph.scene().add(particleGroup);
   }
 
@@ -1552,10 +1578,10 @@ export function createThreeForceGraphRenderer({
       const bodyFactor = selected
         ? 1
         : neighbor || focused
-          ? 0.66 + (near * 0.24)
+          ? 0.64 + (near * 0.3)
           : selectedNodeId
-            ? 0.18 + (near * 0.27)
-            : 0.34 + (near * 0.35);
+            ? 0.14 + (near * 0.31)
+            : 0.26 + (near * 0.46);
       const opacity = Math.max(
         node.visual.opacityFloor,
         master ? AMBIENT_MASTER_BODY_OPACITY_FLOOR : 0,
@@ -1568,21 +1594,22 @@ export function createThreeForceGraphRenderer({
           : master
             ? Math.max(AMBIENT_MASTER_LABEL_OPACITY_FLOOR, 0.32 + (near * 0.26))
             : selectedNodeId
-              ? 0.025 + (near * 0.26)
-              : 0.12 + (near * 0.44);
-      const labelVisible = selected || neighbor || focused || master || labelOpacity >= 0.04;
+              ? Math.max(AMBIENT_FAR_LABEL_OPACITY_FLOOR, 0.02 + (near * 0.24))
+              : 0.09 + (near * 0.5);
+      const labelVisible = selected || neighbor || focused || master
+        || labelOpacity >= AMBIENT_FAR_LABEL_OPACITY_FLOOR;
       const viewportScale = Math.max(
         0.82,
         Math.min(1.15, 480 / Math.max(1, Math.min(data.selection.viewport.width, data.selection.viewport.height))),
       );
-      const scale = selected ? 1.22 : (0.68 + (near * 0.28));
+      const scale = selected ? 1.22 : (0.64 + (near * 0.33));
       applyAmbientDefaultNodeVisual(
         state,
         opacity,
         scale,
         labelVisible,
         labelOpacity,
-        viewportScale * (0.68 + (near * 0.32)),
+        viewportScale * (0.62 + (near * 0.38)),
       );
     }
   }
@@ -1667,6 +1694,7 @@ export function createThreeForceGraphRenderer({
 
   function applyFocusedLinkFlow(): void {
     const focusNodeId = ambientFocusNodeId();
+    const hasFocus = focusNodeId !== null;
     let nextParticle = 0;
     for (const particle of flowParticles) {
       particle.linkId = null;
@@ -1675,11 +1703,12 @@ export function createThreeForceGraphRenderer({
     for (const state of ambientLinks.values()) {
       const source = renderedState(state.link.source);
       const target = renderedState(state.link.target);
-      const incident = focusNodeId !== null && (state.link.source === focusNodeId || state.link.target === focusNodeId);
+      const incident = hasFocus && (state.link.source === focusNodeId || state.link.target === focusNodeId);
+      const idleFlow = !hasFocus && state.ambientFlow;
       const selectedFocus = focusNodeId !== null && currentData?.selection.nodeId === focusNodeId;
       const liveObject = renderedLinkObjects.get(state.id);
       refreshAmbientLinkObject(state, liveObject ?? null);
-      state.active = Boolean(incident && state.object && ambientMotionEnabled());
+      state.active = Boolean((incident || idleFlow) && state.object && ambientMotionEnabled());
       state.particleCount = 0;
       if (!source || !target || !state.object) continue;
       updateLinkObjectFromWorldEndpoints(
@@ -1687,30 +1716,45 @@ export function createThreeForceGraphRenderer({
         actualNodeWorldPosition(source),
         actualNodeWorldPosition(target),
       );
+      let opacity: number;
+      let width: number;
+      if (incident) {
+        opacity = Math.max(selectedFocus ? 0.58 : 0.46, state.baseOpacity);
+        width = Math.max(selectedFocus ? 1.18 : 1.02, state.baseWidth);
+      } else if (idleFlow) {
+        opacity = Math.min(0.13, Math.max(0.075, state.baseOpacity * 0.32));
+        width = Math.max(0.58, Math.min(0.72, state.baseWidth * 0.58));
+      } else {
+        opacity = Math.min(0.055, state.baseOpacity * 0.22);
+        width = 0.5;
+      }
       applyAmbientDefaultLinkVisual(
         state,
-        incident ? Math.max(selectedFocus ? 0.52 : 0.38, state.baseOpacity) : Math.min(0.055, state.baseOpacity * 0.22),
-        incident ? Math.max(selectedFocus ? 1.1 : 0.9, state.baseWidth) : 0.5,
+        opacity,
+        width,
       );
       if (!state.active) continue;
-      const count = state.flowParticleCount;
+      const count = incident ? state.flowParticleCount : 1;
       const positions = state.object.geometry.getAttribute("position");
       if (!positions || positions.count < 3) continue;
       const outwardFromSource = state.link.source === focusNodeId;
       for (let index = 0; index < count && nextParticle < flowParticles.length; index += 1) {
         const particle = flowParticles[nextParticle]!;
         nextParticle += 1;
-        const basePhase = ((ambientElapsedMs / 1000) * FLOW_SPEED_CYCLES_PER_SECOND)
+        const basePhase = ((ambientElapsedMs / 1000) * (incident
+          ? FLOW_SPEED_CYCLES_PER_SECOND
+          : IDLE_FLOW_SPEED_CYCLES_PER_SECOND))
           + (index / count)
           + state.flowPhase;
         const outwardPhase = basePhase - Math.floor(basePhase);
-        const curveProgress = outwardFromSource ? outwardPhase : 1 - outwardPhase;
+        const curveProgress = incident && !outwardFromSource ? 1 - outwardPhase : outwardPhase;
         pointOnThreePointCurve(positions, curveProgress, curvePointLocalPosition);
         state.object.updateWorldMatrix(true, false);
         state.object.localToWorld(curvePointWorldPosition.copy(curvePointLocalPosition));
         particleGroup.updateWorldMatrix(true, false);
         particle.object.position.copy(particleGroup.worldToLocal(particleLocalPosition.copy(curvePointWorldPosition)));
         particle.object.visible = true;
+        particle.object.scale.setScalar(incident ? INTERACTION_FLOW_PARTICLE_SCALE : IDLE_FLOW_PARTICLE_SCALE);
         particle.linkId = state.id;
         particle.phase = outwardPhase;
         particle.x = curvePointWorldPosition.x;
@@ -2377,9 +2421,16 @@ export function createThreeForceGraphRenderer({
     },
     getRenderObservation,
     getTransitionObservation() {
-      return destroyed
-        ? null
-        : { ...transitionObservation, nodePositions: liveTransitionNodePositions() };
+      if (destroyed) return null;
+      const camera = cameraPose();
+      return {
+        ...transitionObservation,
+        camera: {
+          lookAt: { ...camera.lookAt },
+          position: { ...camera.position },
+        },
+        nodePositions: liveTransitionNodePositions(),
+      };
     },
     resize(width, height) {
       const next = dimensions(container, width, height);

@@ -50,6 +50,18 @@ interface MotionTelemetryFrame {
   }[];
   readonly transition: {
     readonly active: boolean;
+    readonly camera?: {
+      readonly lookAt: {
+        readonly x: number;
+        readonly y: number;
+        readonly z: number;
+      };
+      readonly position: {
+        readonly x: number;
+        readonly y: number;
+        readonly z: number;
+      };
+    } | null;
     readonly durationMs: number;
     readonly generation: number;
     readonly nodePositions: readonly {
@@ -611,6 +623,44 @@ function expectWorldMotionForNode(
   expectWorldPositionOnTargetPath(start, middle, end);
 }
 
+function transitionCameraPose(frame: MotionTelemetryFrame): NonNullable<MotionTelemetryFrame["transition"]["camera"]> {
+  const camera = frame.transition.camera;
+  if (!camera) throw new Error("A live renderer camera pose was absent from transition telemetry.");
+  return camera;
+}
+
+function mostInteriorCameraFrame(
+  frames: readonly MotionTelemetryFrame[],
+  start: NonNullable<MotionTelemetryFrame["transition"]["camera"]>,
+  end: NonNullable<MotionTelemetryFrame["transition"]["camera"]>,
+): MotionTelemetryFrame {
+  const best = frames.reduce<{ readonly frame: MotionTelemetryFrame; readonly score: number } | null>((current, frame) => {
+    const camera = transitionCameraPose(frame);
+    const score = Math.min(
+      spatialDistance(start.position, camera.position) + spatialDistance(start.lookAt, camera.lookAt),
+      spatialDistance(camera.position, end.position) + spatialDistance(camera.lookAt, end.lookAt),
+    );
+    return !current || score > current.score ? { frame, score } : current;
+  }, null);
+  if (!best) throw new Error("No active renderer frames were available for camera observation.");
+  return best.frame;
+}
+
+function expectCameraMotion(
+  before: MotionTelemetryFrame,
+  activeFrames: readonly MotionTelemetryFrame[],
+  after: MotionTelemetryFrame,
+): void {
+  const start = transitionCameraPose(before);
+  const end = transitionCameraPose(after);
+  const middle = transitionCameraPose(mostInteriorCameraFrame(activeFrames, start, end));
+
+  expect(spatialDistance(start.position, end.position)).toBeGreaterThan(0.01);
+  expect(spatialDistance(start.lookAt, end.lookAt)).toBeGreaterThan(0.01);
+  expect(spatialDistance(start.position, middle.position)).toBeGreaterThan(0.01);
+  expect(spatialDistance(middle.position, end.position)).toBeGreaterThan(0.01);
+}
+
 async function openFixture(page: Page): Promise<void> {
   await page.goto("/");
   await expect(page.getByTestId("graph-shell")).toBeVisible();
@@ -796,8 +846,37 @@ test("keeps ambient motion live while deterministic anchors stay fixed", async (
   expect(later.frames.length).toBeGreaterThanOrEqual(2);
 });
 
-test("actual canvas hover exposes only outbound flow particles without selecting", async ({ page }) => {
+test("actual canvas hover differentiates bounded idle and focus flow particles without selecting", async ({ page }) => {
   await openFixture(page);
+
+  const idleRender = (await waitForRenderObservation(page)).observation;
+  expect(idleRender.links).toHaveLength(fixtureLinkCount);
+  expect(idleRender.links.every(({ minimumVisibleMaterialOpacity, objectVisible, sceneAttached }) => (
+    objectVisible && sceneAttached && (minimumVisibleMaterialOpacity ?? 0) > 0
+  ))).toBe(true);
+  const idle = await waitForAmbientMotion(page, (motion) => (
+    motion.focusNodeId === null
+    && motion.visibleLinkFlow.length > 0
+    && motion.visibleParticles.length > 0
+  ));
+  expect(idle.visibleLinkFlow).toHaveLength(idle.visibleParticles.length);
+  expect(idle.visibleLinkFlow.length).toBeLessThanOrEqual(5);
+  expect(idle.visibleLinkFlow.every(({ active, particleCount }) => active && particleCount === 1)).toBe(true);
+  expect(idle.visibleParticles.every(({ linkId, phase }) => (
+    idle.visibleLinkFlow.some(({ id }) => id === linkId) && Number.isFinite(phase)
+  ))).toBe(true);
+  expect(idle.linkEndpoints).toHaveLength(fixtureLinkCount);
+  expectLinkEndpointsAttachedToRenderedNodes(idle, idle.linkEndpoints.map(({ id }) => id));
+  const laterIdle = await waitForAmbientMotionAfter(
+    page,
+    idle.frame,
+    12,
+    (motion) => motion.focusNodeId === null && motion.visibleParticles.length > 0,
+  );
+  const firstIdleParticle = idle.visibleParticles[0];
+  const laterIdleParticle = laterIdle.visibleParticles.find(({ id }) => id === firstIdleParticle?.id);
+  if (!firstIdleParticle || !laterIdleParticle) throw new Error("An idle flow particle did not persist across samples.");
+  expect(laterIdleParticle.phase).not.toBe(firstIdleParticle.phase);
 
   await hoverProjectedCanvasNode(page, "relation:query");
   const hover = await waitForAmbientMotion(page, (motion) => (
@@ -1145,18 +1224,20 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
   });
   const firstLayout = await waitForSettledLayout(page, "relation:review");
   const firstSettled = await waitForMotionSettled(page, firstActiveFrames[0]?.transition.generation);
+  const allNodeIds = firstLayout.targetNodePositions.map(({ id }) => id);
 
   // This is a real canvas hit path, not Matrix preselection: the selected
-  // relation, its one-hop component, and a non-neighbor peripheral node all
-  // expose start/intermediate/final world coordinates from renderer telemetry.
-  expectWorldMotionForNode(initial, firstActiveFrames, firstSettled, "relation:review");
-  expectWorldMotionForNode(initial, firstActiveFrames, firstSettled, "concept:contract");
-  expectWorldMotionForNode(initial, firstActiveFrames, firstSettled, "concept:session");
-  expectLiveTransitionTargets(firstSettled, firstLayout, [
-    "relation:review",
-    "concept:contract",
-    "concept:session",
-  ]);
+  // relation and every attached or peripheral node expose real
+  // start/intermediate/final world coordinates. The same transaction carries
+  // a live camera pose; no screenshot or fixed canvas coordinate is used.
+  for (const frame of firstActiveFrames) {
+    expect([...frame.transition.nodePositions.map(({ id }) => id)].sort()).toEqual([...allNodeIds].sort());
+  }
+  for (const nodeId of allNodeIds) {
+    expectWorldMotionForNode(initial, firstActiveFrames, firstSettled, nodeId);
+  }
+  expectLiveTransitionTargets(firstSettled, firstLayout, allNodeIds);
+  expectCameraMotion(initial, firstActiveFrames, firstSettled);
 
   const secondActiveFramesPromise = waitForMotionFrames(page, firstSettled.transition.generation);
   await clickProjectedCanvasNode(page, "relation:query");
@@ -1171,6 +1252,7 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
   expectWorldMotionForNode(firstSettled, secondActiveFrames, secondSettled, "relation:query");
   expectWorldMotionForNode(firstSettled, secondActiveFrames, secondSettled, "concept:index");
   expectWorldMotionForNode(firstSettled, secondActiveFrames, secondSettled, "concept:session");
+  expectCameraMotion(firstSettled, secondActiveFrames, secondSettled);
 
   const ambientAfterSelection = await waitForAmbientMotion(page, (motion) => (
     motion.focusNodeId === "relation:query"

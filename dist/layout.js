@@ -86,6 +86,75 @@ function oneHopNodeIds(input, selectedNodeId) {
         .sort(([leftId, leftOrder], [rightId, rightOrder]) => leftOrder - rightOrder || compareCodeUnits(leftId, rightId))
         .map(([nodeId]) => nodeId);
 }
+function neighborRelationships(input, selectedNodeId, neighborNodeIds) {
+    const directions = new Map();
+    for (const neighborNodeId of neighborNodeIds) {
+        directions.set(neighborNodeId, { incoming: false, outgoing: false });
+    }
+    for (const link of input.links) {
+        const neighborId = link.source === selectedNodeId
+            ? link.target
+            : link.target === selectedNodeId
+                ? link.source
+                : null;
+        if (!neighborId)
+            continue;
+        const direction = directions.get(neighborId);
+        if (!direction)
+            continue;
+        if (link.source === selectedNodeId)
+            direction.outgoing = true;
+        else
+            direction.incoming = true;
+    }
+    return neighborNodeIds.map((nodeId) => {
+        const direction = directions.get(nodeId);
+        return {
+            nodeId,
+            direction: direction.incoming && direction.outgoing
+                ? "bidirectional"
+                : direction.incoming
+                    ? "incoming"
+                    : "outgoing",
+        };
+    });
+}
+function centeredOffset(index, total) {
+    return index - ((total - 1) / 2);
+}
+function directionalConstellationPosition(node, relationship, laneIndex, laneSize, anchor, radius, seed, selectedNodeId) {
+    // A selected graph is a relationship diagram before it is a cloud. Incoming
+    // and outgoing relationships occupy opposing, stable lanes; a two-way
+    // relationship is lifted into its own reading lane. This exposes link
+    // direction without changing any node or link identity.
+    const laneAngle = relationship.direction === "incoming"
+        ? Math.PI
+        : relationship.direction === "outgoing"
+            ? 0
+            : -(Math.PI / 2);
+    const arcStep = laneSize <= 1 ? 0 : Math.min(0.32, 0.92 / Math.max(1, laneSize - 1));
+    const offset = centeredOffset(laneIndex, laneSize);
+    const angle = laneAngle + (offset * arcStep);
+    const radial = radius + (Math.abs(offset) * 4) + (unit(`${seed}:${selectedNodeId}:${node.id}:radius`) * 3);
+    const semanticLift = node.type === "relation"
+        ? radius * 0.28
+        : node.type === "profile"
+            ? radius * 0.14
+            : 0;
+    const depthTier = node.type === "relation"
+        ? 15
+        : node.type === "profile"
+            ? 9
+            : 4;
+    return {
+        x: anchor.x + (Math.cos(angle) * radial),
+        y: anchor.y + (Math.sin(angle) * radial * 0.7) + semanticLift,
+        // The first hop remains forward of the selected anchor. Small stable depth
+        // variation prevents a flat diagram while keeping connected labels legible.
+        z: anchor.z + depthTier + (Math.cos(angle) * 8)
+            + ((unit(`${seed}:${selectedNodeId}:${node.id}:depth`) - 0.5) * 7),
+    };
+}
 function visualCue(node, selectedNodeId, neighborNodeIds) {
     const selected = node.id === selectedNodeId;
     const neighboring = neighborNodeIds.has(node.id);
@@ -117,26 +186,32 @@ function linkVisualCue(link, selectedNodeId, neighborNodeIds) {
             ? { opacity: 0.32, width: 0.95 }
             : { opacity: 0.1, width: 0.6 };
 }
-function selectedLayoutPositions(input, basePositions, selectedNodeId, neighborNodeIds, viewport) {
+function selectedLayoutPositions(input, basePositions, nodesById, selectedNodeId, neighborNodeIds, viewport) {
     const positions = new Map(basePositions);
     if (!selectedNodeId)
         return positions;
-    const selected = input.nodes.find((node) => node.id === selectedNodeId);
+    const selected = nodesById.get(selectedNodeId);
     if (!selected)
         return positions;
     const selectedBase = basePositions.get(selected.id);
     const selectedTarget = { x: 0, y: 6, z: 24 };
+    // A drag/pin is an explicit user placement. Use it as the constellation
+    // anchor rather than merely leaving the selected node behind while moving
+    // every relationship around the default selection origin.
+    const anchor = selected.layoutHint?.pinned ? selectedBase : selectedTarget;
     if (!selected.layoutHint?.pinned)
-        positions.set(selected.id, selectedTarget);
-    // Selection re-centres the *entire* deterministic cloud around the selected
-    // node's original position. Rotating and tightening the existing local
-    // composition preserves real clusters and avoids the artificial perimeter
-    // ring produced by re-assigning every far node to a common radius.
+        positions.set(selected.id, anchor);
+    // Selection re-centres the remaining deterministic cloud around the selected
+    // node's original position. It stays behind the foreground constellation so
+    // unrelated nodes remain useful depth context without competing with the
+    // active relationship.
     const rotation = (unit(`${input.layout.seed}:${selected.id}:selection-rotation`) - 0.5) * 0.48;
-    const cloudScale = Math.max(0.92, Math.min(1, 0.94 + (Math.min(viewport.width, viewport.height) / 12000)));
-    const neighborhood = new Set([selectedNodeId, ...neighborNodeIds]);
+    const shortestViewportAxis = Math.min(viewport.width, viewport.height);
+    const contextScale = Math.max(0.76, Math.min(0.88, 0.76 + (shortestViewportAxis / 5000)));
+    const contextDepth = Math.max(38, Math.min(64, shortestViewportAxis * 0.09));
+    const neighborNodeIdSet = new Set(neighborNodeIds);
     input.nodes.forEach((node, index) => {
-        if (node.id === selectedNodeId || node.layoutHint?.pinned)
+        if (node.id === selectedNodeId || neighborNodeIdSet.has(node.id) || node.layoutHint?.pinned)
             return;
         const base = basePositions.get(node.id);
         const delta = {
@@ -145,26 +220,43 @@ function selectedLayoutPositions(input, basePositions, selectedNodeId, neighborN
             z: base.z - selectedBase.z,
         };
         const rotated = {
-            x: ((delta.x * Math.cos(rotation)) - (delta.y * Math.sin(rotation))) * cloudScale,
-            y: ((delta.x * Math.sin(rotation)) + (delta.y * Math.cos(rotation))) * cloudScale,
-            z: delta.z * (cloudScale * 0.78),
+            x: ((delta.x * Math.cos(rotation)) - (delta.y * Math.sin(rotation))) * contextScale,
+            y: ((delta.x * Math.sin(rotation)) + (delta.y * Math.cos(rotation))) * contextScale,
+            z: delta.z * (contextScale * 0.52),
         };
-        const isNeighbor = neighborhood.has(node.id);
-        const focusPull = isNeighbor ? 0.9 : 1;
         const jitter = {
-            x: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-x`) - 0.5) * (isNeighbor ? 7 : 13),
-            y: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-y`) - 0.5) * (isNeighbor ? 6 : 12),
-            z: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-z`) - 0.5) * (isNeighbor ? 5 : 10),
+            x: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-x`) - 0.5) * 13,
+            y: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-y`) - 0.5) * 12,
+            z: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-z`) - 0.5) * 8,
         };
         positions.set(node.id, {
-            x: selectedTarget.x + (rotated.x * focusPull) + jitter.x,
-            y: selectedTarget.y + (rotated.y * focusPull) + jitter.y
+            x: anchor.x + rotated.x + jitter.x,
+            y: anchor.y + rotated.y + jitter.y
                 + (((index / Math.max(1, input.nodes.length - 1)) - 0.5) * 8),
-            // Neighbours sit slightly forward, while the wider cloud retains its
-            // original depth relationships instead of collapsing into a back ring.
-            z: selectedTarget.z + (rotated.z * focusPull) + jitter.z + (isNeighbor ? 8 : -14),
+            z: anchor.z + rotated.z + jitter.z - contextDepth,
         });
     });
+    const relationships = neighborRelationships(input, selectedNodeId, neighborNodeIds);
+    const relationshipsByDirection = new Map();
+    for (const relationship of relationships) {
+        const lane = relationshipsByDirection.get(relationship.direction) ?? [];
+        lane.push(relationship);
+        relationshipsByDirection.set(relationship.direction, lane);
+    }
+    const laneIndexByNodeId = new Map();
+    for (const lane of relationshipsByDirection.values()) {
+        lane.forEach((relationship, index) => {
+            laneIndexByNodeId.set(relationship.nodeId, { index, size: lane.length });
+        });
+    }
+    const constellationRadius = Math.max(36, Math.min(72, shortestViewportAxis * 0.08));
+    for (const relationship of relationships) {
+        const neighbor = nodesById.get(relationship.nodeId);
+        if (!neighbor || neighbor.layoutHint?.pinned)
+            continue;
+        const lanePosition = laneIndexByNodeId.get(relationship.nodeId);
+        positions.set(neighbor.id, directionalConstellationPosition(neighbor, relationship, lanePosition.index, lanePosition.size, anchor, constellationRadius, input.layout.seed, selectedNodeId));
+    }
     return positions;
 }
 /**
@@ -180,7 +272,8 @@ export function createRenderGraphData(input, presentation, options = {}) {
         node.id,
         organicPosition(node, input.layout.seed, index, input.nodes.length),
     ]));
-    const positions = selectedLayoutPositions(input, basePositions, selectedNodeId, neighborNodeIds, viewport);
+    const nodesById = new Map(input.nodes.map((node) => [node.id, node]));
+    const positions = selectedLayoutPositions(input, basePositions, nodesById, selectedNodeId, neighborNodeIds, viewport);
     const settledNodeIds = new Set(selectedNodeId ? [selectedNodeId, ...neighborNodeIds] : []);
     const nodes = input.nodes.map((node) => {
         const position = positions.get(node.id);

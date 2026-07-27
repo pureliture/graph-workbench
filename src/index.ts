@@ -48,6 +48,7 @@ export {
   type GraphRenderObservation,
   type GraphRenderTransformObservation,
   type GraphScreenPosition,
+  type GraphTransitionCameraPoseObservation,
   type GraphTransitionNodePosition,
   type GraphTransitionObservation,
 } from "./renderer-contract.js";
