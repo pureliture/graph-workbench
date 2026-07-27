@@ -216,19 +216,19 @@ function directionalConstellationPosition(
   seed: string,
   selectedNodeId: string,
 ): Coordinates {
-  // A selected graph is a relationship diagram before it is a cloud. Incoming
-  // and outgoing relationships occupy opposing, stable lanes; a two-way
-  // relationship is lifted into its own reading lane. This exposes link
-  // direction without changing any node or link identity.
+  // A selected graph is a relationship diagram before it is a cloud. The
+  // directional lanes are deliberately biased into opposing arcs instead of
+  // lying on the horizontal axis: even a small one-in/two-out selection reads
+  // as a constellation, while the left/right semantic remains unambiguous.
   const laneAngle = relationship.direction === "incoming"
-    ? Math.PI
+    ? Math.PI + 0.62
     : relationship.direction === "outgoing"
-      ? 0
+      ? 0.62
       : -(Math.PI / 2);
-  const arcStep = laneSize <= 1 ? 0 : Math.min(0.32, 0.92 / Math.max(1, laneSize - 1));
+  const arcStep = laneSize <= 1 ? 0 : Math.min(0.58, 1.44 / Math.max(1, laneSize - 1));
   const offset = centeredOffset(laneIndex, laneSize);
   const angle = laneAngle + (offset * arcStep);
-  const radial = radius + (Math.abs(offset) * 4) + (unit(`${seed}:${selectedNodeId}:${node.id}:radius`) * 3);
+  const radial = radius + 7 + (Math.abs(offset) * 5) + (unit(`${seed}:${selectedNodeId}:${node.id}:radius`) * 3);
   const semanticLift = node.type === "relation"
     ? radius * 0.28
     : node.type === "profile"
@@ -241,10 +241,11 @@ function directionalConstellationPosition(
       : 4;
   return {
     x: anchor.x + (Math.cos(angle) * radial),
-    y: anchor.y + (Math.sin(angle) * radial * 0.7) + semanticLift,
-    // The first hop remains forward of the selected anchor. Small stable depth
-    // variation prevents a flat diagram while keeping connected labels legible.
-    z: anchor.z + depthTier + (Math.cos(angle) * 8)
+    y: anchor.y + (Math.sin(angle) * radial * 0.84) + semanticLift,
+    // Fan depth follows the same arc instead of leaving endpoints in a flat
+    // plane. Stable per-node variation preserves label separation without
+    // weakening the directional shape.
+    z: anchor.z + depthTier + (Math.cos(angle) * 10) + (Math.sin(angle) * 12)
       + ((unit(`${seed}:${selectedNodeId}:${node.id}:depth`) - 0.5) * 7),
   };
 }

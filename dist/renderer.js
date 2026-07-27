@@ -80,8 +80,8 @@ const FLOW_SPEED_CYCLES_PER_SECOND = 0.22;
 // into a competing animation.
 const IDLE_FLOW_SPEED_CYCLES_PER_SECOND = 0.075;
 const MAX_IDLE_FLOW_PARTICLES = 5;
-const IDLE_FLOW_PARTICLE_SCALE = 0.46;
-const INTERACTION_FLOW_PARTICLE_SCALE = 1;
+const IDLE_FLOW_PARTICLE_SCALE = 0.36;
+const INTERACTION_FLOW_PARTICLE_SCALE = 1.35;
 const MAX_FLOW_PARTICLES = 24;
 const AMBIENT_VISUAL_EPSILON = 0.0001;
 const AMBIENT_MASTER_BODY_OPACITY_FLOOR = 0.5;
@@ -518,7 +518,7 @@ function boundedPerspectiveProjection(camera, viewport) {
             : 50,
     };
 }
-function contextCameraPose(points, current, projection, viewport, focalPoint = null) {
+function contextCameraPose(points, current, projection, viewport, focalPoint = null, focalBias = 0.18) {
     if (points.length === 0)
         return null;
     const minimum = { x: Infinity, y: Infinity, z: Infinity };
@@ -540,9 +540,9 @@ function contextCameraPose(points, current, projection, viewport, focalPoint = n
     // cloud. A small pull toward the bounds centre prevents cropped far nodes.
     const center = focalPoint
         ? {
-            x: focalPoint.x + ((boundsCenter.x - focalPoint.x) * 0.18),
-            y: focalPoint.y + ((boundsCenter.y - focalPoint.y) * 0.18),
-            z: focalPoint.z + ((boundsCenter.z - focalPoint.z) * 0.18),
+            x: focalPoint.x + ((boundsCenter.x - focalPoint.x) * focalBias),
+            y: focalPoint.y + ((boundsCenter.y - focalPoint.y) * focalBias),
+            z: focalPoint.z + ((boundsCenter.z - focalPoint.z) * focalBias),
         }
         : boundsCenter;
     const directionLength = Math.hypot(current.position.x - center.x, current.position.y - center.y, current.position.z - center.z);
@@ -727,11 +727,11 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     const ambientLinks = new Map();
     const particleGroup = new Group();
     particleGroup.name = "graph-workbench-flow-particles";
-    const particleGeometry = new SphereGeometry(0.95, 10, 8);
+    const particleGeometry = new SphereGeometry(1.35, 10, 8);
     const particleMaterial = new MeshBasicMaterial({
         color: THEME_PALETTES.dark.rim,
         depthWrite: false,
-        opacity: 0.86,
+        opacity: 0.94,
         transparent: true,
     });
     const projectedWorldPosition = new Vector3();
@@ -872,6 +872,11 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         if (!object || object.userData.graphLinkId !== link.id)
             return;
         setObjectMaterialColor(object, linkDescriptor(link).color ?? themePalette(currentPresentation.theme).edge);
+    }
+    function applyParticlePalette() {
+        // Tokens are neutral contrast signals, not another semantic node palette.
+        // Reusing the theme rim keeps them legible against either canvas surface.
+        particleMaterial.color.set(themePalette(currentPresentation.theme).rim);
     }
     function staticLabelBaseScale(label) {
         const stored = label.userData.graphBaseLabelScale;
@@ -1205,7 +1210,13 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const labelVisible = selected || neighbor || focused || master
                 || labelOpacity >= AMBIENT_FAR_LABEL_OPACITY_FLOOR;
             const viewportScale = Math.max(0.82, Math.min(1.15, 480 / Math.max(1, Math.min(data.selection.viewport.width, data.selection.viewport.height))));
-            const scale = selected ? 1.22 : (0.64 + (near * 0.33));
+            let scale = 0.64 + (near * 0.33);
+            if (selected) {
+                scale = 1.22;
+            }
+            else if (neighbor || focused) {
+                scale = 0.82 + (near * 0.24);
+            }
             applyAmbientDefaultNodeVisual(state, opacity, scale, labelVisible, labelOpacity, viewportScale * (0.62 + (near * 0.38)));
         }
     }
@@ -1525,6 +1536,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         currentDataRevision = nextDataRevision;
         currentPresentation = data.presentation;
         graph.backgroundColor(themePalette(currentPresentation.theme).background);
+        applyParticlePalette();
         graph.graphData(makeLiveData(data, starts));
         const nodeIds = new Set(data.nodes.map((node) => node.id));
         const linkIds = new Set(data.links.map((link) => link.id));
@@ -1761,6 +1773,8 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         if (!currentData || !focused)
             return null;
         const focalPoint = nodePosition(focused);
+        const constellationNodeIds = new Set([nodeId, ...currentData.selection.neighborNodeIds]);
+        const peripheralContextCount = currentData.nodes.reduce((count, node) => count + Number(!constellationNodeIds.has(node.id)), 0);
         const points = currentData.nodes.flatMap((node) => {
             const position = nodePosition(node);
             if (!position)
@@ -1772,7 +1786,11 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             return [{ ...position, radius: (bodyRadius * 1.16 * focusScale) + AMBIENT_MAX_OFFSET }];
         });
         const viewport = currentData.selection.viewport;
-        return contextCameraPose(points, cameraPose(), boundedPerspectiveProjection(graph.camera(), viewport), viewport, focalPoint);
+        // A small graph already reads as one constellation. With several
+        // peripheral nodes, pull the look target closer to the selected subject
+        // while the fit calculation still keeps every context point in frame.
+        const focalBias = peripheralContextCount >= 3 ? 0.32 : 0.18;
+        return contextCameraPose(points, cameraPose(), boundedPerspectiveProjection(graph.camera(), viewport), viewport, focalPoint, focalBias);
     }
     function transitionToNode(nodeId, options) {
         if (activeTransition)
@@ -1980,6 +1998,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 currentData = nextData;
                 currentPresentation = presentation;
                 graph.backgroundColor(themePalette(currentPresentation.theme).background);
+                applyParticlePalette();
                 currentData.nodes.forEach((node) => applyNodePalette(node));
                 currentData.links.forEach((link) => applyLinkPalette(link));
                 if (!activeTransition && !pendingSceneTransition)

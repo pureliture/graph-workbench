@@ -536,6 +536,75 @@ function distanceBetween(
   return Math.hypot(left.x - right.x, left.y - right.y);
 }
 
+function particleScreenPosition(particle: AmbientParticle): { readonly x: number; readonly y: number } {
+  if (
+    particle.screenX === null
+    || particle.screenY === null
+    || ![particle.screenX, particle.screenY].every((coordinate) => Number.isFinite(coordinate))
+  ) {
+    throw new Error(`${particle.id} did not expose a finite renderer screen position.`);
+  }
+  return { x: particle.screenX, y: particle.screenY };
+}
+
+function particlesForLink(frame: AmbientMotionFrame, linkId: string): readonly AmbientParticle[] {
+  return frame.visibleParticles.filter((particle) => particle.linkId === linkId);
+}
+
+function expectFocusedParticleScreenMotion(
+  before: AmbientMotionFrame,
+  after: AmbientMotionFrame,
+  focusedLinkIds: readonly string[],
+  minimumDiscernibleDistance: number,
+): void {
+  for (const linkId of focusedLinkIds) {
+    const first = particlesForLink(before, linkId);
+    const laterById = new Map(particlesForLink(after, linkId).map((particle) => [particle.id, particle]));
+    expect(first.length).toBeGreaterThanOrEqual(2);
+
+    for (let index = 0; index < first.length; index += 1) {
+      const particle = first[index]!;
+      const later = laterById.get(particle.id);
+      if (!later) throw new Error(`${particle.id} did not persist across focused flow samples.`);
+      particleScreenPosition(particle);
+      particleScreenPosition(later);
+      for (const other of first.slice(index + 1)) {
+        expect(distanceBetween(particleScreenPosition(particle), particleScreenPosition(other)))
+          .toBeGreaterThan(minimumDiscernibleDistance);
+      }
+    }
+
+    const maximumMotion = Math.max(...first.map((particle) => {
+      const later = laterById.get(particle.id)!;
+      return distanceBetween(particleScreenPosition(particle), particleScreenPosition(later));
+    }));
+    expect(maximumMotion).toBeGreaterThan(minimumDiscernibleDistance);
+  }
+}
+
+function expectNonCollinearScreenConstellation(
+  points: readonly { readonly x: number; readonly y: number }[],
+  minimumNodeSeparation: number,
+): void {
+  if (points.length !== 3) throw new Error("A small-degree constellation must expose exactly three screen positions.");
+  const [center, firstNeighbor, secondNeighbor] = points;
+  if (!center || !firstNeighbor || !secondNeighbor) throw new Error("Constellation screen positions were incomplete.");
+  const edgeLengths = [
+    distanceBetween(center, firstNeighbor),
+    distanceBetween(center, secondNeighbor),
+    distanceBetween(firstNeighbor, secondNeighbor),
+  ];
+  expect(Math.min(...edgeLengths)).toBeGreaterThan(minimumNodeSeparation);
+  const twiceArea = Math.abs(
+    ((firstNeighbor.x - center.x) * (secondNeighbor.y - center.y))
+    - ((firstNeighbor.y - center.y) * (secondNeighbor.x - center.x)),
+  );
+  const longestEdge = Math.max(...edgeLengths);
+  // Normalize against its own scale so the assertion survives responsive
+  // framing while still rejecting a visually linear three-node constellation.
+  expect(twiceArea / (longestEdge ** 2)).toBeGreaterThan(0.035);
+}
+
 function spatialDistance(
   left: { readonly x: number; readonly y: number; readonly z: number },
   right: { readonly x: number; readonly y: number; readonly z: number },
@@ -666,6 +735,31 @@ async function openFixture(page: Page): Promise<void> {
   await expect(page.getByTestId("graph-shell")).toBeVisible();
   await expect(page.getByTestId("graph-canvas")).toBeVisible();
   await waitForSettledLayout(page);
+}
+
+async function screenDiscernibilityThreshold(page: Page): Promise<number> {
+  const box = await page.getByTestId("graph-canvas").boundingBox();
+  if (!box) throw new Error("graph canvas does not have a measurable bounding box");
+  return Math.max(4, Math.min(box.width, box.height) * 0.005);
+}
+
+async function expectFocusedParticlesInsideCanvas(
+  page: Page,
+  frame: AmbientMotionFrame,
+  focusedLinkIds: readonly string[],
+): Promise<void> {
+  const box = await page.getByTestId("graph-canvas").boundingBox();
+  if (!box) throw new Error("graph canvas does not have a measurable bounding box");
+  const inset = Math.max(2, Math.min(box.width, box.height) * 0.003);
+  const particles = frame.visibleParticles.filter(({ linkId }) => focusedLinkIds.includes(linkId));
+  expect(particles.length).toBeGreaterThan(0);
+  for (const particle of particles) {
+    const position = particleScreenPosition(particle);
+    expect(position.x).toBeGreaterThan(inset);
+    expect(position.x).toBeLessThan(box.width - inset);
+    expect(position.y).toBeGreaterThan(inset);
+    expect(position.y).toBeLessThan(box.height - inset);
+  }
 }
 
 async function waitForRendererPointerSample(page: Page): Promise<void> {
@@ -848,6 +942,7 @@ test("keeps ambient motion live while deterministic anchors stay fixed", async (
 
 test("actual canvas hover differentiates bounded idle and focus flow particles without selecting", async ({ page }) => {
   await openFixture(page);
+  const minimumDiscernibleDistance = await screenDiscernibilityThreshold(page);
 
   const idleRender = (await waitForRenderObservation(page)).observation;
   expect(idleRender.links).toHaveLength(fixtureLinkCount);
@@ -892,6 +987,9 @@ test("actual canvas hover differentiates bounded idle and focus flow particles w
   expect(hover.visibleLinkFlow.every(({ active, id, particleCount }) => (
     active && focusIncidentLinkIds.has(id) && particleCount >= 2 && particleCount <= 3
   ))).toBe(true);
+  // Focus increases the link-level particle density above bounded idle flow,
+  // making the interaction hierarchy observable before any screenshot review.
+  expect(hover.visibleParticles.length).toBeGreaterThan(idle.visibleParticles.length);
   expect(hover.visibleParticles.every(({ linkId, phase }) => (
     focusIncidentLinkIds.has(linkId) && Number.isFinite(phase)
   ))).toBe(true);
@@ -901,6 +999,14 @@ test("actual canvas hover differentiates bounded idle and focus flow particles w
     12,
     (motion) => motion.focusNodeId === "relation:query" && motion.visibleParticles.length > 0,
   );
+  expectFocusedParticleScreenMotion(
+    hover,
+    laterHover,
+    [...focusIncidentLinkIds],
+    minimumDiscernibleDistance,
+  );
+  await expectFocusedParticlesInsideCanvas(page, hover, [...focusIncidentLinkIds]);
+  await expectFocusedParticlesInsideCanvas(page, laterHover, [...focusIncidentLinkIds]);
   const firstParticle = hover.visibleParticles[0];
   const laterParticle = laterHover.visibleParticles.find(({ id }) => id === firstParticle?.id);
   if (!firstParticle || !laterParticle) throw new Error("A hovered outbound flow particle did not persist across samples.");
@@ -1238,6 +1344,15 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
   }
   expectLiveTransitionTargets(firstSettled, firstLayout, allNodeIds);
   expectCameraMotion(initial, firstActiveFrames, firstSettled);
+  const reviewConstellation = await Promise.all([
+    waitForNodeProjection(page, "relation:review"),
+    waitForNodeProjection(page, "concept:contract"),
+    waitForNodeProjection(page, "concept:owner"),
+  ]);
+  expectNonCollinearScreenConstellation(
+    reviewConstellation,
+    (await screenDiscernibilityThreshold(page)) * 3,
+  );
 
   const secondActiveFramesPromise = waitForMotionFrames(page, firstSettled.transition.generation);
   await clickProjectedCanvasNode(page, "relation:query");
@@ -1272,13 +1387,22 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
   const selectedActiveLinkIds = ambientAfterSelection.visibleLinkFlow
     .filter(({ active }) => active)
     .map(({ id }) => id);
-  expect(selectedActiveLinkIds).not.toHaveLength(0);
+  const selectedFocusLinkIds = ["index-query", "query-evidence", "query-vector"];
+  expect([...selectedActiveLinkIds].sort()).toEqual([...selectedFocusLinkIds].sort());
   expectLinkEndpointsAttachedToRenderedNodes(ambientAfterSelection, selectedActiveLinkIds, "relation:query");
   const laterSelectedActiveLinkIds = ambientLater.visibleLinkFlow
     .filter(({ active }) => active)
     .map(({ id }) => id);
   expect(laterSelectedActiveLinkIds).toEqual(selectedActiveLinkIds);
   expectLinkEndpointsAttachedToRenderedNodes(ambientLater, laterSelectedActiveLinkIds, "relation:query");
+  expectFocusedParticleScreenMotion(
+    ambientAfterSelection,
+    ambientLater,
+    selectedFocusLinkIds,
+    await screenDiscernibilityThreshold(page),
+  );
+  await expectFocusedParticlesInsideCanvas(page, ambientAfterSelection, selectedFocusLinkIds);
+  await expectFocusedParticlesInsideCanvas(page, ambientLater, selectedFocusLinkIds);
   for (const nodeId of ["relation:query", "concept:index", "concept:session"]) {
     expect(ambientPosition(ambientLater, nodeId, "anchorNodePositions")).toEqual(
       ambientPosition(ambientAfterSelection, nodeId, "anchorNodePositions"),
