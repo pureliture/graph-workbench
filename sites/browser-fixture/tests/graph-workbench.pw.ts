@@ -462,13 +462,24 @@ async function waitForMotionFramesForGeneration(
       && frame.transition.progress > 0
       && frame.transition.progress < 1
     ));
-    if (activeFrames.length > 0) observed = activeFrames;
-    return activeFrames.length > 0
+    // `frames` is a renderer requestAnimationFrame history, but the first
+    // observable publish can legitimately contain only its initial sample.
+    // The path proof below needs a start and a later in-flight sample, so wait
+    // for two progress-distinct frames from this exact selection generation.
+    const distinctActiveFrames = activeFrames.filter((frame, index) => (
+      activeFrames.findIndex((candidate) => (
+        candidate.transition.progress === frame.transition.progress
+      )) === index
+    ));
+    if (distinctActiveFrames.length >= 2) observed = distinctActiveFrames;
+    return distinctActiveFrames.length >= 2
       && !candidate.transition.active
       && candidate.transition.progress === 1
       && candidate.transition.generation === generation;
   }).toBe(true);
-  if (observed.length === 0) throw new Error(`Motion generation ${generation} did not expose active frames.`);
+  if (observed.length < 2) {
+    throw new Error(`Motion generation ${generation} did not expose two distinct active frames.`);
+  }
   return observed;
 }
 
@@ -1189,7 +1200,7 @@ test("actual canvas hover differentiates bounded idle and focus flow particles w
     && motion.visibleParticles.length > 0
   ));
   expect(idle.visibleLinkFlow).toHaveLength(idle.visibleParticles.length);
-  expect(idle.visibleLinkFlow.length).toBeLessThanOrEqual(5);
+  expect(idle.visibleLinkFlow.length).toBeLessThanOrEqual(3);
   expect(idle.visibleLinkFlow.every(({ active, particleCount }) => active && particleCount === 1)).toBe(true);
   expect(idle.visibleParticles.every(({ linkId, phase }) => (
     idle.visibleLinkFlow.some(({ id }) => id === linkId) && Number.isFinite(phase)
@@ -1219,7 +1230,7 @@ test("actual canvas hover differentiates bounded idle and focus flow particles w
   const focusIncidentLinkIds = new Set(["index-query", "query-evidence", "query-vector"]);
   expect(hover.visibleLinkFlow.map(({ id }) => id)).toEqual(expect.arrayContaining([...focusIncidentLinkIds]));
   expect(hover.visibleLinkFlow.every(({ active, id, particleCount }) => (
-    active && focusIncidentLinkIds.has(id) && particleCount >= 2 && particleCount <= 3
+    active && focusIncidentLinkIds.has(id) && particleCount === 2
   ))).toBe(true);
   // Focus increases the link-level particle density above bounded idle flow,
   // making the interaction hierarchy observable before any screenshot review.
@@ -1439,11 +1450,11 @@ test("keeps persistent scene labels above nodes with renderer-observed near and 
   expect(master.worldScale?.x ?? 0).toBeGreaterThan(far.worldScale?.x ?? 0);
   expect(far.visual.labelCue).toBe("muted");
 
-  // The actual edge objects stay transparent and render through a three-point
-  // curve rather than as a flat DOM diagram. This is scene observation, not a
-  // screenshot-pixel heuristic.
+  // The actual edge objects stay transparent and render through a tessellated
+  // quadratic curve rather than as a flat DOM diagram. This is scene
+  // observation, not a screenshot-pixel heuristic.
   expect(observation.links.every((link) => (
-    link.curvePointCount === 3
+    link.curvePointCount === 29
     && link.depthWriteEnabled === false
     && link.objectTracked
     && link.sceneAttached
@@ -1767,7 +1778,7 @@ test("actual canvas hover preserves the current public selection identity", asyn
   const focusIncidentLinkIds = new Set(["release-api", "api-web", "profile-api"]);
   expect(ambient.visibleLinkFlow.map(({ id }) => id)).toEqual(expect.arrayContaining([...focusIncidentLinkIds]));
   expect(ambient.visibleLinkFlow.every(({ active, id, particleCount }) => (
-    active && focusIncidentLinkIds.has(id) && particleCount >= 2 && particleCount <= 3
+    active && focusIncidentLinkIds.has(id) && particleCount === 2
   ))).toBe(true);
   expect(ambient.visibleParticles.every(({ linkId }) => focusIncidentLinkIds.has(linkId))).toBe(true);
   const laterAmbient = await waitForAmbientMotionAfter(

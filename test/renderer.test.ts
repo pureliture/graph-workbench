@@ -7,6 +7,7 @@ import {
   LineBasicMaterial,
   Mesh,
   MeshBasicMaterial,
+  MeshPhysicalMaterial,
   MeshStandardMaterial,
   Sprite,
   SpriteMaterial,
@@ -505,7 +506,7 @@ describe("Three.js camera transitions", () => {
     expect(apiObject.position.toArray()).toEqual([apiRendered.x, apiRendered.y, apiRendered.z]);
   });
 
-  it("flows two or three renderer-owned tokens outward across every focused default incident curve", () => {
+  it("flows two restrained renderer-owned tokens outward across every focused default incident curve", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
@@ -515,8 +516,7 @@ describe("Three.js camera transitions", () => {
     const first = renderer.getAmbientMotionObservation!()!;
     const activeLinks = first.linkFlow.filter((link) => link.active);
     expect(activeLinks.map((link) => link.id).sort()).toEqual(["api-web", "release-api"]);
-    activeLinks.forEach((link) => expect(link.particleCount).toBeGreaterThanOrEqual(2));
-    activeLinks.forEach((link) => expect(link.particleCount).toBeLessThanOrEqual(3));
+    activeLinks.forEach((link) => expect(link.particleCount).toBe(2));
     expect(first.particles).toHaveLength(activeLinks.reduce((total, link) => total + link.particleCount, 0));
 
     runLatestFrame(1_000);
@@ -524,7 +524,7 @@ describe("Three.js camera transitions", () => {
     const firstParticle = first.particles[0]!;
     const secondParticle = second.particles.find((particle) => particle.id === firstParticle.id)!;
     expect(secondParticle.phase).not.toBe(firstParticle.phase);
-    expect((secondParticle.phase - firstParticle.phase + 1) % 1).toBeCloseTo(0.22);
+    expect((secondParticle.phase - firstParticle.phase + 1) % 1).toBeCloseTo(0.11);
     expect(secondParticle.screenX).not.toBeNull();
     expect(secondParticle.screenY).not.toBeNull();
   });
@@ -538,16 +538,34 @@ describe("Three.js camera transitions", () => {
 
     const ambientRoot = new Group();
     ambientRoot.position.set(23, -17, 11);
+    ambientRoot.rotation.set(0.1, -0.18, 0.07);
+    ambientRoot.scale.set(1.08, 0.94, 1.03);
     graph.sceneRoot.add(ambientRoot);
     const source = graph.nodeObjects.get("component:api")!;
     const target = graph.nodeObjects.get("component:web")!;
     ambientRoot.add(source, target);
 
+    const link = graph.linkObjects.get("api-web") as Line;
+    const linkRoot = new Group();
+    linkRoot.position.set(-13, 9, -7);
+    linkRoot.rotation.set(-0.08, 0.16, -0.12);
+    linkRoot.scale.set(0.91, 1.11, 0.96);
+    graph.sceneRoot.add(linkRoot);
+    linkRoot.add(link);
+
+    const particleGroup = graph.sceneRoot.children.find((child) => child.name === "graph-workbench-flow-particles")!;
+    const particleRoot = new Group();
+    particleRoot.position.set(6, -11, 5);
+    particleRoot.rotation.set(0.05, -0.09, 0.13);
+    particleRoot.scale.set(1.04, 0.97, 1.06);
+    graph.sceneRoot.add(particleRoot);
+    particleRoot.add(particleGroup);
+
     runLatestFrame(0);
     runLatestFrame(1_000);
 
-    const link = graph.linkObjects.get("api-web") as Line;
     const positions = link.geometry.getAttribute("position");
+    expect(positions.count).toBe(29);
     const lineEndpointInWorld = (index: number) => link.localToWorld(new Vector3().fromBufferAttribute(positions, index));
     const sourceWorld = source.getWorldPosition(new Vector3());
     const targetWorld = target.getWorldPosition(new Vector3());
@@ -584,16 +602,26 @@ describe("Three.js camera transitions", () => {
 
     const flow = ambient.particles.find((particle) => particle.linkId === "api-web")!;
     const particleIndex = Number.parseInt(flow.id.slice("flow:".length), 10);
-    const particleGroup = graph.sceneRoot.children.find((child) => child.name === "graph-workbench-flow-particles")!;
     const particle = particleGroup.children[particleIndex] as Mesh;
-    const progress = flow.phase;
-    const inverse = 1 - progress;
-    const expectedParticleWorld = link.localToWorld(new Vector3(
-      (inverse * inverse * positions.getX(0)) + (2 * inverse * progress * positions.getX(1)) + (progress * progress * positions.getX(2)),
-      (inverse * inverse * positions.getY(0)) + (2 * inverse * progress * positions.getY(1)) + (progress * progress * positions.getY(2)),
-      (inverse * inverse * positions.getZ(0)) + (2 * inverse * progress * positions.getZ(1)) + (progress * progress * positions.getZ(2)),
+    const particleWorld = particle.getWorldPosition(new Vector3());
+    const distanceToRenderedSegment = (start: Vector3, end: Vector3): number => {
+      const segment = end.clone().sub(start);
+      const lengthSquared = segment.lengthSq();
+      if (lengthSquared === 0) return particleWorld.distanceTo(start);
+      const projection = Math.max(0, Math.min(1, particleWorld.clone().sub(start).dot(segment) / lengthSquared));
+      return particleWorld.distanceTo(start.add(segment.multiplyScalar(projection)));
+    };
+    const nearestRenderedSegment = Math.min(...Array.from(
+      { length: positions.count - 1 },
+      (_unused, index) => distanceToRenderedSegment(
+        link.localToWorld(new Vector3().fromBufferAttribute(positions, index)),
+        link.localToWorld(new Vector3().fromBufferAttribute(positions, index + 1)),
+      ),
     ));
-    expect(particle.getWorldPosition(new Vector3()).distanceTo(expectedParticleWorld)).toBeLessThan(0.0001);
+    // The particle and the default Line are both under distinct nested
+    // transforms. This proves it remains on the rendered tessellated segment,
+    // rather than merely agreeing with Bézier endpoints or canvas bounds.
+    expect(nearestRenderedSegment).toBeLessThan(0.0001);
   });
 
   it("freezes drift and flow for reduced motion, then clears and resumes safely across visibility changes", () => {
@@ -792,6 +820,61 @@ describe("Three.js camera transitions", () => {
     expect(master.minimumVisibleMaterialOpacity).toBeGreaterThan(far.minimumVisibleMaterialOpacity!);
   });
 
+  it("keeps the idle dark field visible while preserving its quiet depth and edge hierarchy", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const input: GraphInput = {
+      ...graphFixture,
+      nodes: [
+        {
+          ...graphFixture.nodes[0]!,
+          layoutHint: { pinned: true, x: 0, y: 0, z: 42 },
+        },
+        {
+          ...graphFixture.nodes[1]!,
+          kind: "skill",
+          layoutHint: { pinned: true, x: 46, y: 0, z: 88 },
+        },
+        {
+          ...graphFixture.nodes[2]!,
+          kind: "agent",
+          layoutHint: { pinned: true, x: -46, y: 0, z: -126 },
+        },
+      ],
+    };
+
+    renderer.setData(createRenderGraphData(input, { theme: "dark" }));
+    runLatestFrame(0);
+    const idle = renderer.getRenderObservation!()!;
+    const idleNear = idle.nodes.find((node) => node.id === "component:api")!;
+    const idleFar = idle.nodes.find((node) => node.id === "component:web")!;
+    const idleLink = idle.links.find((link) => link.id === "api-web")!;
+
+    // Renderer observations, rather than color constants alone, protect the
+    // actual default material opacity that reaches the dark field.
+    expect(idleNear.bodyMaterialColor).toBe("#60a5fa");
+    expect(idleFar.bodyMaterialColor).toBe("#f59e0b");
+    expect(idleNear.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.5);
+    expect(idleFar.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.22);
+    expect(idleNear.minimumVisibleMaterialOpacity).toBeGreaterThan(idleFar.minimumVisibleMaterialOpacity!);
+    expect(idleNear.worldScale!.x).toBeGreaterThan(idleFar.worldScale!.x);
+    expect(idleLink.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.18);
+    expect(idleLink.visibleMaterialLineWidths).toEqual([0.85]);
+
+    renderer.setData(createRenderGraphData(input, {
+      reducedMotion: true,
+      selectedNodeIds: ["component:api"],
+      theme: "dark",
+    }));
+    renderer.transitionToNode!("component:api", { reducedMotion: true });
+    const selectedLink = renderer.getRenderObservation!()!.links.find((link) => link.id === "api-web")!;
+    expect(selectedLink.minimumVisibleMaterialOpacity).toBe(0.62);
+    expect(selectedLink.visibleMaterialLineWidths).toEqual([1.25]);
+    expect(idleLink.minimumVisibleMaterialOpacity).toBeLessThan(selectedLink.minimumVisibleMaterialOpacity! * 0.4);
+  });
+
   it("refreshes ambient default references when the vendor replaces an attached node object", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
@@ -868,7 +951,7 @@ describe("Three.js camera transitions", () => {
     expect(neighbor?.minimumVisibleMaterialOpacity).toBeGreaterThan(0.5);
     expect(master?.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.5);
     expect(selectedLink).toMatchObject({
-      curvePointCount: 3,
+      curvePointCount: 29,
       depthWriteEnabled: false,
       minimumVisibleMaterialOpacity: 0.62,
       visibleMaterialLineWidths: [1.25],
@@ -881,16 +964,16 @@ describe("Three.js camera transitions", () => {
       objectTracked: true,
       objectVisible: true,
       sceneAttached: true,
-      position: { id: "component:web", x: 0, y: 6.8, z: 0 },
+      position: { id: "component:web", x: 0, y: 6.6, z: 0 },
       transparent: true,
     });
     expect(selected?.label.scale?.x).toBeGreaterThan(0);
 
     const selectedBody = initialWebObject?.children.find((child) => child instanceof Mesh) as Mesh | undefined;
     const selectedMaterial = selectedBody?.material as MeshStandardMaterial;
-    expect(selectedMaterial.emissiveIntensity).toBe(0);
-    expect(selectedMaterial.metalness).toBeCloseTo(0.22);
-    expect(selectedMaterial.roughness).toBeCloseTo(0.58);
+    expect(selectedMaterial.emissiveIntensity).toBeCloseTo(0.08);
+    expect(selectedMaterial.metalness).toBeCloseTo(0.18);
+    expect(selectedMaterial.roughness).toBeCloseTo(0.62);
   });
 
   it("moves live node coordinates, labels, links, and camera through one cancellable selection transaction", () => {
@@ -1387,6 +1470,54 @@ describe("Three.js camera transitions", () => {
     expect((label.material as MeshStandardMaterial).transparent).toBe(true);
     expect(object.children.some((child) => child.userData.graphVisualRole === "outline")).toBe(false);
     expect(object.children.some((child) => child.userData.graphVisualRole === "focus-rim")).toBe(false);
+  });
+
+  it("keeps physical body finish and same-hue emissive synchronized across palette updates", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: {
+        onBackgroundClick() {},
+        onNodeClick() {},
+        onNodeHover() {},
+      },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const bodyMaterial = (nodeId: string): MeshPhysicalMaterial => {
+      const object = graph.nodeObjects.get(nodeId)!;
+      const body = object.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
+      expect(body.material).toBeInstanceOf(MeshPhysicalMaterial);
+      return body.material as MeshPhysicalMaterial;
+    };
+    const expectSameHueEmissive = (material: MeshPhysicalMaterial, color: string) => {
+      const expected = new Color(color).multiplyScalar(0.42);
+      expect(material.color.getHexString()).toBe(new Color(color).getHexString());
+      expect(material.emissive.r).toBeCloseTo(expected.r);
+      expect(material.emissive.g).toBeCloseTo(expected.g);
+      expect(material.emissive.b).toBeCloseTo(expected.b);
+    };
+
+    renderer.setData(createRenderGraphData(graphFixture, { theme: "dark" }));
+    const darkWeb = bodyMaterial("component:web");
+    expect(darkWeb.clearcoat).toBeCloseTo(0.1);
+    expect(darkWeb.clearcoatRoughness).toBeCloseTo(0.76);
+    expectSameHueEmissive(darkWeb, "#f59e0b");
+    expect(bodyMaterial("relation:release").clearcoat).toBeCloseTo(0.15);
+
+    renderer.setPresentation({ theme: "light" });
+    expect(bodyMaterial("component:web")).toBe(darkWeb);
+    expectSameHueEmissive(darkWeb, "#92400e");
+
+    renderer.setData(createRenderGraphData(graphFixture, {
+      theme: "light",
+      nodeDescriptors: { "component:web": { color: "#f0abfc" } },
+    }));
+    expect(bodyMaterial("component:web")).toBe(darkWeb);
+    expectSameHueEmissive(darkWeb, "#f0abfc");
+
+    renderer.setData(createRenderGraphData(graphFixture, {
+      theme: "light",
+      nodeDescriptors: { "component:web": { color: "#60a5fa" } },
+    }));
+    expectSameHueEmissive(darkWeb, "#60a5fa");
   });
 
   it("disposes each CanvasTexture glyph mask once with its SpriteMaterial", () => {

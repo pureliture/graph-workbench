@@ -9,6 +9,7 @@ import {
   LineBasicMaterial,
   Mesh,
   MeshBasicMaterial,
+  MeshPhysicalMaterial,
   MeshStandardMaterial,
   NoColorSpace,
   Object3D,
@@ -167,21 +168,22 @@ const STATIC_LABEL_OPACITY = Object.freeze({
   selected: 1,
 });
 
-const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 11, y: 9, z: 3.2 });
-const AMBIENT_NODE_BREATHING = Object.freeze({ x: 4.5, y: 5.3, z: 2.2 });
-const AMBIENT_CAMERA_DRIFT = Object.freeze({ x: 3.8, y: 2.6, z: 1.2 });
-// Covers the largest common-plus-individual planar displacement (15.5).
-const AMBIENT_MAX_OFFSET = 16;
-const AMBIENT_RADIANS_PER_SECOND = 0.62;
-const FLOW_SPEED_CYCLES_PER_SECOND = 0.22;
+const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 4.8, y: 3.6, z: 1.25 });
+const AMBIENT_NODE_BREATHING = Object.freeze({ x: 1.55, y: 1.85, z: 0.72 });
+const AMBIENT_CAMERA_DRIFT = Object.freeze({ x: 1.1, y: 0.82, z: 0.34 });
+// Covers the largest common-plus-individual planar displacement (6.35).
+const AMBIENT_MAX_OFFSET = 7;
+const AMBIENT_RADIANS_PER_SECOND = 0.24;
+const FLOW_SPEED_CYCLES_PER_SECOND = 0.11;
 // Idle flow is deliberately much slower and smaller than an interaction flow.
 // It lets a settled graph read as a living system without turning every edge
 // into a competing animation.
-const IDLE_FLOW_SPEED_CYCLES_PER_SECOND = 0.075;
-const MAX_IDLE_FLOW_PARTICLES = 5;
-const IDLE_FLOW_PARTICLE_SCALE = 0.32;
-const INTERACTION_FLOW_PARTICLE_SCALE = 1.55;
-const MAX_FLOW_PARTICLES = 24;
+const IDLE_FLOW_SPEED_CYCLES_PER_SECOND = 0.018;
+const MAX_IDLE_FLOW_PARTICLES = 3;
+const IDLE_FLOW_PARTICLE_SCALE = 0.22;
+const INTERACTION_FLOW_PARTICLE_SCALE = 0.72;
+const MAX_FLOW_PARTICLES = 12;
+const DEFAULT_LINK_CURVE_SEGMENTS = 28;
 const AMBIENT_VISUAL_EPSILON = 0.0001;
 const AMBIENT_MASTER_BODY_OPACITY_FLOOR = 0.5;
 const AMBIENT_MASTER_LABEL_OPACITY_FLOOR = 0.5;
@@ -189,6 +191,15 @@ const AMBIENT_MASTER_LABEL_OPACITY_FLOOR = 0.5;
 // subdued depth tier. Fading them below this would make the sprite invisible,
 // which breaks the graph's persistent node hierarchy.
 const AMBIENT_FAR_LABEL_OPACITY_FLOOR = 0.02;
+// The initial field needs enough mass to establish the graph before a user
+// selects anything. These values retain a visibly softer far tier without
+// making routine-harness's type palette disappear into the dark canvas.
+const IDLE_BODY_OPACITY = Object.freeze({ far: 0.46, nearRange: 0.3 });
+const IDLE_LABEL_OPACITY = Object.freeze({ far: 0.28, nearRange: 0.46 });
+const IDLE_LINK_OPACITY = Object.freeze({ maximum: 0.2, minimum: 0.18 });
+const IDLE_NODE_SCALE = Object.freeze({ far: 0.86, nearRange: 0.28 });
+const IDLE_LABEL_SCALE = Object.freeze({ far: 0.8, nearRange: 0.2 });
+const NODE_EMISSIVE_COLOR_SCALE = 0.42;
 
 function themePalette(theme: GraphPresentation["theme"]): GraphThemePalette {
   return theme === "light" ? THEME_PALETTES.light : THEME_PALETTES.dark;
@@ -244,10 +255,10 @@ function descriptorForLink(link: RenderLink, supplied: GraphLinkDescriptor | und
   };
 }
 
-function nodeEmissiveIntensity(_node: RenderNode): number {
-  // Tauri relies on material roughness/metalness and scene lighting for depth
-  // rather than a flat emissive glow.
-  return 0;
+function nodeEmissiveIntensity(node: RenderNode): number {
+  // This is a low, same-hue lift rather than a bloom-like glow. The physical
+  // material and scene light still provide the readable depth cue.
+  return node.type === "relation" ? 0.1 : 0.08;
 }
 
 function materialOpacity(material: unknown): number | null {
@@ -503,17 +514,19 @@ export function createDefaultGraphNodeObject(
   const opacity = boundedOpacity(descriptor?.opacity, 1);
   const group = new Group();
   const relation = node.type === "relation";
-  const radius = relation ? 7.5 : 3;
-  const bodyMaterial = new MeshStandardMaterial({
+  const radius = relation ? 6.8 : 2.8;
+  const bodyMaterial = new MeshPhysicalMaterial({
     color,
-    emissive: "#000000",
+    clearcoat: relation ? 0.15 : 0.1,
+    clearcoatRoughness: 0.76,
+    emissive: color.clone().multiplyScalar(NODE_EMISSIVE_COLOR_SCALE),
     emissiveIntensity: nodeEmissiveIntensity(node),
-    metalness: relation ? 0.36 : 0.22,
+    metalness: relation ? 0.3 : 0.18,
     opacity,
-    roughness: relation ? 0.4 : 0.58,
+    roughness: relation ? 0.48 : 0.62,
     transparent: opacity < 1,
   });
-  const geometry = new SphereGeometry(radius, relation ? 32 : 24, relation ? 20 : 16);
+  const geometry = new SphereGeometry(radius, relation ? 36 : 28, relation ? 24 : 18);
   const body = new Mesh(geometry, bodyMaterial);
   body.userData.graphVisualRole = "body";
   group.add(body);
@@ -532,9 +545,13 @@ export function createDefaultGraphLinkObject(
   descriptor: GraphLinkDescriptor | undefined,
 ): Object3D {
   const geometry = new BufferGeometry();
-  // A restrained three-point path is enough to make overlapping relationships
-  // readable in depth without turning the graph into a decorative spline map.
-  geometry.setAttribute("position", new Float32BufferAttribute([0, 0, 0, 0, 0, 0, 0, 0, 0], 3));
+  // A tessellated quadratic keeps the visible line and flow sampler on the
+  // same polyline, instead of rendering a three-point path while tokens use a
+  // different, analytic Bézier interpolation.
+  geometry.setAttribute(
+    "position",
+    new Float32BufferAttribute((DEFAULT_LINK_CURVE_SEGMENTS + 1) * 3, 3),
+  );
   const opacity = boundedOpacity(descriptor?.opacity, 0.68);
   const material = new LineBasicMaterial({
     color: defaultLinkColor(descriptor),
@@ -550,44 +567,48 @@ export function createDefaultGraphLinkObject(
   return line;
 }
 
-function writeThreePointCurve(
+function writeQuadraticCurve(
   positions: { count: number; itemSize: number; needsUpdate: boolean; setXYZ(index: number, x: number, y: number, z: number): void },
   bendDirection: number,
   start: { x: number; y: number; z: number },
   end: { x: number; y: number; z: number },
 ): void {
-  positions.setXYZ(0, start.x, start.y, start.z);
-  if (positions.count < 3) {
-    positions.setXYZ(1, end.x, end.y, end.z);
-    positions.needsUpdate = true;
-    return;
-  }
   const deltaX = end.x - start.x;
   const deltaY = end.y - start.y;
   const planarDistance = Math.hypot(deltaX, deltaY);
   const curve = Math.max(3, Math.min(18, planarDistance * 0.12));
   const directionX = planarDistance > 0 ? deltaX / planarDistance : 1;
   const directionY = planarDistance > 0 ? deltaY / planarDistance : 0;
-  positions.setXYZ(
-    1,
-    ((start.x + end.x) / 2) + (-directionY * curve * bendDirection),
-    ((start.y + end.y) / 2) + (directionX * curve * bendDirection),
-    ((start.z + end.z) / 2) + (curve * 0.32 * bendDirection),
-  );
-  positions.setXYZ(2, end.x, end.y, end.z);
+  const controlX = ((start.x + end.x) / 2) + (-directionY * curve * bendDirection);
+  const controlY = ((start.y + end.y) / 2) + (directionX * curve * bendDirection);
+  const controlZ = ((start.z + end.z) / 2) + (curve * 0.32 * bendDirection);
+  const lastIndex = Math.max(1, positions.count - 1);
+  for (let index = 0; index < positions.count; index += 1) {
+    const t = index / lastIndex;
+    const inverse = 1 - t;
+    positions.setXYZ(
+      index,
+      (inverse * inverse * start.x) + (2 * inverse * t * controlX) + (t * t * end.x),
+      (inverse * inverse * start.y) + (2 * inverse * t * controlY) + (t * t * end.y),
+      (inverse * inverse * start.z) + (2 * inverse * t * controlZ) + (t * t * end.z),
+    );
+  }
   positions.needsUpdate = true;
 }
 
-function pointOnThreePointCurve(
-  positions: { getX(index: number): number; getY(index: number): number; getZ(index: number): number },
+function pointOnRenderedCurve(
+  positions: { count: number; getX(index: number): number; getY(index: number): number; getZ(index: number): number },
   progress: number,
   output: { x: number; y: number; z: number },
 ): void {
-  const t = Math.max(0, Math.min(1, progress));
-  const inverse = 1 - t;
-  output.x = (inverse * inverse * positions.getX(0)) + (2 * inverse * t * positions.getX(1)) + (t * t * positions.getX(2));
-  output.y = (inverse * inverse * positions.getY(0)) + (2 * inverse * t * positions.getY(1)) + (t * t * positions.getY(2));
-  output.z = (inverse * inverse * positions.getZ(0)) + (2 * inverse * t * positions.getZ(1)) + (t * t * positions.getZ(2));
+  const lastIndex = Math.max(1, positions.count - 1);
+  const scaledProgress = Math.max(0, Math.min(1, progress)) * lastIndex;
+  const startIndex = Math.min(lastIndex - 1, Math.floor(scaledProgress));
+  const segmentProgress = scaledProgress - startIndex;
+  const endIndex = startIndex + 1;
+  output.x = positions.getX(startIndex) + ((positions.getX(endIndex) - positions.getX(startIndex)) * segmentProgress);
+  output.y = positions.getY(startIndex) + ((positions.getY(endIndex) - positions.getY(startIndex)) * segmentProgress);
+  output.z = positions.getZ(startIndex) + ((positions.getZ(endIndex) - positions.getZ(startIndex)) * segmentProgress);
 }
 
 function updateLinkObject(object: Object3D, start: { x: number; y: number; z: number }, end: { x: number; y: number; z: number }): boolean {
@@ -598,7 +619,7 @@ function updateLinkObject(object: Object3D, start: { x: number; y: number; z: nu
   const bendDirection = typeof object.userData.graphCurveBendDirection === "number"
     ? object.userData.graphCurveBendDirection
     : 1;
-  writeThreePointCurve(positions, bendDirection, start, end);
+  writeQuadraticCurve(positions, bendDirection, start, end);
   object.geometry.computeBoundingSphere();
   return true;
 }
@@ -1035,6 +1056,15 @@ function setObjectMaterialColor(object: Object3D | null, color: string): void {
   });
 }
 
+function setDefaultNodeEmissiveColor(object: Object3D | null, color: string): void {
+  if (!object) return;
+  materialsForObject(object).forEach((material) => {
+    if (!material || typeof material !== "object" || !("emissive" in material)) return;
+    const candidate = material.emissive;
+    if (candidate instanceof Color) candidate.set(color).multiplyScalar(NODE_EMISSIVE_COLOR_SCALE);
+  });
+}
+
 function objectMaterialColor(object: Object3D | null): string | null {
   if (!object) return null;
   return materialsForObject(object)
@@ -1094,11 +1124,12 @@ export function createThreeForceGraphRenderer({
   const ambientLinks = new Map<string, AmbientLinkState>();
   const particleGroup = new Group();
   particleGroup.name = "graph-workbench-flow-particles";
-  const particleGeometry = new SphereGeometry(1.5, 10, 8);
+  const particleGeometry = new SphereGeometry(0.65, 8, 6);
   const particleMaterial = new MeshBasicMaterial({
-    color: THEME_PALETTES.dark.rim,
+    color: THEME_PALETTES.dark.edge,
+    depthTest: true,
     depthWrite: false,
-    opacity: 0.96,
+    opacity: 0.5,
     transparent: true,
   });
   const projectedWorldPosition = new Vector3();
@@ -1111,7 +1142,7 @@ export function createThreeForceGraphRenderer({
   const flowParticles: FlowParticle[] = Array.from({ length: MAX_FLOW_PARTICLES }, (_unused, index) => {
     const object = new Mesh(particleGeometry, particleMaterial);
     object.visible = false;
-    object.renderOrder = 44;
+    object.renderOrder = 8;
     particleGroup.add(object);
     return {
       id: `flow:${index}`,
@@ -1233,10 +1264,14 @@ export function createThreeForceGraphRenderer({
     if (!object || object.userData.graphDefaultNodeObject !== true) return;
     const palette = themePalette(currentPresentation.theme);
     const descriptor = nodeDescriptor(node);
+    const bodyColor = defaultNodeColor(node, descriptor, currentPresentation.theme, currentData?.links ?? []);
     setObjectMaterialColor(
       graphChildWithRole(object, "body"),
-      defaultNodeColor(node, descriptor, currentPresentation.theme, currentData?.links ?? []),
+      bodyColor,
     );
+    // Descriptor and theme changes must update the same-hue physical lift too;
+    // otherwise a previously rendered semantic color would linger in emissive.
+    setDefaultNodeEmissiveColor(graphChildWithRole(object, "body"), bodyColor);
     setObjectMaterialColor(graphChildWithRole(object, "outline"), palette.outline);
     setObjectMaterialColor(graphChildWithRole(object, "focus-rim"), palette.rim);
     setObjectMaterialColor(graphChildWithRole(object, "node-label"), palette.outline);
@@ -1249,9 +1284,9 @@ export function createThreeForceGraphRenderer({
   }
 
   function applyParticlePalette(): void {
-    // Tokens are neutral contrast signals, not another semantic node palette.
-    // Reusing the theme rim keeps them legible against either canvas surface.
-    particleMaterial.color.set(themePalette(currentPresentation.theme).rim);
+    // Tokens share the restrained edge tone, rather than a white highlight,
+    // so they read as directional detail without covering nodes or labels.
+    particleMaterial.color.set(themePalette(currentPresentation.theme).edge);
   }
 
   function staticLabelBaseScale(label: Object3D): Coordinates {
@@ -1488,7 +1523,7 @@ export function createThreeForceGraphRenderer({
         ambientFlow: false,
         baseOpacity: boundedOpacity(descriptor.opacity, link.visual.opacity),
         baseWidth: descriptor.width ?? link.visual.width,
-        flowParticleCount: stableUnit(`${link.id}:flow`) >= 0.45 ? 3 : 2,
+        flowParticleCount: 2,
         flowPhase: stableUnit(`${link.id}:flow-phase`),
         id: link.id,
         link,
@@ -1652,7 +1687,7 @@ export function createThreeForceGraphRenderer({
           ? 0.64 + (near * 0.3)
           : selectedNodeId
             ? 0.14 + (near * 0.31)
-            : 0.26 + (near * 0.46);
+            : IDLE_BODY_OPACITY.far + (near * IDLE_BODY_OPACITY.nearRange);
       const opacity = Math.max(
         node.visual.opacityFloor,
         master ? AMBIENT_MASTER_BODY_OPACITY_FLOOR : 0,
@@ -1665,15 +1700,17 @@ export function createThreeForceGraphRenderer({
           : master
             ? Math.max(AMBIENT_MASTER_LABEL_OPACITY_FLOOR, 0.32 + (near * 0.26))
             : selectedNodeId
-              ? Math.max(AMBIENT_FAR_LABEL_OPACITY_FLOOR, 0.02 + (near * 0.24))
-              : 0.09 + (near * 0.5);
+            ? Math.max(AMBIENT_FAR_LABEL_OPACITY_FLOOR, 0.02 + (near * 0.24))
+              : IDLE_LABEL_OPACITY.far + (near * IDLE_LABEL_OPACITY.nearRange);
       const labelVisible = selected || neighbor || focused || master
         || labelOpacity >= AMBIENT_FAR_LABEL_OPACITY_FLOOR;
       const viewportScale = Math.max(
         0.82,
         Math.min(1.15, 480 / Math.max(1, Math.min(data.selection.viewport.width, data.selection.viewport.height))),
       );
-      let scale = 0.64 + (near * 0.33);
+      let scale = selectedNodeId
+        ? 0.64 + (near * 0.33)
+        : IDLE_NODE_SCALE.far + (near * IDLE_NODE_SCALE.nearRange);
       if (selected) {
         scale = 1.22;
       } else if (neighbor || focused) {
@@ -1685,7 +1722,9 @@ export function createThreeForceGraphRenderer({
         scale,
         labelVisible,
         labelOpacity,
-        viewportScale * (0.62 + (near * 0.38)),
+        viewportScale * (selectedNodeId
+          ? 0.62 + (near * 0.38)
+          : IDLE_LABEL_SCALE.far + (near * IDLE_LABEL_SCALE.nearRange)),
       );
     }
   }
@@ -1798,7 +1837,10 @@ export function createThreeForceGraphRenderer({
         opacity = Math.max(selectedFocus ? 0.58 : 0.46, state.baseOpacity);
         width = Math.max(selectedFocus ? 1.18 : 1.02, state.baseWidth);
       } else if (idleFlow) {
-        opacity = Math.min(0.2, Math.max(0.16, state.baseOpacity * 1.15));
+        opacity = Math.min(
+          IDLE_LINK_OPACITY.maximum,
+          Math.max(IDLE_LINK_OPACITY.minimum, state.baseOpacity * 1.15),
+        );
         width = Math.max(0.85, Math.min(0.92, state.baseWidth * 1.05));
       } else if (hasFocus) {
         // A selected or hovered constellation keeps distant edges quiet so
@@ -1809,7 +1851,10 @@ export function createThreeForceGraphRenderer({
         // Keep the settled relationship field readable. It remains well below
         // the hover/selection incident tier, while depth testing preserves the
         // receding hierarchy of edges behind nearer nodes.
-        opacity = Math.max(0.12, Math.min(0.18, state.baseOpacity));
+        opacity = Math.max(
+          IDLE_LINK_OPACITY.minimum,
+          Math.min(IDLE_LINK_OPACITY.maximum, state.baseOpacity * 1.4),
+        );
         width = Math.max(0.7, Math.min(0.82, state.baseWidth));
       }
       applyAmbientDefaultLinkVisual(
@@ -1832,14 +1877,14 @@ export function createThreeForceGraphRenderer({
           + state.flowPhase;
         const outwardPhase = basePhase - Math.floor(basePhase);
         const curveProgress = incident && !outwardFromSource ? 1 - outwardPhase : outwardPhase;
-        pointOnThreePointCurve(positions, curveProgress, curvePointLocalPosition);
+        pointOnRenderedCurve(positions, curveProgress, curvePointLocalPosition);
         state.object.updateWorldMatrix(true, false);
         state.object.localToWorld(curvePointWorldPosition.copy(curvePointLocalPosition));
         particleGroup.updateWorldMatrix(true, false);
         particle.object.position.copy(particleGroup.worldToLocal(particleLocalPosition.copy(curvePointWorldPosition)));
         particle.object.visible = true;
         const particleScale = incident
-          ? INTERACTION_FLOW_PARTICLE_SCALE * (0.9 + (Math.sin(outwardPhase * Math.PI * 2) * 0.18))
+          ? INTERACTION_FLOW_PARTICLE_SCALE * (0.94 + (Math.sin(outwardPhase * Math.PI * 2) * 0.06))
           : IDLE_FLOW_PARTICLE_SCALE;
         particle.object.scale.setScalar(particleScale);
         particle.linkId = state.id;

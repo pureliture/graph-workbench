@@ -135,7 +135,7 @@ export interface GraphRenderNodeObservation extends GraphRenderObjectObservation
     readonly visual: RenderNode["visual"];
 }
 export interface GraphRenderLinkObservation extends GraphRenderObjectObservation {
-    /** The default edge uses a gentle three-point curve; custom factories may differ. */
+    /** The default edge uses a tessellated gentle quadratic curve; custom factories may differ. */
     readonly curvePointCount: number | null;
     readonly depthWriteEnabled: boolean | null;
     readonly visual: RenderLink["visual"];

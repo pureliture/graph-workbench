@@ -152,8 +152,8 @@ renderer는 `ambientMotion` 힌트를 무시해도 호환됩니다.
 명시적 `master`는 별도의 최소 가독성 계층을 유지합니다. 실제 blur나 post-processing은 사용하지
 않습니다.
 
-idle edge는 거의 보이지 않습니다. hover 또는 selected focus의 기본 incident edge만 기존의
-3-point curve 위에 2–3개의 renderer-owned token을 focus에서 이웃 방향으로 흘립니다. custom
+idle edge는 거의 보이지 않습니다. hover 또는 selected focus의 기본 incident edge만 tessellated
+quadratic curve 위에 2개의 작은 renderer-owned token을 focus에서 이웃 방향으로 흘립니다. custom
 link factory의 geometry와 animation은 건드리지 않습니다. `reducedMotion`에서는 node offset과
 flow가 즉시 0이 되고, document가 hidden이면 motion loop가 멈췄다가 visible에서 시간 점프 없이
 재개됩니다.
