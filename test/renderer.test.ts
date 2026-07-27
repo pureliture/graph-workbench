@@ -628,6 +628,16 @@ describe("Three.js camera transitions", () => {
     const ambient = renderer.getAmbientMotionObservation!()!;
     const endpoint = ambient.linkEndpoints.find((candidate) => candidate.id === "api-web")!;
 
+    expect(endpoint.sourceBoundary).toMatchObject({
+      endpointAtSilhouetteBoundary: true,
+      exteriorProbeInside: false,
+      interiorProbeInside: true,
+    });
+    expect(endpoint.targetBoundary).toMatchObject({
+      endpointAtSilhouetteBoundary: true,
+      exteriorProbeInside: false,
+      interiorProbeInside: true,
+    });
     expect(lineEndpointInWorld(0).distanceTo(sourceWorld)).toBeGreaterThan(0.1);
     expect(lineEndpointInWorld(positions.count - 1).distanceTo(targetWorld)).toBeGreaterThan(0.1);
     expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z).distanceTo(lineEndpointInWorld(0))).toBeLessThan(0.0001);
@@ -645,6 +655,9 @@ describe("Three.js camera transitions", () => {
     };
     graph.cameraControls.dispatch("change");
     graph.cameraControls.dispatch("end");
+    // Normal-motion Orbit changes share the already queued ambient RAF rather
+    // than synchronously retrimming every default edge a second time.
+    runLatestFrame(1_016);
     const afterOrbit = renderer.getAmbientMotionObservation!()!.linkEndpoints
       .find((candidate) => candidate.id === "api-web")!;
     expect(afterOrbit.start).not.toEqual(endpointBeforeOrbit);
@@ -721,6 +734,103 @@ describe("Three.js camera transitions", () => {
     });
   });
 
+  it("coalesces normal OrbitControls clipping into ambient RAF while static modes update immediately", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, {}));
+    runLatestFrame(0);
+
+    const line = graph.linkObjects.get("api-web") as Line;
+    const positions = line.geometry.getAttribute("position");
+    const normalWrites = vi.spyOn(positions, "setXYZ");
+    graph.pose = {
+      lookAt: { x: -8, y: 5, z: 0 },
+      position: { x: 175, y: 75, z: 230 },
+    };
+    graph.cameraControls.dispatch("change");
+    expect(normalWrites).not.toHaveBeenCalled();
+
+    runLatestFrame(16);
+    expect(normalWrites).toHaveBeenCalled();
+    normalWrites.mockRestore();
+
+    renderer.setData(createRenderGraphData(graphFixture, { reducedMotion: true }));
+    const staticWrites = vi.spyOn(positions, "setXYZ");
+    graph.pose = {
+      lookAt: { x: 11, y: -4, z: 0 },
+      position: { x: 132, y: 64, z: 245 },
+    };
+    graph.cameraControls.dispatch("change");
+    expect(staticWrites).toHaveBeenCalled();
+  });
+
+  it("coalesces ambient-disabled OrbitControls changes into a live camera transition", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, { ambientMotion: false }));
+    renderer.setData(createRenderGraphData(graphFixture, {
+      ambientMotion: false,
+      selectedNodeIds: ["component:api"],
+    }));
+    renderer.transitionToNode!("component:api", { reducedMotion: false });
+
+    const line = graph.linkObjects.get("api-web") as Line;
+    const positions = line.geometry.getAttribute("position");
+    const transitionWrites = vi.spyOn(positions, "setXYZ");
+    graph.pose = {
+      lookAt: { x: -6, y: 4, z: 0 },
+      position: { x: 168, y: 71, z: 228 },
+    };
+    graph.cameraControls.dispatch("change");
+    expect(transitionWrites).not.toHaveBeenCalled();
+
+    runLatestFrame(0);
+    expect(transitionWrites).toHaveBeenCalled();
+    runLatestFrame(420);
+    transitionWrites.mockRestore();
+
+    const staticWrites = vi.spyOn(positions, "setXYZ");
+    graph.pose = {
+      lookAt: { x: 8, y: -3, z: 0 },
+      position: { x: 144, y: 65, z: 244 },
+    };
+    graph.cameraControls.dispatch("change");
+    expect(staticWrites).toHaveBeenCalled();
+  });
+
+  it("keeps per-frame default-link boundary cache out of Line userData", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] }));
+    runLatestFrame(0);
+
+    const line = graph.linkObjects.get("api-web") as Line;
+    const userDataKeys = Object.keys(line.userData).sort();
+    runLatestFrame(125);
+    runLatestFrame(250);
+
+    expect(Object.keys(line.userData).sort()).toEqual(userDataKeys);
+    expect(line.userData.graphDefaultLinkBoundaryEvidence).toBeUndefined();
+    const endpoint = renderer.getAmbientMotionObservation!()!.linkEndpoints
+      .find((candidate) => candidate.id === "api-web")!;
+    expect(endpoint.sourceBoundary).toMatchObject({
+      endpointAtSilhouetteBoundary: true,
+      exteriorProbeInside: false,
+      interiorProbeInside: true,
+    });
+    expect(endpoint.targetBoundary).toMatchObject({
+      endpointAtSilhouetteBoundary: true,
+      exteriorProbeInside: false,
+      interiorProbeInside: true,
+    });
+  });
+
   it("leaves custom node and link factory geometry under host control", () => {
     const customNode = new Group();
     const renderer = createThreeForceGraphRenderer({
@@ -746,6 +856,12 @@ describe("Three.js camera transitions", () => {
     const defaultTarget = graph.nodeObjects.get("default-target")!;
     expect(new Vector3(endpoint.end.x, endpoint.end.y, endpoint.end.z)
       .distanceTo(defaultTarget.getWorldPosition(new Vector3()))).toBeGreaterThan(0.1);
+    expect(endpoint.sourceBoundary).toBeNull();
+    expect(endpoint.targetBoundary).toMatchObject({
+      endpointAtSilhouetteBoundary: true,
+      exteriorProbeInside: false,
+      interiorProbeInside: true,
+    });
 
     const hostLink = new Group();
     const customLinkRenderer = createThreeForceGraphRenderer({
@@ -1686,6 +1802,96 @@ describe("Three.js camera transitions", () => {
     // The input update gives the former leaf degree two, so it falls back to
     // its routine semantic kind instead of retaining the leaf amber.
     expect(nodeColors()["component:leaf"]).toBe("#1d4ed8");
+  });
+
+  it("refreshes cached default silhouettes and shape-dependent label bases after topology or type changes", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const initial: GraphInput = {
+      schemaVersion: 1,
+      layout: { seed: "silhouette-refresh" },
+      nodes: [
+        { id: "leaf", kind: "skill", label: "Leaf", type: "component" },
+        { id: "leaf-target", kind: "concept", label: "Leaf target", type: "concept" },
+        { id: "leaf-second-target", kind: "concept", label: "Leaf second target", type: "concept" },
+        { id: "relation", kind: "inspection", label: "Relation", type: "relation" },
+        { id: "relation-a", kind: "concept", label: "Relation A", type: "concept" },
+        { id: "relation-b", kind: "concept", label: "Relation B", type: "concept" },
+        { id: "profile", kind: "profile", label: "Profile", type: "profile" },
+        { id: "profile-a", kind: "concept", label: "Profile A", type: "concept" },
+        { id: "profile-b", kind: "concept", label: "Profile B", type: "concept" },
+      ],
+      links: [
+        { id: "leaf-target", relationKind: "uses", source: "leaf", target: "leaf-target" },
+        { id: "relation-a", relationKind: "uses", source: "relation", target: "relation-a" },
+        { id: "relation-b", relationKind: "uses", source: "relation", target: "relation-b" },
+        { id: "profile-a", relationKind: "uses", source: "profile", target: "profile-a" },
+        { id: "profile-b", relationKind: "uses", source: "profile", target: "profile-b" },
+      ],
+    };
+    renderer.setData(createRenderGraphData(initial, { reducedMotion: true }));
+
+    const bodyAndLabel = (id: string) => {
+      const object = graph.nodeObjects.get(id)!;
+      return {
+        body: object.children.find((child) => child.userData.graphVisualRole === "body") as Mesh,
+        label: object.children.find((child) => child.userData.graphVisualRole === "node-label") as Sprite,
+        object,
+      };
+    };
+    const leafBefore = bodyAndLabel("leaf");
+    const relationBefore = bodyAndLabel("relation");
+    const profileBefore = bodyAndLabel("profile");
+    expect(leafBefore.body.userData.graphDefaultNodeSilhouette).toBe("dot");
+    expect(relationBefore.body.userData.graphDefaultNodeSilhouette).toBe("disk");
+    expect(relationBefore.label.position.y).toBe(10.6);
+    expect((relationBefore.label.userData.graphBaseLabelScale as Coordinates).y).toBe(10);
+    expect(profileBefore.body.userData.graphDefaultNodeSilhouette).toBe("circle");
+    profileBefore.body.geometry.computeBoundingBox();
+    expect(profileBefore.body.geometry.boundingBox?.max.x).toBeCloseTo(3.8);
+
+    renderer.setData(createRenderGraphData({
+      ...initial,
+      nodes: initial.nodes.map((node) => {
+        if (node.id === "relation") return { ...node, kind: "skill", type: "component" as const };
+        if (node.id === "profile") return { ...node, kind: "concept", type: "component" as const };
+        return node;
+      }),
+      links: [
+        ...initial.links,
+        { id: "leaf-second-target", relationKind: "uses", source: "leaf", target: "leaf-second-target" },
+      ],
+    }, { reducedMotion: true }));
+
+    const leafAfter = bodyAndLabel("leaf");
+    const relationAfter = bodyAndLabel("relation");
+    const profileAfter = bodyAndLabel("profile");
+    expect(leafAfter.object).toBe(leafBefore.object);
+    expect(leafAfter.body).toBe(leafBefore.body);
+    expect(leafAfter.body.userData.graphDefaultNodeSilhouette).toBe("circle");
+    expect(leafAfter.label.position.y).toBe(6.6);
+    expect((leafAfter.label.userData.graphBaseLabelScale as Coordinates).y).toBe(8);
+    expect(relationAfter.object).toBe(relationBefore.object);
+    expect(relationAfter.body.userData.graphDefaultNodeSilhouette).toBe("circle");
+    expect(relationAfter.label.position.y).toBe(6.6);
+    expect((relationAfter.label.userData.graphBaseLabelScale as Coordinates).y).toBe(8);
+    expect(relationAfter.label.userData.graphBaseLabelAnchorY).toBe(6.6);
+    expect((relationAfter.label.userData.graphBaseLabelScale as Coordinates).y).toBe(8);
+    expect(profileAfter.object).toBe(profileBefore.object);
+    expect(profileAfter.body.userData.graphDefaultNodeSilhouette).toBe("circle");
+    profileAfter.body.geometry.computeBoundingBox();
+    expect(profileAfter.body.geometry.boundingBox?.max.x).toBeCloseTo(2.8);
+
+    const observation = renderer.getAmbientMotionObservation!()!;
+    const leafBoundary = observation.linkEndpoints.find((endpoint) => endpoint.id === "leaf-target")?.sourceBoundary;
+    expect(leafBoundary).toEqual({
+      endpointAtSilhouetteBoundary: true,
+      exteriorProbeInside: false,
+      interiorProbeInside: true,
+      silhouette: "circle",
+    });
   });
 
   it("uses routine-harness flat light materials without an outline shell or selection ring", () => {

@@ -115,12 +115,21 @@ interface AmbientLinkFlow {
   readonly particleCount: number;
 }
 
+interface AmbientLinkEndpointBoundary {
+  readonly endpointAtSilhouetteBoundary: boolean;
+  readonly exteriorProbeInside: boolean;
+  readonly interiorProbeInside: boolean;
+  readonly silhouette: DefaultNodeSilhouette;
+}
+
 interface AmbientLinkEndpoint {
   readonly end: AmbientPosition;
   readonly id: string;
   readonly sourceId: string;
+  readonly sourceBoundary?: AmbientLinkEndpointBoundary | null;
   readonly start: AmbientPosition;
   readonly targetId: string;
+  readonly targetBoundary?: AmbientLinkEndpointBoundary | null;
 }
 
 interface AmbientParticle extends AmbientPosition {
@@ -199,7 +208,7 @@ interface RenderDefaultNodeBodyObservation {
 
 interface RenderNodeObservation extends RenderObjectObservation {
   readonly bodyMaterialColor: string | null;
-  readonly defaultBody: RenderDefaultNodeBodyObservation | null;
+  readonly defaultBody?: RenderDefaultNodeBodyObservation | null;
   readonly label: RenderNodeLabelObservation;
   readonly worldPosition: RenderTransformObservation;
   readonly worldScale: RenderTransformObservation | null;
@@ -610,29 +619,37 @@ function expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
   for (const linkId of linkIds) {
     const link = linksById.get(linkId);
     if (!link) throw new Error(`${linkId} was absent from the live renderer observation.`);
-    // The fixture uses the renderer-owned tessellated default Line. A host
-    // factory can return a different object with no curve observation, which
-    // remains outside this default-geometry contract.
-    if (link.curvePointCount === null) continue;
+    // This fixture mounts only renderer-owned default Lines, so a missing
+    // tessellated curve observation is a failed default-renderer contract.
+    if (typeof link.curvePointCount !== "number") {
+      throw new Error(`${linkId} did not expose a live default Line curve.`);
+    }
+    expect(link.curvePointCount).toBeGreaterThanOrEqual(2);
     expect(link).toMatchObject({ objectTracked: true, objectVisible: true, sceneAttached: true });
     const endpoint = endpointsById.get(linkId);
     if (!endpoint) throw new Error(`${linkId} did not expose live default Line endpoints.`);
     if (focusedNodeId) {
       expect([endpoint.sourceId, endpoint.targetId]).toContain(focusedNodeId);
     }
-    for (const [nodeId, endpointPosition] of [
-      [endpoint.sourceId, endpoint.start],
-      [endpoint.targetId, endpoint.end],
+    for (const [end, nodeId, boundary] of [
+      ["source", endpoint.sourceId, endpoint.sourceBoundary],
+      ["target", endpoint.targetId, endpoint.targetBoundary],
     ] as const) {
       const node = nodesById.get(nodeId);
       if (!node) throw new Error(`${nodeId} was absent from the live renderer observation.`);
-      // Default flat bodies are clipped at the renderer-owned silhouette
-      // boundary. Custom node factories own their geometry, so a null body is
-      // intentionally not constrained by this assertion.
-      if (node.defaultBody === null) continue;
+      if (!node.defaultBody) {
+        throw new Error(`${nodeId} did not expose a renderer-owned default flat body in this fixture.`);
+      }
+      if (!boundary) {
+        throw new Error(`${linkId} did not expose ${end} silhouette boundary evidence.`);
+      }
       expect(node).toMatchObject({ objectTracked: true, objectVisible: true, sceneAttached: true });
-      expect(spatialDistance(endpointPosition, ambientPosition(frame, nodeId, "renderedNodePositions")))
-        .toBeGreaterThan(0.1);
+      expect(boundary).toEqual({
+        silhouette: node.defaultBody.silhouette,
+        endpointAtSilhouetteBoundary: true,
+        interiorProbeInside: true,
+        exteriorProbeInside: false,
+      });
     }
   }
 }

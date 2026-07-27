@@ -33,6 +33,8 @@ export {
   type GraphNodeObjectFactory,
   type GraphDefaultNodeSilhouette,
   type GraphAmbientMotionLinkFlowObservation,
+  type GraphAmbientMotionLinkEndpointBoundaryObservation,
+  type GraphAmbientMotionLinkEndpointObservation,
   type GraphAmbientMotionNodePosition,
   type GraphAmbientMotionObservation,
   type GraphAmbientMotionParticleObservation,

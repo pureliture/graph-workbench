@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   createGraphWorkbench,
+  type GraphAmbientMotionLinkEndpointObservation,
   type GraphPresentation,
+  type GraphRenderObservation,
   type GraphRenderer,
   type GraphRendererFactoryOptions,
   type RenderGraphData,
@@ -65,7 +67,7 @@ class ProjectionRenderer extends FakeRenderer {
 }
 
 class ObservationRenderer extends FakeRenderer {
-  getRenderObservation() {
+  getRenderObservation(): GraphRenderObservation | null {
     if (!this.data) return null;
     return {
       linkIds: this.data.links.map((link) => link.id),
@@ -75,19 +77,36 @@ class ObservationRenderer extends FakeRenderer {
         objectTracked: false,
         objectVisible: null,
         sceneAttached: false,
+        visibleMaterialLineWidths: [],
         visibleMaterialOpacities: [],
         visual: link.visual,
       })),
       nodeIds: this.data.nodes.map((node) => node.id),
       nodes: this.data.nodes.map((node) => ({
         bodyMaterialColor: null,
-        defaultBody: null,
         id: node.id,
         minimumVisibleMaterialOpacity: null,
         objectTracked: false,
         objectVisible: null,
         sceneAttached: false,
         visibleMaterialOpacities: [],
+        // Deliberately omit the post-existing defaultBody field. A custom
+        // renderer's observation remains source-compatible with this release.
+        label: {
+          alphaMasked: null,
+          id: node.id,
+          minimumVisibleMaterialOpacity: null,
+          objectTracked: false,
+          objectVisible: null,
+          position: null,
+          scale: null,
+          sceneAttached: false,
+          transparent: null,
+          visibleMaterialLineWidths: [],
+          visibleMaterialOpacities: [],
+        },
+        worldPosition: { id: node.id, x: node.x, y: node.y, z: node.z },
+        worldScale: null,
         visual: node.visual,
       })),
     };
@@ -95,6 +114,19 @@ class ObservationRenderer extends FakeRenderer {
 }
 
 describe("GraphWorkbench", () => {
+  it("keeps ambient endpoint observations source-compatible when boundary evidence is unavailable", () => {
+    const legacyEndpoint: GraphAmbientMotionLinkEndpointObservation = {
+      end: { x: 12, y: 8, z: 0 },
+      id: "legacy-link",
+      sourceId: "legacy-source",
+      start: { x: -12, y: -8, z: 0 },
+      targetId: "legacy-target",
+    };
+
+    expect(legacyEndpoint.sourceBoundary).toBeUndefined();
+    expect(legacyEndpoint.targetBoundary).toBeUndefined();
+  });
+
   it("connects renderer events and keyboard focus to host-observable stable identities", () => {
     let renderer: FakeRenderer | null = null;
     let callbacks: GraphRendererFactoryOptions["callbacks"] | null = null;
@@ -182,6 +214,7 @@ describe("GraphWorkbench", () => {
       nodeIds: graphFixture.nodes.map((node) => node.id),
     });
     expect(observation?.nodes[0]).toMatchObject({ id: "relation:release", objectTracked: false });
+    expect(observation?.nodes[0]).not.toHaveProperty("defaultBody");
 
     workbench.unmount();
     expect(workbench.getRenderObservation()).toBeNull();

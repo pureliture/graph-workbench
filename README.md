@@ -124,6 +124,8 @@ pixels. Detached stale factory objects are reported as not scene-attached and do
 contribute material-opacity evidence. Built-in node bodies additionally report
 `defaultBody: { kind: "flat-2.5d", silhouette }`, where `silhouette` is one of
 `circle`, `capsule`, `dot`, or `disk`; host-provided node objects report `null`.
+`defaultBody`는 기존 custom renderer observation과의 source compatibility를 위해 optional이며,
+내장 renderer는 항상 이 필드를 제공합니다.
 
 내장 renderer는 선택을 하나의 취소 가능한 transaction으로 처리합니다. 모든 live node는
 현재 renderer-local 위치에서 deterministic target까지 보간되고, link emphasis, focus rim,
@@ -169,6 +171,9 @@ particle phase/position을 반환합니다. transition의 앵커 transaction은 
 `getTransitionObservation()`으로 계속 확인합니다. `getNodeScreenPosition()` 역시 실제 raycast
 Object3D의 live world transform을 투영하므로, host/fixture는 움직이는 node를 정확한 위치에서
 클릭할 수 있습니다. mount 전 또는 legacy custom renderer에서는 ambient observation이 `null`입니다.
+기본 Line endpoint에는 optional `sourceBoundary`/`targetBoundary` evidence가 추가될 수 있습니다.
+이 값은 기본 flat body에서만 silhouette과 camera-facing bisection trim의 안쪽·바깥쪽 probe 결과를
+제공하며, custom body 또는 legacy observation에서는 `null` 또는 생략될 수 있습니다.
 
 ## Development
 

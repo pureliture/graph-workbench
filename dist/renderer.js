@@ -88,6 +88,7 @@ const MAX_FLOW_PARTICLES = 12;
 const DEFAULT_LINK_CURVE_SEGMENTS = 28;
 const DEFAULT_LINK_BOUNDARY_SCAN_STEPS = 28;
 const DEFAULT_LINK_BOUNDARY_BISECTION_STEPS = 12;
+const DEFAULT_LINK_BOUNDARY_PROBE_PROGRESS = 2 / (DEFAULT_LINK_BOUNDARY_SCAN_STEPS * (2 ** DEFAULT_LINK_BOUNDARY_BISECTION_STEPS));
 const AMBIENT_VISUAL_EPSILON = 0.0001;
 const AMBIENT_MASTER_BODY_OPACITY_FLOOR = 0.5;
 const AMBIENT_MASTER_LABEL_OPACITY_FLOOR = 0.5;
@@ -116,8 +117,13 @@ const IDLE_LABEL_SCALE = Object.freeze({ far: 0.8, nearRange: 0.2 });
 function themePalette(theme) {
     return theme === "light" ? THEME_PALETTES.light : THEME_PALETTES.dark;
 }
-function nodeDegree(nodeId, links) {
-    return links.reduce((degree, link) => (degree + Number(link.source === nodeId) + Number(link.target === nodeId)), 0);
+function nodeDegrees(links) {
+    const degrees = new Map();
+    links.forEach((link) => {
+        degrees.set(link.source, (degrees.get(link.source) ?? 0) + 1);
+        degrees.set(link.target, (degrees.get(link.target) ?? 0) + 1);
+    });
+    return degrees;
 }
 function routineComponentKind(node) {
     const candidate = node.kind.toLowerCase();
@@ -125,19 +131,19 @@ function routineComponentKind(node) {
         ? candidate
         : null;
 }
-function resolvedNodeVisualKind(node, links) {
+function resolvedNodeVisualKind(node, degree = 0) {
     // These identities must remain visible even where a profile or workflow is
     // incident to exactly one relationship.
     if (node.type === "profile")
         return "profile";
     if (node.type === "workflow" || node.kind === "workflow")
         return "workflow";
-    if (nodeDegree(node.id, links) === 1)
+    if (degree === 1)
         return "leaf";
     return routineComponentKind(node) ?? "fallback";
 }
-function defaultNodeColor(node, descriptor, theme = "dark", links = []) {
-    return descriptor?.color ?? themePalette(theme).node[resolvedNodeVisualKind(node, links)];
+function defaultNodeColor(node, descriptor, theme = "dark", visualKind = resolvedNodeVisualKind(node)) {
+    return descriptor?.color ?? themePalette(theme).node[visualKind];
 }
 function defaultLinkColor(descriptor) {
     return descriptor?.color ?? THEME_PALETTES.dark.edge;
@@ -160,8 +166,7 @@ function nodeEmissiveIntensity(node) {
     // Renderer-owned defaults use MeshBasicMaterial and therefore ignore it.
     return node.type === "relation" ? 0.1 : 0.08;
 }
-function defaultNodeSilhouette(node, links = []) {
-    const visualKind = resolvedNodeVisualKind(node, links);
+function defaultNodeSilhouette(node, visualKind = resolvedNodeVisualKind(node)) {
     if (visualKind === "profile") {
         return { cameraRadius: 3.8, height: 7.6, kind: "circle", labelAnchorY: 7.6, width: 7.6 };
     }
@@ -175,6 +180,29 @@ function defaultNodeSilhouette(node, links = []) {
         return { cameraRadius: 6.8, height: 13.6, kind: "disk", labelAnchorY: 10.6, width: 13.6 };
     }
     return { cameraRadius: 2.8, height: 5.6, kind: "circle", labelAnchorY: 6.6, width: 5.6 };
+}
+function defaultNodeSilhouetteSignature(silhouette) {
+    return [
+        silhouette.kind,
+        silhouette.width,
+        silhouette.height,
+        silhouette.labelAnchorY,
+        silhouette.cameraRadius,
+    ].join(":");
+}
+function defaultNodeVisualInputs(data) {
+    const degrees = nodeDegrees(data.links);
+    return new Map(data.nodes.map((node) => {
+        const degree = degrees.get(node.id) ?? 0;
+        const visualKind = resolvedNodeVisualKind(node, degree);
+        return [node.id, { degree, silhouette: defaultNodeSilhouette(node, visualKind), visualKind }];
+    }));
+}
+function defaultNodeVisualInputsRevision(data) {
+    return JSON.stringify({
+        links: data.links.map((link) => ({ source: link.source, target: link.target })),
+        nodes: data.nodes.map((node) => ({ id: node.id, kind: node.kind, type: node.type })),
+    });
 }
 function createCapsuleGeometry(width, height) {
     const radius = height / 2;
@@ -455,6 +483,7 @@ function createNodeLabelSprite(label, silhouette, opacity) {
     sprite.center.set(0.5, 0);
     sprite.position.set(0, silhouette.labelAnchorY, 0);
     sprite.scale.set(Math.max(17, Math.min(58, text.length * 3.05)), silhouette.kind === "disk" ? 10 : 8, 1);
+    sprite.userData.graphBaseLabelAnchorY = silhouette.labelAnchorY;
     sprite.userData.graphBaseLabelScale = { x: sprite.scale.x, y: sprite.scale.y, z: sprite.scale.z };
     sprite.renderOrder = 42;
     sprite.userData.graphVisualRole = "node-label";
@@ -475,6 +504,7 @@ export function createDefaultGraphNodeObject(node, descriptor) {
     const body = new Mesh(geometry, bodyMaterial);
     body.userData.graphVisualRole = "body";
     body.userData.graphDefaultNodeSilhouette = silhouette.kind;
+    body.userData.graphDefaultNodeSilhouetteSignature = defaultNodeSilhouetteSignature(silhouette);
     makeCameraFacingFlatMesh(body);
     group.add(body);
     // Default bodies stay deliberately flat. Depth is expressed through the
@@ -828,6 +858,8 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         controlType: "orbit",
     });
     let currentData = null;
+    let currentDefaultNodeVisualInputs = new Map();
+    let currentDefaultNodeVisualInputsRevision = null;
     let currentPresentation = {};
     let destroyed = false;
     const renderedLinkObjects = new Map();
@@ -846,11 +878,13 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     let ambientFrameCount = 0;
     let ambientLastTimestamp = null;
     let ambientPaused = false;
+    let ambientVisualsDirty = false;
     let ambientCameraAnchor = null;
     let ambientCameraAnchorElapsedMs = 0;
     let ambientCameraLastPose = null;
     const ambientNodes = new Map();
     const ambientLinks = new Map();
+    const defaultLinkBoundaryEvidenceByObject = new WeakMap();
     const particleGroup = new Group();
     particleGroup.name = "graph-workbench-flow-particles";
     const particleGeometry = new CircleGeometry(0.65, 12);
@@ -912,6 +946,12 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     ownerDocument.addEventListener("pointerup", suppressMalformedVendorDragRelease, true);
     const nodeDescriptor = (node) => descriptorForNode(node, currentPresentation.nodeDescriptors?.[node.id]);
     const linkDescriptor = (link) => descriptorForLink(link, currentPresentation.linkDescriptors?.[link.id]);
+    const defaultVisualInputForNode = (node) => (currentDefaultNodeVisualInputs.get(node.id)
+        ?? {
+            degree: 0,
+            silhouette: defaultNodeSilhouette(node),
+            visualKind: resolvedNodeVisualKind(node),
+        });
     graph
         .backgroundColor("#08111f")
         .showNavInfo(false)
@@ -991,34 +1031,49 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         delete mutable.fy;
         delete mutable.fz;
     }
-    function syncDefaultNodeSilhouette(node, object, links) {
+    function syncDefaultNodeSilhouette(node, object) {
         if (object.userData.graphDefaultNodeObject !== true)
             return;
         const body = graphChildWithRole(object, "body");
         if (!(body instanceof Mesh))
             return;
-        const silhouette = defaultNodeSilhouette(node, links);
-        if (body.userData.graphDefaultNodeSilhouette !== silhouette.kind) {
+        const silhouette = defaultVisualInputForNode(node).silhouette;
+        if (body.userData.graphDefaultNodeSilhouetteSignature !== defaultNodeSilhouetteSignature(silhouette)) {
             const previousGeometry = body.geometry;
             body.geometry = createDefaultNodeGeometry(silhouette);
             body.userData.graphDefaultNodeSilhouette = silhouette.kind;
+            body.userData.graphDefaultNodeSilhouetteSignature = defaultNodeSilhouetteSignature(silhouette);
             // The renderer owns this body and its generated geometry. Dispose only
             // the replaced body geometry; factory-return custom objects are never
             // reshaped or disposed here.
             previousGeometry.dispose();
         }
         const label = graphChildWithRole(object, "node-label");
-        if (label)
+        if (label) {
+            const labelScaleMultiplier = staticLabelScaleMultiplier(label);
+            const previousBaseScale = staticLabelBaseScale(label);
+            const baseLabelScale = {
+                x: previousBaseScale.x,
+                y: silhouette.kind === "disk" ? 10 : 8,
+                z: previousBaseScale.z,
+            };
             label.position.y = silhouette.labelAnchorY;
+            label.scale.set(baseLabelScale.x * labelScaleMultiplier, baseLabelScale.y * labelScaleMultiplier, baseLabelScale.z * labelScaleMultiplier);
+            label.userData.graphBaseLabelAnchorY = silhouette.labelAnchorY;
+            label.userData.graphBaseLabelScale = baseLabelScale;
+            const ambientState = ambientNodes.get(node.id);
+            if (ambientState)
+                ambientState.defaultVisual = null;
+        }
     }
     function applyNodePalette(node) {
         const object = renderedNodeObjects.get(node.id);
         if (!object || object.userData.graphDefaultNodeObject !== true)
             return;
-        syncDefaultNodeSilhouette(node, object, currentData?.links ?? []);
+        syncDefaultNodeSilhouette(node, object);
         const palette = themePalette(currentPresentation.theme);
         const descriptor = nodeDescriptor(node);
-        const bodyColor = defaultNodeColor(node, descriptor, currentPresentation.theme, currentData?.links ?? []);
+        const bodyColor = defaultNodeColor(node, descriptor, currentPresentation.theme, defaultVisualInputForNode(node).visualKind);
         setObjectMaterialColor(graphChildWithRole(object, "body"), bodyColor);
         setObjectMaterialColor(graphChildWithRole(object, "outline"), palette.outline);
         setObjectMaterialColor(graphChildWithRole(object, "focus-rim"), palette.rim);
@@ -1588,6 +1643,68 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         }
         return 0;
     }
+    function renderedCurveEndpointMatchesProgress(positions, endpointIndex, start, end, bendDirection, progress) {
+        pointOnQuadraticCurve(start, end, bendDirection, progress, curvePointLocalPosition);
+        const endpointX = positions.getX(endpointIndex);
+        const endpointY = positions.getY(endpointIndex);
+        const endpointZ = positions.getZ(endpointIndex);
+        return Math.hypot(curvePointLocalPosition.x - endpointX, curvePointLocalPosition.y - endpointY, curvePointLocalPosition.z - endpointZ) <= 0.001;
+    }
+    function cachedDefaultLinkBoundaryEndpoint() {
+        return {
+            available: false,
+            endpointAtSilhouetteBoundary: false,
+            exteriorProbeInside: false,
+            interiorProbeInside: false,
+            silhouette: null,
+        };
+    }
+    function cachedDefaultLinkBoundaryEvidence(object) {
+        let evidence = defaultLinkBoundaryEvidenceByObject.get(object);
+        if (!evidence) {
+            evidence = {
+                source: cachedDefaultLinkBoundaryEndpoint(),
+                target: cachedDefaultLinkBoundaryEndpoint(),
+            };
+            defaultLinkBoundaryEvidenceByObject.set(object, evidence);
+        }
+        return evidence;
+    }
+    function clearCachedDefaultLinkBoundaryEndpoint(endpoint) {
+        endpoint.available = false;
+        endpoint.endpointAtSilhouetteBoundary = false;
+        endpoint.exteriorProbeInside = false;
+        endpoint.interiorProbeInside = false;
+        endpoint.silhouette = null;
+    }
+    function updateCachedDefaultLinkBoundaryEndpoint(cached, object, positions, start, end, bendDirection, body, silhouette, camera, boundaryProgress, direction) {
+        const interiorProgress = direction === "source"
+            ? Math.max(0, boundaryProgress - DEFAULT_LINK_BOUNDARY_PROBE_PROGRESS)
+            : Math.min(1, boundaryProgress + DEFAULT_LINK_BOUNDARY_PROBE_PROGRESS);
+        const exteriorProgress = direction === "source"
+            ? Math.min(1, boundaryProgress + DEFAULT_LINK_BOUNDARY_PROBE_PROGRESS)
+            : Math.max(0, boundaryProgress - DEFAULT_LINK_BOUNDARY_PROBE_PROGRESS);
+        const interiorProbeInside = curvePointInsideDefaultNode(object, start, end, bendDirection, interiorProgress, body, silhouette, camera) === true;
+        const exteriorProbeInside = curvePointInsideDefaultNode(object, start, end, bendDirection, exteriorProgress, body, silhouette, camera) === true;
+        const endpointIndex = direction === "source" ? 0 : positions.count - 1;
+        cached.available = true;
+        cached.endpointAtSilhouetteBoundary = interiorProbeInside
+            && !exteriorProbeInside
+            && renderedCurveEndpointMatchesProgress(positions, endpointIndex, start, end, bendDirection, boundaryProgress);
+        cached.exteriorProbeInside = exteriorProbeInside;
+        cached.interiorProbeInside = interiorProbeInside;
+        cached.silhouette = silhouette.kind;
+    }
+    function defaultLinkBoundaryObservation(cached) {
+        if (!cached?.available || cached.silhouette === null)
+            return null;
+        return {
+            endpointAtSilhouetteBoundary: cached.endpointAtSilhouetteBoundary,
+            exteriorProbeInside: cached.exteriorProbeInside,
+            interiorProbeInside: cached.interiorProbeInside,
+            silhouette: cached.silhouette,
+        };
+    }
     function updateDefaultLinkObjectWithBoundaryTrim(object, start, end, source, target) {
         if (!(object instanceof Line) || object.userData.graphDefaultLinkObject !== true) {
             return updateLinkObject(object, start, end);
@@ -1598,31 +1715,52 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const bendDirection = typeof object.userData.graphCurveBendDirection === "number"
             ? object.userData.graphCurveBendDirection
             : 1;
+        const boundaryEvidence = cachedDefaultLinkBoundaryEvidence(object);
         const sourceBody = defaultNodeBody(source);
         const targetBody = defaultNodeBody(target);
-        if (!sourceBody && !targetBody)
+        if (!sourceBody && !targetBody) {
+            clearCachedDefaultLinkBoundaryEndpoint(boundaryEvidence.source);
+            clearCachedDefaultLinkBoundaryEndpoint(boundaryEvidence.target);
             return updateLinkObject(object, start, end);
+        }
         object.updateWorldMatrix(true, false);
         const camera = cameraPose();
-        const sourceSilhouette = source ? defaultNodeSilhouette(source.node, currentData?.links ?? []) : null;
-        const targetSilhouette = target ? defaultNodeSilhouette(target.node, currentData?.links ?? []) : null;
+        const sourceSilhouette = source ? defaultVisualInputForNode(source.node).silhouette : null;
+        const targetSilhouette = target ? defaultVisualInputForNode(target.node).silhouette : null;
         const startProgress = sourceBody && sourceSilhouette
             ? firstCurveProgressOutsideDefaultNode(object, start, end, bendDirection, sourceBody, sourceSilhouette, camera)
             : 0;
         const endProgress = targetBody && targetSilhouette
             ? firstCurveProgressInsideDefaultNodeFromEnd(object, start, end, bendDirection, targetBody, targetSilhouette, camera)
             : 1;
-        if (startProgress === null || endProgress === null)
+        if (startProgress === null || endProgress === null) {
+            clearCachedDefaultLinkBoundaryEndpoint(boundaryEvidence.source);
+            clearCachedDefaultLinkBoundaryEndpoint(boundaryEvidence.target);
             return updateLinkObject(object, start, end);
+        }
         if (startProgress >= endProgress) {
             object.visible = false;
             object.userData.graphDefaultLinkHasVisibleCurve = false;
+            clearCachedDefaultLinkBoundaryEndpoint(boundaryEvidence.source);
+            clearCachedDefaultLinkBoundaryEndpoint(boundaryEvidence.target);
             return true;
         }
         writeQuadraticCurve(positions, bendDirection, start, end, startProgress, endProgress);
         object.visible = true;
         object.userData.graphDefaultLinkHasVisibleCurve = true;
         object.geometry.computeBoundingSphere();
+        if (sourceBody && sourceSilhouette) {
+            updateCachedDefaultLinkBoundaryEndpoint(boundaryEvidence.source, object, positions, start, end, bendDirection, sourceBody, sourceSilhouette, camera, startProgress, "source");
+        }
+        else {
+            clearCachedDefaultLinkBoundaryEndpoint(boundaryEvidence.source);
+        }
+        if (targetBody && targetSilhouette) {
+            updateCachedDefaultLinkBoundaryEndpoint(boundaryEvidence.target, object, positions, start, end, bendDirection, targetBody, targetSilhouette, camera, endProgress, "target");
+        }
+        else {
+            clearCachedDefaultLinkBoundaryEndpoint(boundaryEvidence.target);
+        }
         return true;
     }
     function updateLinkObjectFromWorldEndpoints(object, startWorldPosition, endWorldPosition, source = null, target = null) {
@@ -1644,6 +1782,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const positions = object?.geometry.getAttribute("position");
         if (!object || !positions || positions.itemSize !== 3 || positions.count < 2)
             return null;
+        const boundaryEvidence = defaultLinkBoundaryEvidenceByObject.get(object);
         object.updateWorldMatrix(true, false);
         const positionAt = (index) => {
             lineEndpointWorldPosition.set(positions.getX(index), positions.getY(index), positions.getZ(index));
@@ -1658,8 +1797,10 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             end: positionAt(positions.count - 1),
             id: state.id,
             sourceId: state.link.source,
+            sourceBoundary: defaultLinkBoundaryObservation(boundaryEvidence?.source),
             start: positionAt(0),
             targetId: state.link.target,
+            targetBoundary: defaultLinkBoundaryObservation(boundaryEvidence?.target),
         };
     }
     function applyFocusedLinkFlow() {
@@ -1962,6 +2103,11 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             cancelCameraTransition();
         }
         currentData = data;
+        const nextDefaultNodeVisualInputsRevision = defaultNodeVisualInputsRevision(data);
+        if (nextDefaultNodeVisualInputsRevision !== currentDefaultNodeVisualInputsRevision) {
+            currentDefaultNodeVisualInputs = defaultNodeVisualInputs(data);
+            currentDefaultNodeVisualInputsRevision = nextDefaultNodeVisualInputsRevision;
+        }
         currentDataRevision = nextDataRevision;
         currentPresentation = data.presentation;
         graph.backgroundColor(themePalette(currentPresentation.theme).background);
@@ -2044,19 +2190,26 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             if (motionFrame !== frameId)
                 return;
             motionFrame = null;
+            const hadTransitionTick = transitionTick !== null;
             transitionTick?.(timestamp);
-            if (ambientMotionEnabled()) {
+            const motionEnabled = ambientMotionEnabled();
+            if (motionEnabled) {
                 if (ambientLastTimestamp !== null) {
                     ambientElapsedMs += Math.max(0, timestamp - ambientLastTimestamp);
                 }
                 ambientLastTimestamp = timestamp;
                 ambientFrameCount += 1;
-                applyAmbientVisuals();
             }
             else {
                 ambientLastTimestamp = null;
+            }
+            // OrbitControls `change` only marks this shared renderer frame dirty.
+            // Ambient motion already needs the same work every tick; static camera
+            // transitions still retain their one final visual refresh.
+            if (motionEnabled || ambientVisualsDirty || hadTransitionTick) {
                 applyAmbientVisuals();
             }
+            ambientVisualsDirty = false;
             ensureMotionFrame();
         });
         motionFrame = frameId;
@@ -2071,6 +2224,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             if (motionFrame !== null)
                 frameScheduler.cancel(motionFrame);
             motionFrame = null;
+            ambientVisualsDirty = false;
             applyAmbientVisuals();
             return;
         }
@@ -2090,8 +2244,17 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     const updateCameraControlInteraction = () => {
         if (cameraControlInteractionActive)
             cancelCameraTransition();
-        // Reduced motion intentionally has no RAF. Orbit changes must still
-        // recompute the camera-facing boundary clip before the next render.
+        // Ambient motion and a non-reduced camera transition each own a shared
+        // renderer frame that recomputes default Line silhouette trims. Coalesce
+        // OrbitControls changes into either frame rather than doing an immediate
+        // second all-link pass. Reduced/static/hidden modes have no such frame and
+        // retain the synchronous update needed for immediate rendering.
+        if (ambientMotionEnabled() || (transitionTick !== null && !ambientPaused)) {
+            ambientVisualsDirty = true;
+            ensureMotionFrame();
+            return;
+        }
+        ambientVisualsDirty = false;
         applyAmbientVisuals();
     };
     const endCameraControlInteraction = () => {
@@ -2218,7 +2381,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 return [];
             // Shape metrics are shared with the default body's label anchor, so a
             // flat capsule or disk never gets framed as if it were the old sphere.
-            const bodyRadius = defaultNodeSilhouette(node, data.links).cameraRadius;
+            const bodyRadius = defaultVisualInputForNode(node).silhouette.cameraRadius;
             const focusScale = node.id === nodeId ? 1.22 : 1;
             // Reserve the renderer-owned micro-motion envelope inside the existing
             // camera padding, including compact portrait framing.
@@ -2302,6 +2465,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             if (motionFrame !== null)
                 frameScheduler.cancel(motionFrame);
             motionFrame = null;
+            ambientVisualsDirty = false;
             transitionTick = null;
             destroyed = true;
             deferredDataDuringTransition = null;

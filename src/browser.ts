@@ -28,6 +28,8 @@ export type {
   GraphLinkObjectFactory,
   GraphNodeObjectFactory,
   GraphDefaultNodeSilhouette,
+  GraphAmbientMotionLinkEndpointBoundaryObservation,
+  GraphAmbientMotionLinkEndpointObservation,
   GraphAmbientMotionLinkFlowObservation,
   GraphAmbientMotionNodePosition,
   GraphAmbientMotionObservation,

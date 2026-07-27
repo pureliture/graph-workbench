@@ -31,6 +31,18 @@ export interface GraphAmbientMotionLinkFlowObservation {
     readonly particleCount: number;
 }
 /**
+ * Read-only proof that one default Line end was trimmed against a live,
+ * camera-facing flat default body. The probes are sampled immediately inside
+ * and outside the bisection-resolved curve boundary. Custom node objects use
+ * `null`, while legacy observations may omit this optional evidence entirely.
+ */
+export interface GraphAmbientMotionLinkEndpointBoundaryObservation {
+    readonly endpointAtSilhouetteBoundary: boolean;
+    readonly exteriorProbeInside: boolean;
+    readonly interiorProbeInside: boolean;
+    readonly silhouette: GraphDefaultNodeSilhouette;
+}
+/**
  * World-space endpoints read from a default Line geometry after its local
  * positions have been transformed through the Line's current world matrix.
  * When either end uses a renderer-owned flat body, the corresponding endpoint
@@ -41,8 +53,12 @@ export interface GraphAmbientMotionLinkEndpointObservation {
     readonly end: GraphAmbientMotionPosition;
     readonly id: string;
     readonly sourceId: string;
+    /** Renderer-owned source-body trim proof, or null for a custom source. */
+    readonly sourceBoundary?: GraphAmbientMotionLinkEndpointBoundaryObservation | null;
     readonly start: GraphAmbientMotionPosition;
     readonly targetId: string;
+    /** Renderer-owned target-body trim proof, or null for a custom target. */
+    readonly targetBoundary?: GraphAmbientMotionLinkEndpointBoundaryObservation | null;
 }
 export interface GraphAmbientMotionParticleObservation {
     readonly id: string;
@@ -137,8 +153,11 @@ export interface GraphRenderDefaultNodeBodyObservation {
 export interface GraphRenderNodeObservation extends GraphRenderObjectObservation {
     /** Default node body's current material color, or null for custom objects. */
     readonly bodyMaterialColor: string | null;
-    /** Default flat body identity, or null when a host supplied the node object. */
-    readonly defaultBody: GraphRenderDefaultNodeBodyObservation | null;
+    /**
+     * Default flat body identity, or null when a host supplied the node object.
+     * Optional so existing custom renderer observations remain source-compatible.
+     */
+    readonly defaultBody?: GraphRenderDefaultNodeBodyObservation | null;
     /** Scene-level Sprite label, anchored above the node and camera-facing. */
     readonly label: GraphRenderNodeLabelObservation;
     /** Renderer-local position used for perspective and distance cues. */
