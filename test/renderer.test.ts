@@ -27,7 +27,7 @@ vi.mock("3d-force-graph", () => ({
 }));
 
 import { createRenderGraphData } from "../src/layout.js";
-import { createThreeForceGraphRenderer } from "../src/renderer.js";
+import { createDefaultGraphNodeObject, createThreeForceGraphRenderer } from "../src/renderer.js";
 import type { GraphInput } from "../src/contract.js";
 import { graphFixture } from "./fixtures.js";
 
@@ -306,6 +306,43 @@ function expectAllNodeBoundsWithinViewport(
   });
 }
 
+function projectedEndpointInBodyCoordinates(
+  body: Mesh,
+  endpoint: Coordinates,
+  camera: Coordinates,
+): Vector3 {
+  body.updateWorldMatrix(true, false);
+  const origin = body.localToWorld(new Vector3());
+  const axisX = body.localToWorld(new Vector3(1, 0, 0)).sub(origin);
+  const axisY = body.localToWorld(new Vector3(0, 1, 0)).sub(origin);
+  const normal = axisX.cross(axisY).normalize();
+  const ray = new Vector3(endpoint.x - camera.x, endpoint.y - camera.y, endpoint.z - camera.z);
+  const denominator = ray.dot(normal);
+  if (Math.abs(denominator) < 0.0001) throw new Error("Expected endpoint ray to meet a default body plane");
+  const progress = origin.clone().sub(camera).dot(normal) / denominator;
+  return body.worldToLocal(ray.multiplyScalar(progress).add(camera));
+}
+
+function expectEndpointOnDefaultBodyBoundary(
+  body: Mesh,
+  endpoint: Coordinates,
+  camera: Coordinates,
+): void {
+  body.geometry.computeBoundingBox();
+  const bounds = body.geometry.boundingBox!;
+  const point = projectedEndpointInBodyCoordinates(body, endpoint, camera);
+  const radius = bounds.max.y;
+  if (body.userData.graphDefaultNodeSilhouette === "capsule") {
+    const halfStraight = Math.max(0, bounds.max.x - radius);
+    const boundaryRadius = Math.abs(point.x) <= halfStraight
+      ? Math.abs(point.y)
+      : Math.hypot(Math.abs(point.x) - halfStraight, point.y);
+    expect(boundaryRadius).toBeCloseTo(radius, 2);
+    return;
+  }
+  expect(Math.hypot(point.x, point.y)).toBeCloseTo(radius, 2);
+}
+
 describe("Three.js camera transitions", () => {
   const frames = new Map<number, FrameRequestCallback>();
   const cancelledFrames: number[] = [];
@@ -530,7 +567,7 @@ describe("Three.js camera transitions", () => {
     expect(secondParticle.screenY).not.toBeNull();
   });
 
-  it("attaches focused default links to the actual world positions of ambient node objects", () => {
+  it("clips focused default curves at the live camera-facing node boundaries", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
@@ -591,15 +628,28 @@ describe("Three.js camera transitions", () => {
     const ambient = renderer.getAmbientMotionObservation!()!;
     const endpoint = ambient.linkEndpoints.find((candidate) => candidate.id === "api-web")!;
 
-    expect(lineEndpointInWorld(0).distanceTo(sourceWorld)).toBeLessThan(0.0001);
-    expect(lineEndpointInWorld(positions.count - 1).distanceTo(targetWorld)).toBeLessThan(0.0001);
-    expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z).distanceTo(sourceWorld)).toBeLessThan(0.0001);
-    expect(new Vector3(endpoint.end.x, endpoint.end.y, endpoint.end.z).distanceTo(targetWorld)).toBeLessThan(0.0001);
-    const renderedNodes = new Map(ambient.renderedNodePositions.map((node) => [node.id, node]));
-    const renderedSource = renderedNodes.get(endpoint.sourceId)!;
-    const renderedTarget = renderedNodes.get(endpoint.targetId)!;
-    expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z).distanceTo(renderedSource)).toBeLessThan(0.0001);
-    expect(new Vector3(endpoint.end.x, endpoint.end.y, endpoint.end.z).distanceTo(renderedTarget)).toBeLessThan(0.0001);
+    expect(lineEndpointInWorld(0).distanceTo(sourceWorld)).toBeGreaterThan(0.1);
+    expect(lineEndpointInWorld(positions.count - 1).distanceTo(targetWorld)).toBeGreaterThan(0.1);
+    expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z).distanceTo(lineEndpointInWorld(0))).toBeLessThan(0.0001);
+    expect(new Vector3(endpoint.end.x, endpoint.end.y, endpoint.end.z).distanceTo(lineEndpointInWorld(positions.count - 1))).toBeLessThan(0.0001);
+    const sourceBody = source.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
+    const targetBody = target.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
+    expectEndpointOnDefaultBodyBoundary(sourceBody, endpoint.start, graph.pose.position);
+    expectEndpointOnDefaultBodyBoundary(targetBody, endpoint.end, graph.pose.position);
+
+    const endpointBeforeOrbit = { ...endpoint.start };
+    graph.cameraControls.dispatch("start");
+    graph.pose = {
+      lookAt: { x: 4, y: -3, z: 0 },
+      position: { x: 175, y: 75, z: 230 },
+    };
+    graph.cameraControls.dispatch("change");
+    graph.cameraControls.dispatch("end");
+    const afterOrbit = renderer.getAmbientMotionObservation!()!.linkEndpoints
+      .find((candidate) => candidate.id === "api-web")!;
+    expect(afterOrbit.start).not.toEqual(endpointBeforeOrbit);
+    expectEndpointOnDefaultBodyBoundary(sourceBody, afterOrbit.start, graph.pose.position);
+    expectEndpointOnDefaultBodyBoundary(targetBody, afterOrbit.end, graph.pose.position);
 
     const flow = ambient.particles.find((particle) => particle.linkId === "api-web")!;
     const particleIndex = Number.parseInt(flow.id.slice("flow:".length), 10);
@@ -623,6 +673,95 @@ describe("Three.js camera transitions", () => {
     // transforms. This proves it remains on the rendered tessellated segment,
     // rather than merely agreeing with Bézier endpoints or canvas bounds.
     expect(nearestRenderedSegment).toBeLessThan(0.0001);
+  });
+
+  it("uses each default flat silhouette as a link boundary", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData({
+      layout: { seed: "endpoint-silhouettes" },
+      nodes: [
+        { id: "profile", kind: "profile", label: "Profile", layoutHint: { pinned: true, x: -90, y: 55, z: 0 }, type: "profile" },
+        { id: "workflow", kind: "workflow", label: "Workflow", layoutHint: { pinned: true, x: -90, y: 18, z: 0 }, type: "workflow" },
+        { id: "relation", kind: "relation", label: "Relation", layoutHint: { pinned: true, x: -90, y: -18, z: 0 }, type: "relation" },
+        { id: "leaf", kind: "service", label: "Leaf", layoutHint: { pinned: true, x: -90, y: -55, z: 0 }, type: "component" },
+        { id: "profile-target", kind: "service", label: "Profile target", layoutHint: { pinned: true, x: 90, y: 55, z: 0 }, type: "component" },
+        { id: "workflow-target", kind: "service", label: "Workflow target", layoutHint: { pinned: true, x: 90, y: 18, z: 0 }, type: "component" },
+        { id: "relation-target", kind: "service", label: "Relation target", layoutHint: { pinned: true, x: 90, y: -18, z: 0 }, type: "component" },
+        { id: "relation-second-target", kind: "service", label: "Relation second target", layoutHint: { pinned: true, x: 70, y: -72, z: 0 }, type: "component" },
+        { id: "leaf-target", kind: "service", label: "Leaf target", layoutHint: { pinned: true, x: 90, y: -55, z: 0 }, type: "component" },
+      ],
+      schemaVersion: 1,
+      links: [
+        { id: "profile-link", relationKind: "uses", source: "profile", target: "profile-target" },
+        { id: "workflow-link", relationKind: "uses", source: "workflow", target: "workflow-target" },
+        { id: "relation-link", relationKind: "uses", source: "relation", target: "relation-target" },
+        { id: "relation-second-link", relationKind: "uses", source: "relation", target: "relation-second-target" },
+        { id: "leaf-link", relationKind: "uses", source: "leaf", target: "leaf-target" },
+      ],
+    }, { reducedMotion: true }));
+
+    const expectedSilhouettes = new Map([
+      ["profile-link", "circle"],
+      ["workflow-link", "capsule"],
+      ["relation-link", "disk"],
+      ["leaf-link", "dot"],
+    ]);
+    const endpoints = renderer.getAmbientMotionObservation!()!.linkEndpoints;
+    expectedSilhouettes.forEach((silhouette, linkId) => {
+      const endpoint = endpoints.find((candidate) => candidate.id === linkId)!;
+      const source = graph.nodeObjects.get(endpoint.sourceId)!;
+      const body = source.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
+      expect(body.userData.graphDefaultNodeSilhouette).toBe(silhouette);
+      expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z)
+        .distanceTo(source.getWorldPosition(new Vector3()))).toBeGreaterThan(0.1);
+      expectEndpointOnDefaultBodyBoundary(body, endpoint.start, graph.pose.position);
+    });
+  });
+
+  it("leaves custom node and link factory geometry under host control", () => {
+    const customNode = new Group();
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+      nodeObjectFactory: (node, descriptor) => node.id === "custom-source"
+        ? customNode
+        : createDefaultGraphNodeObject(node, descriptor),
+    });
+    renderer.setData(createRenderGraphData({
+      layout: { seed: "custom-endpoint" },
+      nodes: [
+        { id: "custom-source", kind: "service", label: "Custom", layoutHint: { pinned: true, x: -40, y: 0, z: 0 }, type: "component" },
+        { id: "default-target", kind: "service", label: "Default", layoutHint: { pinned: true, x: 40, y: 0, z: 0 }, type: "component" },
+      ],
+      schemaVersion: 1,
+      links: [{ id: "custom-node-link", relationKind: "uses", source: "custom-source", target: "default-target" }],
+    }, { reducedMotion: true }));
+
+    const endpoint = renderer.getAmbientMotionObservation!()!.linkEndpoints[0]!;
+    expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z))
+      .toEqual(customNode.getWorldPosition(new Vector3()));
+    const defaultTarget = graph.nodeObjects.get("default-target")!;
+    expect(new Vector3(endpoint.end.x, endpoint.end.y, endpoint.end.z)
+      .distanceTo(defaultTarget.getWorldPosition(new Vector3()))).toBeGreaterThan(0.1);
+
+    const hostLink = new Group();
+    const customLinkRenderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+      linkObjectFactory: () => hostLink,
+    });
+    customLinkRenderer.setData(createRenderGraphData(graphFixture, { reducedMotion: true }));
+    const api = graph.data.nodes.find((node) => node.id === "component:api")!;
+    const web = graph.data.nodes.find((node) => node.id === "component:web")!;
+    expect(graph.linkPositionUpdater!(hostLink, { end: web, start: api }, {
+      id: "api-web",
+      source: api,
+      target: web,
+    })).toBe(false);
+    expect(hostLink.visible).toBe(true);
   });
 
   it("freezes drift and flow for reduced motion, then clears and resumes safely across visibility changes", () => {
@@ -656,12 +795,23 @@ describe("Three.js camera transitions", () => {
     expect(reduced.particles).toEqual([]);
     expect(reduced.anchorNodePositions).toEqual(reduced.renderedNodePositions);
     expect(reduced.linkEndpoints).toHaveLength(graphFixture.links.length);
-    const reducedNodes = new Map(reduced.renderedNodePositions.map((node) => [node.id, node]));
     reduced.linkEndpoints.forEach((endpoint) => {
-      const source = reducedNodes.get(endpoint.sourceId)!;
-      const target = reducedNodes.get(endpoint.targetId)!;
-      expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z).distanceTo(source)).toBeLessThan(0.0001);
-      expect(new Vector3(endpoint.end.x, endpoint.end.y, endpoint.end.z).distanceTo(target)).toBeLessThan(0.0001);
+      const source = graph.nodeObjects.get(endpoint.sourceId)!;
+      const target = graph.nodeObjects.get(endpoint.targetId)!;
+      const sourceCenter = source.getWorldPosition(new Vector3());
+      const targetCenter = target.getWorldPosition(new Vector3());
+      expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z).distanceTo(sourceCenter)).toBeGreaterThan(0.1);
+      expect(new Vector3(endpoint.end.x, endpoint.end.y, endpoint.end.z).distanceTo(targetCenter)).toBeGreaterThan(0.1);
+      expectEndpointOnDefaultBodyBoundary(
+        source.children.find((child) => child.userData.graphVisualRole === "body") as Mesh,
+        endpoint.start,
+        graph.pose.position,
+      );
+      expectEndpointOnDefaultBodyBoundary(
+        target.children.find((child) => child.userData.graphVisualRole === "body") as Mesh,
+        endpoint.end,
+        graph.pose.position,
+      );
     });
   });
 

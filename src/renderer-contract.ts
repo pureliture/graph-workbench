@@ -42,6 +42,9 @@ export interface GraphAmbientMotionLinkFlowObservation {
 /**
  * World-space endpoints read from a default Line geometry after its local
  * positions have been transformed through the Line's current world matrix.
+ * When either end uses a renderer-owned flat body, the corresponding endpoint
+ * is clipped at that body's camera-facing silhouette boundary; custom-node
+ * ends retain their factory-owned world center.
  */
 export interface GraphAmbientMotionLinkEndpointObservation {
   readonly end: GraphAmbientMotionPosition;
@@ -67,7 +70,8 @@ export interface GraphAmbientMotionParticleObservation {
  * Read-only renderer evidence for visual motion. `anchorNodePositions` are
  * the selection/layout coordinates before micro motion; `renderedNodePositions`
  * are the live world-space positions of the rendered node objects. Default Line
- * endpoints remain available in reduced-motion mode while flow particles pause.
+ * endpoints remain available in reduced-motion mode while flow particles pause,
+ * including their current camera-facing silhouette clip.
  */
 export interface GraphAmbientMotionObservation {
   readonly active: boolean;

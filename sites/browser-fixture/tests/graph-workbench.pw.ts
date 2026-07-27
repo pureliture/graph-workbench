@@ -598,22 +598,42 @@ function ambientScreenPosition(frame: AmbientMotionFrame, nodeId: string) {
   return position;
 }
 
-function expectLinkEndpointsAttachedToRenderedNodes(
+function expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
   frame: AmbientMotionFrame,
+  render: ObservedRenderTelemetry["observation"],
   linkIds: readonly string[],
   focusedNodeId?: string,
 ): void {
   const endpointsById = new Map(frame.linkEndpoints.map((endpoint) => [endpoint.id, endpoint]));
+  const linksById = new Map(render.links.map((link) => [link.id, link]));
+  const nodesById = new Map(render.nodes.map((node) => [node.id, node]));
   for (const linkId of linkIds) {
+    const link = linksById.get(linkId);
+    if (!link) throw new Error(`${linkId} was absent from the live renderer observation.`);
+    // The fixture uses the renderer-owned tessellated default Line. A host
+    // factory can return a different object with no curve observation, which
+    // remains outside this default-geometry contract.
+    if (link.curvePointCount === null) continue;
+    expect(link).toMatchObject({ objectTracked: true, objectVisible: true, sceneAttached: true });
     const endpoint = endpointsById.get(linkId);
     if (!endpoint) throw new Error(`${linkId} did not expose live default Line endpoints.`);
     if (focusedNodeId) {
       expect([endpoint.sourceId, endpoint.targetId]).toContain(focusedNodeId);
     }
-    expect(spatialDistance(endpoint.start, ambientPosition(frame, endpoint.sourceId, "renderedNodePositions")))
-      .toBeLessThan(0.001);
-    expect(spatialDistance(endpoint.end, ambientPosition(frame, endpoint.targetId, "renderedNodePositions")))
-      .toBeLessThan(0.001);
+    for (const [nodeId, endpointPosition] of [
+      [endpoint.sourceId, endpoint.start],
+      [endpoint.targetId, endpoint.end],
+    ] as const) {
+      const node = nodesById.get(nodeId);
+      if (!node) throw new Error(`${nodeId} was absent from the live renderer observation.`);
+      // Default flat bodies are clipped at the renderer-owned silhouette
+      // boundary. Custom node factories own their geometry, so a null body is
+      // intentionally not constrained by this assertion.
+      if (node.defaultBody === null) continue;
+      expect(node).toMatchObject({ objectTracked: true, objectVisible: true, sceneAttached: true });
+      expect(spatialDistance(endpointPosition, ambientPosition(frame, nodeId, "renderedNodePositions")))
+        .toBeGreaterThan(0.1);
+    }
   }
 }
 
@@ -1099,12 +1119,25 @@ test("actual WebGL scene exposes semantic default node colors across system them
   await page.emulateMedia({ colorScheme: "dark" });
   await openFixture(page);
 
-  const dark = (await waitForRenderObservation(page)).observation.nodes;
+  const darkRender = (await waitForRenderObservation(page)).observation;
+  const dark = darkRender.nodes;
   const darkColor = (nodeId: string) => dark.find(({ id }) => id === nodeId)?.bodyMaterialColor;
   expect(darkColor("relation:release")).toBe("#fb7185");
   expect(darkColor("profile:platform")).toBe("#a5b4fc");
   expect(darkColor("component:web")).toBe("#f59e0b");
   expect(darkColor("relation:ingest")).toBe("#cbd5e1");
+
+  await selectMatrixNode(page, "relation:release");
+  await waitForSelection(page, "matrix");
+  const darkSelection = await waitForAmbientMotion(page, (motion) => (
+    motion.focusNodeId === "relation:release" && motion.visibleLinkFlow.length > 0
+  ));
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+    darkSelection,
+    (await waitForRenderObservation(page)).observation,
+    ["release-api", "release-profile"],
+    "relation:release",
+  );
 
   await page.emulateMedia({ colorScheme: "light" });
   await expect.poll(async () => {
@@ -1113,11 +1146,20 @@ test("actual WebGL scene exposes semantic default node colors across system them
     return telemetry.observation.nodes.find(({ id }) => id === "profile:platform")?.bodyMaterialColor ?? null;
   }).toBe("#4338ca");
 
-  const light = await waitForRenderObservation(page);
-  const lightColor = (nodeId: string) => light.observation.nodes.find(({ id }) => id === nodeId)?.bodyMaterialColor;
+  const lightRender = await waitForRenderObservation(page);
+  const lightColor = (nodeId: string) => lightRender.observation.nodes.find(({ id }) => id === nodeId)?.bodyMaterialColor;
   expect(lightColor("relation:release")).toBe("#be123c");
   expect(lightColor("component:web")).toBe("#92400e");
   expect(lightColor("relation:ingest")).toBe("#334155");
+  const lightSelection = await waitForAmbientMotion(page, (motion) => (
+    motion.focusNodeId === "relation:release" && motion.visibleLinkFlow.length > 0
+  ));
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+    lightSelection,
+    lightRender.observation,
+    ["release-api", "release-profile"],
+    "relation:release",
+  );
 });
 
 test("actual WebGL scene attaches profile, workflow, leaf, and relation flat default bodies", async ({ page }) => {
@@ -1250,7 +1292,11 @@ test("actual canvas hover differentiates bounded idle and focus flow particles w
     idle.visibleLinkFlow.some(({ id }) => id === linkId) && Number.isFinite(phase)
   ))).toBe(true);
   expect(idle.linkEndpoints).toHaveLength(fixtureLinkCount);
-  expectLinkEndpointsAttachedToRenderedNodes(idle, idle.linkEndpoints.map(({ id }) => id));
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+    idle,
+    idleRender,
+    idle.linkEndpoints.map(({ id }) => id),
+  );
   const laterIdle = await waitForAmbientMotionAfter(
     page,
     idle.frame,
@@ -1282,6 +1328,13 @@ test("actual canvas hover differentiates bounded idle and focus flow particles w
   expect(hover.visibleParticles.every(({ linkId, phase }) => (
     focusIncidentLinkIds.has(linkId) && Number.isFinite(phase)
   ))).toBe(true);
+  const hoverRender = (await waitForRenderObservation(page)).observation;
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+    hover,
+    hoverRender,
+    [...focusIncidentLinkIds],
+    "relation:query",
+  );
   const laterHover = await waitForAmbientMotionAfterWhileHovering(
     page,
     "relation:query",
@@ -1325,7 +1378,8 @@ test("keeps hovered active link curves attached to rendered node positions acros
   ));
   const activeLinkIds = hover.visibleLinkFlow.filter(({ active }) => active).map(({ id }) => id);
   expect(activeLinkIds).not.toHaveLength(0);
-  expectLinkEndpointsAttachedToRenderedNodes(hover, activeLinkIds, "relation:query");
+  const hoverRender = (await waitForRenderObservation(page)).observation;
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(hover, hoverRender, activeLinkIds, "relation:query");
 
   // The endpoint observation is sampled again after a later renderer frame,
   // rather than comparing the curve to a static layout snapshot. This catches
@@ -1345,7 +1399,7 @@ test("keeps hovered active link curves attached to rendered node positions acros
   expect(laterHover.frame).toBeGreaterThan(hover.frame);
   const laterActiveLinkIds = laterHover.visibleLinkFlow.filter(({ active }) => active).map(({ id }) => id);
   expect(laterActiveLinkIds).not.toHaveLength(0);
-  expectLinkEndpointsAttachedToRenderedNodes(laterHover, laterActiveLinkIds, "relation:query");
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(laterHover, hoverRender, laterActiveLinkIds, "relation:query");
 });
 
 test("observes the master floor and selection-distance opacity in attached scene objects", async ({ page }) => {
@@ -1706,12 +1760,23 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
     .map(({ id }) => id);
   const selectedFocusLinkIds = ["index-query", "query-evidence", "query-vector"];
   expect([...selectedActiveLinkIds].sort()).toEqual([...selectedFocusLinkIds].sort());
-  expectLinkEndpointsAttachedToRenderedNodes(ambientAfterSelection, selectedActiveLinkIds, "relation:query");
+  const selectedRender = (await waitForRenderObservation(page)).observation;
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+    ambientAfterSelection,
+    selectedRender,
+    selectedActiveLinkIds,
+    "relation:query",
+  );
   const laterSelectedActiveLinkIds = ambientLater.visibleLinkFlow
     .filter(({ active }) => active)
     .map(({ id }) => id);
   expect(laterSelectedActiveLinkIds).toEqual(selectedActiveLinkIds);
-  expectLinkEndpointsAttachedToRenderedNodes(ambientLater, laterSelectedActiveLinkIds, "relation:query");
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+    ambientLater,
+    selectedRender,
+    laterSelectedActiveLinkIds,
+    "relation:query",
+  );
   expectFocusedParticleScreenMotion(
     ambientAfterSelection,
     ambientLater,
@@ -1862,6 +1927,11 @@ test("actual canvas navigation drag preserves the selected public identity", asy
 
   await selectMatrixNode(page, "component:api");
   const beforeSelection = await waitForSelection(page, "matrix");
+  const beforeDrag = await waitForAmbientMotion(page, (motion) => (
+    motion.focusNodeId === "component:api" && motion.visibleLinkFlow.some(({ id }) => id === "api-web")
+  ));
+  const render = (await waitForRenderObservation(page)).observation;
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(beforeDrag, render, ["api-web"], "component:api");
 
   await page.mouse.move(box.x + box.width - 32, box.y + box.height - 32);
   await page.mouse.down({ button: "right" });
@@ -1870,6 +1940,13 @@ test("actual canvas navigation drag preserves the selected public identity", asy
 
   await expect(canvas).toBeVisible();
   expect(await readTelemetry<ObservedSelectionState>(page, "graph-selection")).toEqual(beforeSelection);
+  const afterDrag = await waitForAmbientMotionAfter(
+    page,
+    beforeDrag.frame,
+    1,
+    (motion) => motion.focusNodeId === "component:api" && motion.visibleLinkFlow.some(({ id }) => id === "api-web"),
+  );
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(afterDrag, render, ["api-web"], "component:api");
 });
 
 test("reduced motion reaches the same public selection target and deterministic layout", async ({ browser }) => {
@@ -1884,7 +1961,8 @@ test("reduced motion reaches the same public selection target and deterministic 
     motion.active && !motion.reducedMotion && motion.focusNodeId === "component:web"
   ));
   const laterNormalAmbient = await waitForAmbientMotionAfter(normalPage, normalAmbient.frame, 12);
-  const normalBodies = (await waitForRenderObservation(normalPage)).observation.nodes
+  const normalRender = (await waitForRenderObservation(normalPage)).observation;
+  const normalBodies = normalRender.nodes
     .filter(({ id }) => ["profile:platform", "relation:release", "relation:orchestrate", "relation:ingest"].includes(id))
     .map(({ defaultBody, id }) => ({ defaultBody, id }));
 
@@ -1897,7 +1975,8 @@ test("reduced motion reaches the same public selection target and deterministic 
   const reducedAmbient = await waitForAmbientMotion(reducedPage, (motion) => (
     motion.reducedMotion && !motion.active && motion.focusNodeId === "component:web"
   ));
-  const reducedBodies = (await waitForRenderObservation(reducedPage)).observation.nodes
+  const reducedRender = (await waitForRenderObservation(reducedPage)).observation;
+  const reducedBodies = reducedRender.nodes
     .filter(({ id }) => ["profile:platform", "relation:release", "relation:orchestrate", "relation:ingest"].includes(id))
     .map(({ defaultBody, id }) => ({ defaultBody, id }));
 
@@ -1927,8 +2006,14 @@ test("reduced motion reaches the same public selection target and deterministic 
   expect(reducedAmbient.anchorNodePositions).toEqual(normalAmbient.anchorNodePositions);
   expect(reducedAmbient.renderedNodePositions).toEqual(reducedAmbient.anchorNodePositions);
   expect(reducedAmbient.linkEndpoints).toHaveLength(fixtureLinkCount);
-  expectLinkEndpointsAttachedToRenderedNodes(
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+    normalAmbient,
+    normalRender,
+    normalAmbient.linkEndpoints.map(({ id }) => id),
+  );
+  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
     reducedAmbient,
+    reducedRender,
     reducedAmbient.linkEndpoints.map(({ id }) => id),
   );
   expect(reducedAmbient.visibleLinkFlow).toHaveLength(0);

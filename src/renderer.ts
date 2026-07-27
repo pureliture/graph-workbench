@@ -190,6 +190,8 @@ const IDLE_FLOW_PARTICLE_SCALE = 0.22;
 const INTERACTION_FLOW_PARTICLE_SCALE = 0.72;
 const MAX_FLOW_PARTICLES = 12;
 const DEFAULT_LINK_CURVE_SEGMENTS = 28;
+const DEFAULT_LINK_BOUNDARY_SCAN_STEPS = 28;
+const DEFAULT_LINK_BOUNDARY_BISECTION_STEPS = 12;
 const AMBIENT_VISUAL_EPSILON = 0.0001;
 const AMBIENT_MASTER_BODY_OPACITY_FLOOR = 0.5;
 const AMBIENT_MASTER_LABEL_OPACITY_FLOOR = 0.5;
@@ -326,8 +328,33 @@ function createDefaultNodeGeometry(silhouette: DefaultNodeSilhouetteSpec): Buffe
 function makeCameraFacingFlatMesh(mesh: Mesh): void {
   const cameraWorldQuaternion = new Quaternion();
   const parentWorldQuaternion = new Quaternion();
-  mesh.onBeforeRender = (_renderer, _scene, camera) => {
-    camera.getWorldQuaternion(cameraWorldQuaternion);
+  const fallbackCamera = new Object3D();
+  const updateFacing = (camera: unknown, fallbackPose?: CameraPose): void => {
+    if (camera && typeof camera === "object" && "getWorldQuaternion" in camera
+      && typeof camera.getWorldQuaternion === "function") {
+      camera.getWorldQuaternion(cameraWorldQuaternion);
+    } else if (fallbackPose && [
+      fallbackPose.position.x,
+      fallbackPose.position.y,
+      fallbackPose.position.z,
+      fallbackPose.lookAt.x,
+      fallbackPose.lookAt.y,
+      fallbackPose.lookAt.z,
+    ].every(Number.isFinite)) {
+      fallbackCamera.position.set(
+        fallbackPose.position.x,
+        fallbackPose.position.y,
+        fallbackPose.position.z,
+      );
+      fallbackCamera.lookAt(
+        fallbackPose.lookAt.x,
+        fallbackPose.lookAt.y,
+        fallbackPose.lookAt.z,
+      );
+      cameraWorldQuaternion.copy(fallbackCamera.quaternion);
+    } else {
+      return;
+    }
     if (!mesh.parent) {
       mesh.quaternion.copy(cameraWorldQuaternion);
     } else {
@@ -341,6 +368,10 @@ function makeCameraFacingFlatMesh(mesh: Mesh): void {
     // `matrixWorld`. The new local quaternion must therefore be propagated in
     // this same callback before the renderer derives modelViewMatrix.
     mesh.updateWorldMatrix(true, false);
+  };
+  mesh.userData.graphCameraFacingUpdate = updateFacing;
+  mesh.onBeforeRender = (_renderer, _scene, camera) => {
+    updateFacing(camera);
   };
 }
 
@@ -655,6 +686,25 @@ function writeQuadraticCurve(
   bendDirection: number,
   start: { x: number; y: number; z: number },
   end: { x: number; y: number; z: number },
+  startProgress = 0,
+  endProgress = 1,
+): void {
+  const lastIndex = Math.max(1, positions.count - 1);
+  const point = new Vector3();
+  for (let index = 0; index < positions.count; index += 1) {
+    const progress = startProgress + ((endProgress - startProgress) * (index / lastIndex));
+    pointOnQuadraticCurve(start, end, bendDirection, progress, point);
+    positions.setXYZ(index, point.x, point.y, point.z);
+  }
+  positions.needsUpdate = true;
+}
+
+function pointOnQuadraticCurve(
+  start: { x: number; y: number; z: number },
+  end: { x: number; y: number; z: number },
+  bendDirection: number,
+  progress: number,
+  output: { x: number; y: number; z: number },
 ): void {
   const deltaX = end.x - start.x;
   const deltaY = end.y - start.y;
@@ -665,18 +715,11 @@ function writeQuadraticCurve(
   const controlX = ((start.x + end.x) / 2) + (-directionY * curve * bendDirection);
   const controlY = ((start.y + end.y) / 2) + (directionX * curve * bendDirection);
   const controlZ = ((start.z + end.z) / 2) + (curve * 0.32 * bendDirection);
-  const lastIndex = Math.max(1, positions.count - 1);
-  for (let index = 0; index < positions.count; index += 1) {
-    const t = index / lastIndex;
-    const inverse = 1 - t;
-    positions.setXYZ(
-      index,
-      (inverse * inverse * start.x) + (2 * inverse * t * controlX) + (t * t * end.x),
-      (inverse * inverse * start.y) + (2 * inverse * t * controlY) + (t * t * end.y),
-      (inverse * inverse * start.z) + (2 * inverse * t * controlZ) + (t * t * end.z),
-    );
-  }
-  positions.needsUpdate = true;
+  const t = Math.max(0, Math.min(1, progress));
+  const inverse = 1 - t;
+  output.x = (inverse * inverse * start.x) + (2 * inverse * t * controlX) + (t * t * end.x);
+  output.y = (inverse * inverse * start.y) + (2 * inverse * t * controlY) + (t * t * end.y);
+  output.z = (inverse * inverse * start.z) + (2 * inverse * t * controlZ) + (t * t * end.z);
 }
 
 function pointOnRenderedCurve(
@@ -703,6 +746,8 @@ function updateLinkObject(object: Object3D, start: { x: number; y: number; z: nu
     ? object.userData.graphCurveBendDirection
     : 1;
   writeQuadraticCurve(positions, bendDirection, start, end);
+  object.visible = true;
+  object.userData.graphDefaultLinkHasVisibleCurve = true;
   object.geometry.computeBoundingSphere();
   return true;
 }
@@ -1012,6 +1057,7 @@ interface AmbientLinkState {
 
 interface AmbientDefaultNodeVisual {
   readonly baseLabelScale: Coordinates;
+  readonly body: Mesh;
   readonly bodyMaterial: MeshBasicMaterial;
   readonly label: Sprite;
   readonly labelMaterial: SpriteMaterial;
@@ -1221,6 +1267,13 @@ export function createThreeForceGraphRenderer({
   const linkEndLocalPosition = new Vector3();
   const curvePointLocalPosition = new Vector3();
   const curvePointWorldPosition = new Vector3();
+  const linkBoundaryPlaneOrigin = new Vector3();
+  const linkBoundaryPlaneXAxis = new Vector3();
+  const linkBoundaryPlaneYAxis = new Vector3();
+  const linkBoundaryPlaneNormal = new Vector3();
+  const linkBoundaryRayDirection = new Vector3();
+  const linkBoundaryIntersection = new Vector3();
+  const linkBoundaryBodyLocalPosition = new Vector3();
   const particleLocalPosition = new Vector3();
   const lineEndpointWorldPosition = new Vector3();
   const flowParticles: FlowParticle[] = Array.from({ length: MAX_FLOW_PARTICLES }, (_unused, index) => {
@@ -1419,6 +1472,7 @@ export function createThreeForceGraphRenderer({
     if (!(label instanceof Sprite) || !(label.material instanceof SpriteMaterial)) return;
     state.defaultVisual = {
       baseLabelScale: staticLabelBaseScale(label),
+      body,
       bodyMaterial: body.material,
       label,
       labelMaterial: label.material,
@@ -1870,14 +1924,224 @@ export function createThreeForceGraphRenderer({
     return object.worldToLocal(output);
   }
 
+  function defaultNodeBody(state: AmbientNodeState | null): Mesh | null {
+    if (!state) return null;
+    const object = renderedNodeObjects.get(state.id) ?? state.object;
+    if (object?.userData.graphDefaultNodeObject !== true) return null;
+    cacheAmbientDefaultNodeVisual(state);
+    const body = state.defaultVisual?.body;
+    if (!body) return null;
+    const updateFacing = body.userData.graphCameraFacingUpdate;
+    if (typeof updateFacing === "function") updateFacing(graph.camera(), cameraPose());
+    body.updateWorldMatrix(true, false);
+    return body;
+  }
+
+  function defaultNodeSilhouetteContainsLocalPoint(
+    silhouette: DefaultNodeSilhouetteSpec,
+    point: Vector3,
+  ): boolean {
+    const radius = silhouette.height / 2;
+    if (silhouette.kind !== "capsule") {
+      return point.x * point.x + point.y * point.y <= radius * radius;
+    }
+    const halfStraight = Math.max(0, (silhouette.width / 2) - radius);
+    if (Math.abs(point.x) <= halfStraight) return Math.abs(point.y) <= radius;
+    const capCenterX = point.x < 0 ? -halfStraight : halfStraight;
+    const capOffsetX = point.x - capCenterX;
+    return (capOffsetX * capOffsetX) + (point.y * point.y) <= radius * radius;
+  }
+
+  function curvePointProjectsInsideDefaultNode(
+    body: Mesh,
+    silhouette: DefaultNodeSilhouetteSpec,
+    camera: CameraPose,
+    point: Vector3,
+  ): boolean | null {
+    if (![point.x, point.y, point.z].every(Number.isFinite)) return null;
+    linkBoundaryPlaneOrigin.set(0, 0, 0);
+    body.localToWorld(linkBoundaryPlaneOrigin);
+    linkBoundaryPlaneXAxis.set(1, 0, 0);
+    body.localToWorld(linkBoundaryPlaneXAxis).sub(linkBoundaryPlaneOrigin);
+    linkBoundaryPlaneYAxis.set(0, 1, 0);
+    body.localToWorld(linkBoundaryPlaneYAxis).sub(linkBoundaryPlaneOrigin);
+    linkBoundaryPlaneNormal.crossVectors(linkBoundaryPlaneXAxis, linkBoundaryPlaneYAxis);
+    if (linkBoundaryPlaneNormal.lengthSq() <= AMBIENT_VISUAL_EPSILON) return null;
+    linkBoundaryPlaneNormal.normalize();
+    linkBoundaryRayDirection.set(
+      point.x - camera.position.x,
+      point.y - camera.position.y,
+      point.z - camera.position.z,
+    );
+    const denominator = linkBoundaryRayDirection.dot(linkBoundaryPlaneNormal);
+    if (Math.abs(denominator) <= AMBIENT_VISUAL_EPSILON) return null;
+    const planeProgress = (
+      ((linkBoundaryPlaneOrigin.x - camera.position.x) * linkBoundaryPlaneNormal.x)
+      + ((linkBoundaryPlaneOrigin.y - camera.position.y) * linkBoundaryPlaneNormal.y)
+      + ((linkBoundaryPlaneOrigin.z - camera.position.z) * linkBoundaryPlaneNormal.z)
+    ) / denominator;
+    if (!Number.isFinite(planeProgress) || planeProgress <= 0) return null;
+    linkBoundaryIntersection.set(
+      camera.position.x + (linkBoundaryRayDirection.x * planeProgress),
+      camera.position.y + (linkBoundaryRayDirection.y * planeProgress),
+      camera.position.z + (linkBoundaryRayDirection.z * planeProgress),
+    );
+    linkBoundaryBodyLocalPosition.copy(linkBoundaryIntersection);
+    body.worldToLocal(linkBoundaryBodyLocalPosition);
+    return defaultNodeSilhouetteContainsLocalPoint(silhouette, linkBoundaryBodyLocalPosition);
+  }
+
+  function curvePointInsideDefaultNode(
+    object: Line,
+    start: Coordinates,
+    end: Coordinates,
+    bendDirection: number,
+    progress: number,
+    body: Mesh,
+    silhouette: DefaultNodeSilhouetteSpec,
+    camera: CameraPose,
+  ): boolean | null {
+    pointOnQuadraticCurve(start, end, bendDirection, progress, curvePointLocalPosition);
+    curvePointWorldPosition.copy(curvePointLocalPosition);
+    object.localToWorld(curvePointWorldPosition);
+    return curvePointProjectsInsideDefaultNode(body, silhouette, camera, curvePointWorldPosition);
+  }
+
+  function firstCurveProgressOutsideDefaultNode(
+    object: Line,
+    start: Coordinates,
+    end: Coordinates,
+    bendDirection: number,
+    body: Mesh,
+    silhouette: DefaultNodeSilhouetteSpec,
+    camera: CameraPose,
+  ): number | null {
+    const initial = curvePointInsideDefaultNode(object, start, end, bendDirection, 0, body, silhouette, camera);
+    if (initial === null) return null;
+    if (!initial) return 0;
+    let previous = 0;
+    for (let index = 1; index <= DEFAULT_LINK_BOUNDARY_SCAN_STEPS; index += 1) {
+      const current = index / DEFAULT_LINK_BOUNDARY_SCAN_STEPS;
+      const inside = curvePointInsideDefaultNode(object, start, end, bendDirection, current, body, silhouette, camera);
+      if (inside === null) return null;
+      if (inside) {
+        previous = current;
+        continue;
+      }
+      let lower = previous;
+      let upper = current;
+      for (let iteration = 0; iteration < DEFAULT_LINK_BOUNDARY_BISECTION_STEPS; iteration += 1) {
+        const midpoint = (lower + upper) / 2;
+        const midpointInside = curvePointInsideDefaultNode(
+          object, start, end, bendDirection, midpoint, body, silhouette, camera,
+        );
+        if (midpointInside === null) return null;
+        if (midpointInside) lower = midpoint;
+        else upper = midpoint;
+      }
+      return upper;
+    }
+    return 1;
+  }
+
+  function firstCurveProgressInsideDefaultNodeFromEnd(
+    object: Line,
+    start: Coordinates,
+    end: Coordinates,
+    bendDirection: number,
+    body: Mesh,
+    silhouette: DefaultNodeSilhouetteSpec,
+    camera: CameraPose,
+  ): number | null {
+    const terminal = curvePointInsideDefaultNode(object, start, end, bendDirection, 1, body, silhouette, camera);
+    if (terminal === null) return null;
+    if (!terminal) return 1;
+    let previous = 1;
+    for (let index = DEFAULT_LINK_BOUNDARY_SCAN_STEPS - 1; index >= 0; index -= 1) {
+      const current = index / DEFAULT_LINK_BOUNDARY_SCAN_STEPS;
+      const inside = curvePointInsideDefaultNode(object, start, end, bendDirection, current, body, silhouette, camera);
+      if (inside === null) return null;
+      if (inside) {
+        previous = current;
+        continue;
+      }
+      let lower = current;
+      let upper = previous;
+      for (let iteration = 0; iteration < DEFAULT_LINK_BOUNDARY_BISECTION_STEPS; iteration += 1) {
+        const midpoint = (lower + upper) / 2;
+        const midpointInside = curvePointInsideDefaultNode(
+          object, start, end, bendDirection, midpoint, body, silhouette, camera,
+        );
+        if (midpointInside === null) return null;
+        if (midpointInside) upper = midpoint;
+        else lower = midpoint;
+      }
+      return upper;
+    }
+    return 0;
+  }
+
+  function updateDefaultLinkObjectWithBoundaryTrim(
+    object: Object3D,
+    start: Coordinates,
+    end: Coordinates,
+    source: AmbientNodeState | null,
+    target: AmbientNodeState | null,
+  ): boolean {
+    if (!(object instanceof Line) || object.userData.graphDefaultLinkObject !== true) {
+      return updateLinkObject(object, start, end);
+    }
+    const positions = object.geometry.getAttribute("position");
+    if (!positions || positions.itemSize !== 3 || positions.count < 2) return false;
+    const bendDirection = typeof object.userData.graphCurveBendDirection === "number"
+      ? object.userData.graphCurveBendDirection
+      : 1;
+    const sourceBody = defaultNodeBody(source);
+    const targetBody = defaultNodeBody(target);
+    if (!sourceBody && !targetBody) return updateLinkObject(object, start, end);
+    object.updateWorldMatrix(true, false);
+    const camera = cameraPose();
+    const sourceSilhouette = source ? defaultNodeSilhouette(source.node, currentData?.links ?? []) : null;
+    const targetSilhouette = target ? defaultNodeSilhouette(target.node, currentData?.links ?? []) : null;
+    const startProgress = sourceBody && sourceSilhouette
+      ? firstCurveProgressOutsideDefaultNode(
+        object, start, end, bendDirection, sourceBody, sourceSilhouette, camera,
+      )
+      : 0;
+    const endProgress = targetBody && targetSilhouette
+      ? firstCurveProgressInsideDefaultNodeFromEnd(
+        object, start, end, bendDirection, targetBody, targetSilhouette, camera,
+      )
+      : 1;
+    if (startProgress === null || endProgress === null) return updateLinkObject(object, start, end);
+    if (startProgress >= endProgress) {
+      object.visible = false;
+      object.userData.graphDefaultLinkHasVisibleCurve = false;
+      return true;
+    }
+    writeQuadraticCurve(positions, bendDirection, start, end, startProgress, endProgress);
+    object.visible = true;
+    object.userData.graphDefaultLinkHasVisibleCurve = true;
+    object.geometry.computeBoundingSphere();
+    return true;
+  }
+
   function updateLinkObjectFromWorldEndpoints(
     object: Object3D,
     startWorldPosition: Coordinates,
     endWorldPosition: Coordinates,
+    source: AmbientNodeState | null = null,
+    target: AmbientNodeState | null = null,
   ): boolean {
     objectLocalPositionForWorld(object, startWorldPosition, linkStartLocalPosition);
     objectLocalPositionForWorld(object, endWorldPosition, linkEndLocalPosition);
-    return updateLinkObject(object, linkStartLocalPosition, linkEndLocalPosition);
+    return updateDefaultLinkObjectWithBoundaryTrim(
+      object,
+      linkStartLocalPosition,
+      linkEndLocalPosition,
+      source,
+      target,
+    );
   }
 
   function updateLinkObjectForRenderedNodes(
@@ -1895,6 +2159,8 @@ export function createThreeForceGraphRenderer({
       object,
       actualNodeWorldPosition(source),
       actualNodeWorldPosition(target),
+      source,
+      target,
     );
   }
 
@@ -1944,7 +2210,13 @@ export function createThreeForceGraphRenderer({
         state.object,
         actualNodeWorldPosition(source),
         actualNodeWorldPosition(target),
+        source,
+        target,
       );
+      if (state.object.userData.graphDefaultLinkHasVisibleCurve !== true) {
+        state.active = false;
+        continue;
+      }
       let opacity: number;
       let width: number;
       if (incident) {
@@ -2392,9 +2664,13 @@ export function createThreeForceGraphRenderer({
   const beginCameraControlInteraction = () => {
     cameraControlInteractionActive = true;
     cancelCameraTransition();
+    applyAmbientVisuals();
   };
   const updateCameraControlInteraction = () => {
     if (cameraControlInteractionActive) cancelCameraTransition();
+    // Reduced motion intentionally has no RAF. Orbit changes must still
+    // recompute the camera-facing boundary clip before the next render.
+    applyAmbientVisuals();
   };
   const endCameraControlInteraction = () => {
     cameraControlInteractionActive = false;
