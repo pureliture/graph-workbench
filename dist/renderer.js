@@ -1366,12 +1366,21 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 width = Math.max(selectedFocus ? 1.18 : 1.02, state.baseWidth);
             }
             else if (idleFlow) {
-                opacity = Math.min(0.13, Math.max(0.075, state.baseOpacity * 0.32));
-                width = Math.max(0.58, Math.min(0.72, state.baseWidth * 0.58));
+                opacity = Math.min(0.2, Math.max(0.16, state.baseOpacity * 1.15));
+                width = Math.max(0.85, Math.min(0.92, state.baseWidth * 1.05));
             }
-            else {
+            else if (hasFocus) {
+                // A selected or hovered constellation keeps distant edges quiet so
+                // its incident relationships retain the primary reading tier.
                 opacity = Math.min(0.055, state.baseOpacity * 0.22);
                 width = 0.5;
+            }
+            else {
+                // Keep the settled relationship field readable. It remains well below
+                // the hover/selection incident tier, while depth testing preserves the
+                // receding hierarchy of edges behind nearer nodes.
+                opacity = Math.max(0.12, Math.min(0.18, state.baseOpacity));
+                width = Math.max(0.7, Math.min(0.82, state.baseWidth));
             }
             applyAmbientDefaultLinkVisual(state, opacity, width);
             if (!state.active)
