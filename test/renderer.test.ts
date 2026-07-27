@@ -7,8 +7,9 @@ import {
   LineBasicMaterial,
   Mesh,
   MeshBasicMaterial,
-  MeshPhysicalMaterial,
   MeshStandardMaterial,
+  PerspectiveCamera,
+  Quaternion,
   Sprite,
   SpriteMaterial,
   Vector3,
@@ -739,12 +740,12 @@ describe("Three.js camera transitions", () => {
     const body = nodeObject.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
     const label = nodeObject.children.find((child) => child.userData.graphVisualRole === "node-label") as Sprite;
     expect(linkObject).toBeInstanceOf(Line);
-    expect(body.material).toBeInstanceOf(MeshStandardMaterial);
+    expect(body.material).toBeInstanceOf(MeshBasicMaterial);
     expect(label.material).toBeInstanceOf(SpriteMaterial);
     const link = linkObject as Line;
     expect(link.material).toBeInstanceOf(LineBasicMaterial);
 
-    const bodyMaterial = body.material as MeshStandardMaterial;
+    const bodyMaterial = body.material as MeshBasicMaterial;
     const labelMaterial = label.material as SpriteMaterial;
     const linkMaterial = link.material as LineBasicMaterial;
     const particleGroup = graph.sceneRoot.children.find((child) => child.name === "graph-workbench-flow-particles")!;
@@ -755,6 +756,7 @@ describe("Three.js camera transitions", () => {
     const linkGeometry = link.geometry;
     const particleGeometry = particle.geometry;
     const particleMaterial = particle.material;
+    expect(particleGeometry.type).toBe("CircleGeometry");
     const nodeTraverse = vi.spyOn(nodeObject, "traverse");
     const linkTraverse = vi.spyOn(link, "traverse");
     const bodyNeedsUpdateWrites = observeNeedsUpdateWrites(bodyMaterial);
@@ -860,8 +862,15 @@ describe("Three.js camera transitions", () => {
     expect(idleFar.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.22);
     expect(idleNear.minimumVisibleMaterialOpacity).toBeGreaterThan(idleFar.minimumVisibleMaterialOpacity!);
     expect(idleNear.worldScale!.x).toBeGreaterThan(idleFar.worldScale!.x);
-    expect(idleLink.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.18);
+    expect(idleLink.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.22);
     expect(idleLink.visibleMaterialLineWidths).toEqual([0.85]);
+
+    // Reduced motion skips the ambient RAF. The static default-link path must
+    // retain the same readable baseline instead of falling back to layout's
+    // intentionally quieter raw cue.
+    renderer.setData(createRenderGraphData(input, { reducedMotion: true, theme: "dark" }));
+    const reducedIdleLink = renderer.getRenderObservation!()!.links.find((link) => link.id === "api-web")!;
+    expect(reducedIdleLink.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.22);
 
     renderer.setData(createRenderGraphData(input, {
       reducedMotion: true,
@@ -964,16 +973,72 @@ describe("Three.js camera transitions", () => {
       objectTracked: true,
       objectVisible: true,
       sceneAttached: true,
-      position: { id: "component:web", x: 0, y: 6.6, z: 0 },
+      position: { id: "component:web", x: 0, y: 4.8, z: 0 },
       transparent: true,
     });
     expect(selected?.label.scale?.x).toBeGreaterThan(0);
 
     const selectedBody = initialWebObject?.children.find((child) => child instanceof Mesh) as Mesh | undefined;
-    const selectedMaterial = selectedBody?.material as MeshStandardMaterial;
-    expect(selectedMaterial.emissiveIntensity).toBeCloseTo(0.08);
-    expect(selectedMaterial.metalness).toBeCloseTo(0.18);
-    expect(selectedMaterial.roughness).toBeCloseTo(0.62);
+    const selectedMaterial = selectedBody?.material as MeshBasicMaterial;
+    expect(selectedMaterial).toBeInstanceOf(MeshBasicMaterial);
+    expect("emissive" in selectedMaterial).toBe(false);
+    expect("metalness" in selectedMaterial).toBe(false);
+    expect("roughness" in selectedMaterial).toBe(false);
+  });
+
+  it("keeps quiet light-mode selection context readable below incident hierarchy", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const input: GraphInput = {
+      ...graphFixture,
+      nodes: [
+        ...graphFixture.nodes,
+        { id: "concept:docs", type: "concept", kind: "reference", label: "Docs" },
+        { id: "concept:archive", type: "concept", kind: "reference", label: "Archive" },
+      ],
+      links: [
+        ...graphFixture.links,
+        { id: "docs-archive", source: "concept:docs", target: "concept:archive", relationKind: "references" },
+      ],
+    };
+    renderer.setData(createRenderGraphData(input, {
+      selectedNodeIds: ["component:api"],
+      theme: "light",
+    }));
+    runLatestFrame(0);
+
+    const observation = renderer.getRenderObservation!()!;
+    const selectedLink = observation.links.find((link) => link.id === "api-web")!;
+    const quietLink = observation.links.find((link) => link.id === "docs-archive")!;
+    const quietNode = observation.nodes.find((node) => node.id === "concept:docs")!;
+
+    expect(quietNode.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.2);
+    expect(quietNode.label.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.36);
+    expect(quietLink).toMatchObject({
+      minimumVisibleMaterialOpacity: 0.16,
+      visibleMaterialLineWidths: [0.68],
+    });
+    expect(selectedLink.minimumVisibleMaterialOpacity).toBe(0.62);
+    expect(selectedLink.visibleMaterialLineWidths).toEqual([1.25]);
+    expect(selectedLink.minimumVisibleMaterialOpacity).toBeGreaterThan(quietLink.minimumVisibleMaterialOpacity!);
+    expect(selectedLink.visibleMaterialLineWidths[0]).toBeGreaterThan(quietLink.visibleMaterialLineWidths[0]!);
+
+    renderer.setData(createRenderGraphData(input, {
+      reducedMotion: true,
+      selectedNodeIds: ["component:api"],
+      theme: "light",
+    }));
+    const reduced = renderer.getRenderObservation!()!;
+    const reducedQuietLink = reduced.links.find((link) => link.id === "docs-archive")!;
+    const reducedQuietNode = reduced.nodes.find((node) => node.id === "concept:docs")!;
+    expect(reducedQuietNode.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.2);
+    expect(reducedQuietNode.label.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.36);
+    expect(reducedQuietLink).toMatchObject({
+      minimumVisibleMaterialOpacity: 0.16,
+      visibleMaterialLineWidths: [0.68],
+    });
   });
 
   it("moves live node coordinates, labels, links, and camera through one cancellable selection transaction", () => {
@@ -1315,7 +1380,18 @@ describe("Three.js camera transitions", () => {
     renderer.transitionToNode!("component:web", { reducedMotion: true });
 
     const extents = selected.nodes.map((node) => {
-      const bodyRadius = node.type === "relation" ? 7.5 : 3;
+      const degree = selected.links.reduce((count, link) => (
+        count + Number(link.source === node.id) + Number(link.target === node.id)
+      ), 0);
+      const bodyRadius = node.type === "profile"
+        ? 3.8
+        : node.type === "workflow" || node.kind === "workflow"
+          ? 7
+          : degree === 1
+            ? 1.6
+            : node.type === "relation"
+              ? 6.8
+              : 2.8;
       const radius = bodyRadius * 1.16 * (node.id === "component:web" ? 1.22 : 1);
       return {
         maximum: { x: node.x + radius, y: node.y + radius, z: node.z + radius },
@@ -1394,6 +1470,9 @@ describe("Three.js camera transitions", () => {
     const nodeColors = () => Object.fromEntries(
       renderer.getRenderObservation!().nodes.map((node) => [node.id, node.bodyMaterialColor]),
     );
+    const defaultBodies = () => Object.fromEntries(
+      renderer.getRenderObservation!().nodes.map((node) => [node.id, node.defaultBody]),
+    );
 
     renderer.setData(createRenderGraphData(semanticFixture, { theme: "dark" }));
     expect(nodeColors()).toMatchObject({
@@ -1408,6 +1487,14 @@ describe("Three.js camera transitions", () => {
       "profile:ops": "#a5b4fc",
       "relation:release": "#fb7185",
       "relation:unknown": "#cbd5e1",
+    });
+    // The renderer owns this semantic-to-silhouette mapping. A custom factory
+    // reports null instead, so a host never has to reproduce this visual rule.
+    expect(defaultBodies()).toMatchObject({
+      "component:leaf": { kind: "flat-2.5d", silhouette: "dot" },
+      "profile:ops": { kind: "flat-2.5d", silhouette: "circle" },
+      "relation:release": { kind: "flat-2.5d", silhouette: "capsule" },
+      "relation:unknown": { kind: "flat-2.5d", silhouette: "disk" },
     });
     const darkFallback = nodeColors()["concept:hub"];
 
@@ -1451,7 +1538,7 @@ describe("Three.js camera transitions", () => {
     expect(nodeColors()["component:leaf"]).toBe("#1d4ed8");
   });
 
-  it("uses routine-harness light materials without an outline shell or selection ring", () => {
+  it("uses routine-harness flat light materials without an outline shell or selection ring", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -1465,14 +1552,59 @@ describe("Three.js camera transitions", () => {
     const object = graph.nodeObjects.get("component:api")!;
     const body = object.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
     const label = object.children.find((child) => child.userData.graphVisualRole === "node-label") as Mesh;
-    expect((body.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
+    expect(body.material).toBeInstanceOf(MeshBasicMaterial);
+    expect((body.material as MeshBasicMaterial).color.getHexString()).toBe("334155");
     expect((label.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
     expect((label.material as MeshStandardMaterial).transparent).toBe(true);
     expect(object.children.some((child) => child.userData.graphVisualRole === "outline")).toBe(false);
     expect(object.children.some((child) => child.userData.graphVisualRole === "focus-rim")).toBe(false);
   });
 
-  it("keeps physical body finish and same-hue emissive synchronized across palette updates", () => {
+  it("keeps renderer-owned flat bodies camera-facing through nested transforms", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, {}));
+
+    const object = graph.nodeObjects.get("component:api")!;
+    const body = object.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
+    const nestedParent = new Group();
+    nestedParent.position.set(13, -7, 4);
+    nestedParent.rotation.set(0.28, -0.41, 0.17);
+    graph.sceneRoot.add(nestedParent);
+    nestedParent.add(object);
+
+    const camera = new PerspectiveCamera(50, 4 / 3, 0.1, 1_000);
+    camera.position.set(60, 35, 240);
+    camera.lookAt(0, 0, 0);
+    camera.updateMatrixWorld(true);
+    const cameraWorldQuaternion = camera.getWorldQuaternion(new Quaternion());
+    const expectCallbackWorldMatrixToFaceCamera = (mesh: Mesh) => {
+      mesh.onBeforeRender(
+        null as never,
+        graph.sceneRoot as never,
+        camera,
+        mesh.geometry,
+        mesh.material,
+        null as never,
+      );
+      // Decompose the already-built world matrix directly. getWorldQuaternion
+      // would update it during the assertion and hide a stale callback matrix.
+      const renderedWorldQuaternion = new Quaternion();
+      mesh.matrixWorld.decompose(new Vector3(), renderedWorldQuaternion, new Vector3());
+      expect(renderedWorldQuaternion.angleTo(cameraWorldQuaternion)).toBeLessThan(0.000001);
+    };
+
+    expectCallbackWorldMatrixToFaceCamera(body);
+    const particleGroup = graph.sceneRoot.children.find((child) => child.name === "graph-workbench-flow-particles")!;
+    particleGroup.rotation.set(-0.19, 0.24, -0.11);
+    expectCallbackWorldMatrixToFaceCamera(particleGroup.children[0] as Mesh);
+    expect(renderer.getRenderObservation!().nodes.find((node) => node.id === "component:api")?.defaultBody)
+      .toEqual({ kind: "flat-2.5d", silhouette: "circle" });
+  });
+
+  it("keeps flat body colors synchronized across palette updates", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -1481,43 +1613,41 @@ describe("Three.js camera transitions", () => {
       },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
     });
-    const bodyMaterial = (nodeId: string): MeshPhysicalMaterial => {
+    const bodyMaterial = (nodeId: string): MeshBasicMaterial => {
       const object = graph.nodeObjects.get(nodeId)!;
       const body = object.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
-      expect(body.material).toBeInstanceOf(MeshPhysicalMaterial);
-      return body.material as MeshPhysicalMaterial;
+      expect(body.material).toBeInstanceOf(MeshBasicMaterial);
+      return body.material as MeshBasicMaterial;
     };
-    const expectSameHueEmissive = (material: MeshPhysicalMaterial, color: string) => {
-      const expected = new Color(color).multiplyScalar(0.42);
+    const expectFlatColor = (material: MeshBasicMaterial, color: string) => {
       expect(material.color.getHexString()).toBe(new Color(color).getHexString());
-      expect(material.emissive.r).toBeCloseTo(expected.r);
-      expect(material.emissive.g).toBeCloseTo(expected.g);
-      expect(material.emissive.b).toBeCloseTo(expected.b);
+      expect("clearcoat" in material).toBe(false);
+      expect("emissive" in material).toBe(false);
+      expect("metalness" in material).toBe(false);
+      expect("roughness" in material).toBe(false);
     };
 
     renderer.setData(createRenderGraphData(graphFixture, { theme: "dark" }));
     const darkWeb = bodyMaterial("component:web");
-    expect(darkWeb.clearcoat).toBeCloseTo(0.1);
-    expect(darkWeb.clearcoatRoughness).toBeCloseTo(0.76);
-    expectSameHueEmissive(darkWeb, "#f59e0b");
-    expect(bodyMaterial("relation:release").clearcoat).toBeCloseTo(0.15);
+    expectFlatColor(darkWeb, "#f59e0b");
+    expectFlatColor(bodyMaterial("relation:release"), "#fb7185");
 
     renderer.setPresentation({ theme: "light" });
     expect(bodyMaterial("component:web")).toBe(darkWeb);
-    expectSameHueEmissive(darkWeb, "#92400e");
+    expectFlatColor(darkWeb, "#92400e");
 
     renderer.setData(createRenderGraphData(graphFixture, {
       theme: "light",
       nodeDescriptors: { "component:web": { color: "#f0abfc" } },
     }));
     expect(bodyMaterial("component:web")).toBe(darkWeb);
-    expectSameHueEmissive(darkWeb, "#f0abfc");
+    expectFlatColor(darkWeb, "#f0abfc");
 
     renderer.setData(createRenderGraphData(graphFixture, {
       theme: "light",
       nodeDescriptors: { "component:web": { color: "#60a5fa" } },
     }));
-    expectSameHueEmissive(darkWeb, "#60a5fa");
+    expectFlatColor(darkWeb, "#60a5fa");
   });
 
   it("disposes each CanvasTexture glyph mask once with its SpriteMaterial", () => {

@@ -2,20 +2,22 @@ import ForceGraph3D, { type ForceGraph3DInstance } from "3d-force-graph";
 import {
   BufferGeometry,
   CanvasTexture,
+  CircleGeometry,
   Color,
+  DoubleSide,
   Float32BufferAttribute,
   Group,
   Line,
   LineBasicMaterial,
   Mesh,
   MeshBasicMaterial,
-  MeshPhysicalMaterial,
-  MeshStandardMaterial,
   NoColorSpace,
   Object3D,
+  Quaternion,
+  Shape,
+  ShapeGeometry,
   Sprite,
   SpriteMaterial,
-  SphereGeometry,
   Vector3,
 } from "three";
 
@@ -31,7 +33,9 @@ import type {
   GraphAmbientMotionObservation,
   GraphAmbientMotionParticleObservation,
   GraphAmbientMotionScreenPosition,
+  GraphDefaultNodeSilhouette,
   GraphLinkObjectFactory,
+  GraphRenderDefaultNodeBodyObservation,
   GraphRenderLinkObservation,
   GraphRenderNodeObservation,
   GraphRenderNodeLabelObservation,
@@ -55,7 +59,9 @@ export type {
   GraphAmbientMotionObservation,
   GraphAmbientMotionParticleObservation,
   GraphAmbientMotionScreenPosition,
+  GraphDefaultNodeSilhouette,
   GraphRenderLinkObservation,
+  GraphRenderDefaultNodeBodyObservation,
   GraphRenderNodeObservation,
   GraphRenderNodeLabelObservation,
   GraphRenderObjectObservation,
@@ -191,15 +197,24 @@ const AMBIENT_MASTER_LABEL_OPACITY_FLOOR = 0.5;
 // subdued depth tier. Fading them below this would make the sprite invisible,
 // which breaks the graph's persistent node hierarchy.
 const AMBIENT_FAR_LABEL_OPACITY_FLOOR = 0.02;
+// The previous far tier disappears against a white canvas. Keep light-mode
+// context readable without approaching selected or incident emphasis.
+const LIGHT_SELECTED_CONTEXT_FLOOR = Object.freeze({
+  bodyOpacity: 0.2,
+  labelOpacity: 0.36,
+  linkOpacity: 0.16,
+  linkWidth: 0.68,
+});
 // The initial field needs enough mass to establish the graph before a user
 // selects anything. These values retain a visibly softer far tier without
 // making routine-harness's type palette disappear into the dark canvas.
 const IDLE_BODY_OPACITY = Object.freeze({ far: 0.46, nearRange: 0.3 });
 const IDLE_LABEL_OPACITY = Object.freeze({ far: 0.28, nearRange: 0.46 });
-const IDLE_LINK_OPACITY = Object.freeze({ maximum: 0.2, minimum: 0.18 });
+// The quiet field needs to remain independently legible before focus, while
+// still leaving a clear gap to the selected relationship tier (0.58+).
+const IDLE_LINK_OPACITY = Object.freeze({ maximum: 0.28, minimum: 0.22 });
 const IDLE_NODE_SCALE = Object.freeze({ far: 0.86, nearRange: 0.28 });
 const IDLE_LABEL_SCALE = Object.freeze({ far: 0.8, nearRange: 0.2 });
-const NODE_EMISSIVE_COLOR_SCALE = 0.42;
 
 function themePalette(theme: GraphPresentation["theme"]): GraphThemePalette {
   return theme === "light" ? THEME_PALETTES.light : THEME_PALETTES.dark;
@@ -256,9 +271,77 @@ function descriptorForLink(link: RenderLink, supplied: GraphLinkDescriptor | und
 }
 
 function nodeEmissiveIntensity(node: RenderNode): number {
-  // This is a low, same-hue lift rather than a bloom-like glow. The physical
-  // material and scene light still provide the readable depth cue.
+  // This remains part of the long-standing custom-object visual update path.
+  // Renderer-owned defaults use MeshBasicMaterial and therefore ignore it.
   return node.type === "relation" ? 0.1 : 0.08;
+}
+
+interface DefaultNodeSilhouetteSpec {
+  readonly cameraRadius: number;
+  readonly height: number;
+  readonly kind: GraphDefaultNodeSilhouette;
+  readonly labelAnchorY: number;
+  readonly width: number;
+}
+
+function defaultNodeSilhouette(
+  node: RenderNode,
+  links: readonly LinkEndpoints[] = [],
+): DefaultNodeSilhouetteSpec {
+  const visualKind = resolvedNodeVisualKind(node, links);
+  if (visualKind === "profile") {
+    return { cameraRadius: 3.8, height: 7.6, kind: "circle", labelAnchorY: 7.6, width: 7.6 };
+  }
+  if (visualKind === "workflow") {
+    return { cameraRadius: 7, height: 5.8, kind: "capsule", labelAnchorY: 6.8, width: 14 };
+  }
+  if (visualKind === "leaf") {
+    return { cameraRadius: 1.6, height: 3.2, kind: "dot", labelAnchorY: 4.8, width: 3.2 };
+  }
+  if (node.type === "relation") {
+    return { cameraRadius: 6.8, height: 13.6, kind: "disk", labelAnchorY: 10.6, width: 13.6 };
+  }
+  return { cameraRadius: 2.8, height: 5.6, kind: "circle", labelAnchorY: 6.6, width: 5.6 };
+}
+
+function createCapsuleGeometry(width: number, height: number): ShapeGeometry {
+  const radius = height / 2;
+  const halfStraight = Math.max(0, (width / 2) - radius);
+  const shape = new Shape();
+  shape.moveTo(-halfStraight, -radius);
+  shape.lineTo(halfStraight, -radius);
+  shape.absarc(halfStraight, 0, radius, -Math.PI / 2, Math.PI / 2, false);
+  shape.lineTo(-halfStraight, radius);
+  shape.absarc(-halfStraight, 0, radius, Math.PI / 2, (Math.PI * 3) / 2, false);
+  return new ShapeGeometry(shape, 20);
+}
+
+function createDefaultNodeGeometry(silhouette: DefaultNodeSilhouetteSpec): BufferGeometry {
+  if (silhouette.kind === "capsule") {
+    return createCapsuleGeometry(silhouette.width, silhouette.height);
+  }
+  return new CircleGeometry(silhouette.width / 2, silhouette.kind === "dot" ? 16 : 28);
+}
+
+function makeCameraFacingFlatMesh(mesh: Mesh): void {
+  const cameraWorldQuaternion = new Quaternion();
+  const parentWorldQuaternion = new Quaternion();
+  mesh.onBeforeRender = (_renderer, _scene, camera) => {
+    camera.getWorldQuaternion(cameraWorldQuaternion);
+    if (!mesh.parent) {
+      mesh.quaternion.copy(cameraWorldQuaternion);
+    } else {
+      // The default body can be nested under a host or ambient transform. Use
+      // its parent's inverse world rotation so the local flat geometry still
+      // faces the active camera instead of becoming edge-on during orbit/drift.
+      mesh.parent.getWorldQuaternion(parentWorldQuaternion);
+      mesh.quaternion.copy(parentWorldQuaternion.invert().multiply(cameraWorldQuaternion));
+    }
+    // WebGLRenderer reaches this callback after the scene traversal has built
+    // `matrixWorld`. The new local quaternion must therefore be propagated in
+    // this same callback before the renderer derives modelViewMatrix.
+    mesh.updateWorldMatrix(true, false);
+  };
 }
 
 function materialOpacity(material: unknown): number | null {
@@ -444,7 +527,11 @@ function observeGraphObject(
   };
 }
 
-function createNodeLabelSprite(label: string, radius: number, opacity: number): Sprite {
+function createNodeLabelSprite(
+  label: string,
+  silhouette: DefaultNodeSilhouetteSpec,
+  opacity: number,
+): Sprite {
   const text = label.trim() || "Untitled";
   const spriteMaterial = new SpriteMaterial({
     color: THEME_PALETTES.dark.outline,
@@ -494,10 +581,10 @@ function createNodeLabelSprite(label: string, radius: number, opacity: number): 
   }
   const sprite = new Sprite(spriteMaterial);
   sprite.center.set(0.5, 0);
-  sprite.position.set(0, radius + 3.8, 0);
+  sprite.position.set(0, silhouette.labelAnchorY, 0);
   sprite.scale.set(
     Math.max(17, Math.min(58, text.length * 3.05)),
-    radius >= 7 ? 10 : 8,
+    silhouette.kind === "disk" ? 10 : 8,
     1,
   );
   sprite.userData.graphBaseLabelScale = { x: sprite.scale.x, y: sprite.scale.y, z: sprite.scale.z };
@@ -513,28 +600,24 @@ export function createDefaultGraphNodeObject(
   const color = new Color(defaultNodeColor(node, descriptor));
   const opacity = boundedOpacity(descriptor?.opacity, 1);
   const group = new Group();
-  const relation = node.type === "relation";
-  const radius = relation ? 6.8 : 2.8;
-  const bodyMaterial = new MeshPhysicalMaterial({
+  const silhouette = defaultNodeSilhouette(node);
+  const bodyMaterial = new MeshBasicMaterial({
     color,
-    clearcoat: relation ? 0.15 : 0.1,
-    clearcoatRoughness: 0.76,
-    emissive: color.clone().multiplyScalar(NODE_EMISSIVE_COLOR_SCALE),
-    emissiveIntensity: nodeEmissiveIntensity(node),
-    metalness: relation ? 0.3 : 0.18,
     opacity,
-    roughness: relation ? 0.48 : 0.62,
+    side: DoubleSide,
     transparent: opacity < 1,
   });
-  const geometry = new SphereGeometry(radius, relation ? 36 : 28, relation ? 24 : 18);
+  const geometry = createDefaultNodeGeometry(silhouette);
   const body = new Mesh(geometry, bodyMaterial);
   body.userData.graphVisualRole = "body";
+  body.userData.graphDefaultNodeSilhouette = silhouette.kind;
+  makeCameraFacingFlatMesh(body);
   group.add(body);
 
-  // Keep the reference's soft, filled node masses. Selection is carried by
-  // scale, the label and edge hierarchy instead of a permanent outline shell
-  // or a bright halo around the focused node.
-  group.add(createNodeLabelSprite(descriptor?.label ?? node.label, radius, opacity));
+  // Default bodies stay deliberately flat. Depth is expressed through the
+  // renderer's scale and opacity hierarchy rather than scene lighting, gloss,
+  // or a permanent outline/halo around the focused node.
+  group.add(createNodeLabelSprite(descriptor?.label ?? node.label, silhouette, opacity));
   group.userData.graphNodeId = node.id;
   group.userData.graphDefaultNodeObject = true;
   return group;
@@ -929,7 +1012,7 @@ interface AmbientLinkState {
 
 interface AmbientDefaultNodeVisual {
   readonly baseLabelScale: Coordinates;
-  readonly bodyMaterial: MeshStandardMaterial;
+  readonly bodyMaterial: MeshBasicMaterial;
   readonly label: Sprite;
   readonly labelMaterial: SpriteMaterial;
   lastBodyOpacity: number;
@@ -1056,21 +1139,22 @@ function setObjectMaterialColor(object: Object3D | null, color: string): void {
   });
 }
 
-function setDefaultNodeEmissiveColor(object: Object3D | null, color: string): void {
-  if (!object) return;
-  materialsForObject(object).forEach((material) => {
-    if (!material || typeof material !== "object" || !("emissive" in material)) return;
-    const candidate = material.emissive;
-    if (candidate instanceof Color) candidate.set(color).multiplyScalar(NODE_EMISSIVE_COLOR_SCALE);
-  });
-}
-
 function objectMaterialColor(object: Object3D | null): string | null {
   if (!object) return null;
   return materialsForObject(object)
     .map((material) => materialColor(material))
     .find((color): color is string => color !== null)
     ?? null;
+}
+
+function defaultNodeBodyObservation(object: Object3D | undefined): GraphRenderDefaultNodeBodyObservation | null {
+  if (object?.userData.graphDefaultNodeObject !== true) return null;
+  const body = graphChildWithRole(object, "body");
+  const silhouette = body?.userData.graphDefaultNodeSilhouette;
+  if (silhouette !== "capsule" && silhouette !== "circle" && silhouette !== "disk" && silhouette !== "dot") {
+    return null;
+  }
+  return { kind: "flat-2.5d", silhouette };
 }
 
 function setObjectMaterialOpacity(object: Object3D | null, opacity: number): void {
@@ -1124,7 +1208,7 @@ export function createThreeForceGraphRenderer({
   const ambientLinks = new Map<string, AmbientLinkState>();
   const particleGroup = new Group();
   particleGroup.name = "graph-workbench-flow-particles";
-  const particleGeometry = new SphereGeometry(0.65, 8, 6);
+  const particleGeometry = new CircleGeometry(0.65, 12);
   const particleMaterial = new MeshBasicMaterial({
     color: THEME_PALETTES.dark.edge,
     depthTest: true,
@@ -1141,6 +1225,7 @@ export function createThreeForceGraphRenderer({
   const lineEndpointWorldPosition = new Vector3();
   const flowParticles: FlowParticle[] = Array.from({ length: MAX_FLOW_PARTICLES }, (_unused, index) => {
     const object = new Mesh(particleGeometry, particleMaterial);
+    makeCameraFacingFlatMesh(object);
     object.visible = false;
     object.renderOrder = 8;
     particleGroup.add(object);
@@ -1259,9 +1344,32 @@ export function createThreeForceGraphRenderer({
     delete mutable.fz;
   }
 
+  function syncDefaultNodeSilhouette(
+    node: RenderNode,
+    object: Object3D,
+    links: readonly LinkEndpoints[],
+  ): void {
+    if (object.userData.graphDefaultNodeObject !== true) return;
+    const body = graphChildWithRole(object, "body");
+    if (!(body instanceof Mesh)) return;
+    const silhouette = defaultNodeSilhouette(node, links);
+    if (body.userData.graphDefaultNodeSilhouette !== silhouette.kind) {
+      const previousGeometry = body.geometry;
+      body.geometry = createDefaultNodeGeometry(silhouette);
+      body.userData.graphDefaultNodeSilhouette = silhouette.kind;
+      // The renderer owns this body and its generated geometry. Dispose only
+      // the replaced body geometry; factory-return custom objects are never
+      // reshaped or disposed here.
+      previousGeometry.dispose();
+    }
+    const label = graphChildWithRole(object, "node-label");
+    if (label) label.position.y = silhouette.labelAnchorY;
+  }
+
   function applyNodePalette(node: RenderNode): void {
     const object = renderedNodeObjects.get(node.id);
     if (!object || object.userData.graphDefaultNodeObject !== true) return;
+    syncDefaultNodeSilhouette(node, object, currentData?.links ?? []);
     const palette = themePalette(currentPresentation.theme);
     const descriptor = nodeDescriptor(node);
     const bodyColor = defaultNodeColor(node, descriptor, currentPresentation.theme, currentData?.links ?? []);
@@ -1269,9 +1377,6 @@ export function createThreeForceGraphRenderer({
       graphChildWithRole(object, "body"),
       bodyColor,
     );
-    // Descriptor and theme changes must update the same-hue physical lift too;
-    // otherwise a previously rendered semantic color would linger in emissive.
-    setDefaultNodeEmissiveColor(graphChildWithRole(object, "body"), bodyColor);
     setObjectMaterialColor(graphChildWithRole(object, "outline"), palette.outline);
     setObjectMaterialColor(graphChildWithRole(object, "focus-rim"), palette.rim);
     setObjectMaterialColor(graphChildWithRole(object, "node-label"), palette.outline);
@@ -1310,7 +1415,7 @@ export function createThreeForceGraphRenderer({
     if (state.defaultVisual || object?.userData.graphDefaultNodeObject !== true) return;
     const body = graphChildWithRole(object, "body");
     const label = graphChildWithRole(object, "node-label");
-    if (!(body instanceof Mesh) || !(body.material instanceof MeshStandardMaterial)) return;
+    if (!(body instanceof Mesh) || !(body.material instanceof MeshBasicMaterial)) return;
     if (!(label instanceof Sprite) || !(label.material instanceof SpriteMaterial)) return;
     state.defaultVisual = {
       baseLabelScale: staticLabelBaseScale(label),
@@ -1372,7 +1477,7 @@ export function createThreeForceGraphRenderer({
     return !Number.isFinite(previous) || Math.abs(previous - next) > AMBIENT_VISUAL_EPSILON;
   }
 
-  function ensureAmbientTransparency(material: MeshStandardMaterial | LineBasicMaterial, transparent: boolean): void {
+  function ensureAmbientTransparency(material: MeshBasicMaterial | LineBasicMaterial, transparent: boolean): void {
     if (material.transparent === transparent) return;
     material.transparent = transparent;
     // This is a shader flag transition, never part of the stable RAF path.
@@ -1444,10 +1549,12 @@ export function createThreeForceGraphRenderer({
   ): void {
     const object = renderedNodeObjects.get(node.id);
     if (!object) return;
-    updateObjectMaterials(object, {
-      emissiveIntensity: nodeEmissiveIntensity(node),
-      opacity,
-    });
+    updateObjectMaterials(
+      object,
+      object.userData.graphDefaultNodeObject === true
+        ? { opacity }
+        : { emissiveIntensity: nodeEmissiveIntensity(node), opacity },
+    );
     if (object.userData.graphDefaultNodeObject === true) {
       object.scale.setScalar(scale);
     }
@@ -1668,6 +1775,7 @@ export function createThreeForceGraphRenderer({
     const depthRange = Math.max(1, maximumDepth - minimumDepth);
     const selectedNodeId = data.selection.nodeId;
     const focusNodeId = ambientFocusNodeId();
+    const lightSelectedContext = data.presentation.theme === "light" && selectedNodeId !== null;
     for (const state of ambientNodes.values()) {
       if (state.object?.userData.graphDefaultNodeObject !== true) continue;
       const node = state.node;
@@ -1691,6 +1799,9 @@ export function createThreeForceGraphRenderer({
       const opacity = Math.max(
         node.visual.opacityFloor,
         master ? AMBIENT_MASTER_BODY_OPACITY_FLOOR : 0,
+        lightSelectedContext && !selected && !neighbor && !focused
+          ? LIGHT_SELECTED_CONTEXT_FLOOR.bodyOpacity
+          : 0,
         state.baseOpacity * bodyFactor,
       );
       const labelOpacity = selected
@@ -1702,8 +1813,11 @@ export function createThreeForceGraphRenderer({
             : selectedNodeId
             ? Math.max(AMBIENT_FAR_LABEL_OPACITY_FLOOR, 0.02 + (near * 0.24))
               : IDLE_LABEL_OPACITY.far + (near * IDLE_LABEL_OPACITY.nearRange);
+      const readableLabelOpacity = lightSelectedContext && !selected && !neighbor && !focused
+        ? Math.max(labelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity)
+        : labelOpacity;
       const labelVisible = selected || neighbor || focused || master
-        || labelOpacity >= AMBIENT_FAR_LABEL_OPACITY_FLOOR;
+        || readableLabelOpacity >= AMBIENT_FAR_LABEL_OPACITY_FLOOR;
       const viewportScale = Math.max(
         0.82,
         Math.min(1.15, 480 / Math.max(1, Math.min(data.selection.viewport.width, data.selection.viewport.height))),
@@ -1721,7 +1835,7 @@ export function createThreeForceGraphRenderer({
         opacity,
         scale,
         labelVisible,
-        labelOpacity,
+        readableLabelOpacity,
         viewportScale * (selectedNodeId
           ? 0.62 + (near * 0.38)
           : IDLE_LABEL_SCALE.far + (near * IDLE_LABEL_SCALE.nearRange)),
@@ -1844,9 +1958,14 @@ export function createThreeForceGraphRenderer({
         width = Math.max(0.85, Math.min(0.92, state.baseWidth * 1.05));
       } else if (hasFocus) {
         // A selected or hovered constellation keeps distant edges quiet so
-        // its incident relationships retain the primary reading tier.
-        opacity = Math.min(0.055, state.baseOpacity * 0.22);
-        width = 0.5;
+        // its incident relationships retain the primary reading tier. Light
+        // mode receives a context floor against the white canvas; dark mode
+        // retains its intentionally receding background treatment.
+        const lightContext = currentPresentation.theme === "light";
+        opacity = lightContext
+          ? Math.max(LIGHT_SELECTED_CONTEXT_FLOOR.linkOpacity, state.baseOpacity * 0.22)
+          : Math.min(0.055, state.baseOpacity * 0.22);
+        width = lightContext ? LIGHT_SELECTED_CONTEXT_FLOOR.linkWidth : 0.5;
       } else {
         // Keep the settled relationship field readable. It remains well below
         // the hover/selection incident tier, while depth testing preserves the
@@ -1908,24 +2027,49 @@ export function createThreeForceGraphRenderer({
     data.nodes.forEach((node) => {
       const descriptor = nodeDescriptor(node);
       const visual = sceneVisualForNode(node, data, descriptor);
+      const object = renderedNodeObjects.get(node.id);
+      const lightQuietContext = data.presentation.theme === "light"
+        && data.selection.nodeId !== null
+        && data.selection.nodeId !== node.id
+        && !data.selection.neighborNodeIds.includes(node.id)
+        && object?.userData.graphDefaultNodeObject === true;
       applyNodePalette(node);
       applyNodeVisual(
         node,
-        visual.opacity,
+        lightQuietContext ? Math.max(visual.opacity, LIGHT_SELECTED_CONTEXT_FLOOR.bodyOpacity) : visual.opacity,
         visual.scale,
         data.selection.nodeId === node.id ? visual.opacity : 0,
         visual.labelVisible,
-        visual.labelOpacity,
+        lightQuietContext ? Math.max(visual.labelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity) : visual.labelOpacity,
         visual.labelScale,
       );
     });
     data.links.forEach((link) => {
       const descriptor = linkDescriptor(link);
       applyLinkPalette(link);
+      const baseOpacity = boundedOpacity(descriptor.opacity, link.visual.opacity);
+      const object = renderedLinkObjects.get(link.id);
+      const defaultLink = object?.userData.graphDefaultLinkObject === true;
+      const lightQuietContext = data.presentation.theme === "light"
+        && data.selection.nodeId !== null
+        && link.source !== data.selection.nodeId
+        && link.target !== data.selection.nodeId
+        && defaultLink;
+      const opacity = lightQuietContext
+        ? Math.max(LIGHT_SELECTED_CONTEXT_FLOOR.linkOpacity, baseOpacity)
+        : data.selection.nodeId === null && defaultLink
+          ? Math.max(
+            IDLE_LINK_OPACITY.minimum,
+            Math.min(IDLE_LINK_OPACITY.maximum, baseOpacity * 1.4),
+          )
+          : baseOpacity;
+      const width = lightQuietContext
+        ? Math.max(LIGHT_SELECTED_CONTEXT_FLOOR.linkWidth, descriptor.width ?? link.visual.width)
+        : descriptor.width ?? link.visual.width;
       applyLinkVisual(
         link,
-        boundedOpacity(descriptor.opacity, link.visual.opacity),
-        descriptor.width ?? link.visual.width,
+        opacity,
+        width,
       );
     });
   }
@@ -2372,22 +2516,25 @@ export function createThreeForceGraphRenderer({
   function nodeCameraTarget(nodeId: string): CameraPose | null {
     const focused = currentData?.nodes.find((candidate) => candidate.id === nodeId);
     if (!currentData || !focused) return null;
+    const data = currentData;
     const focalPoint = nodePosition(focused);
-    const constellationNodeIds = new Set([nodeId, ...currentData.selection.neighborNodeIds]);
-    const peripheralContextCount = currentData.nodes.reduce(
+    const constellationNodeIds = new Set([nodeId, ...data.selection.neighborNodeIds]);
+    const peripheralContextCount = data.nodes.reduce(
       (count, node) => count + Number(!constellationNodeIds.has(node.id)),
       0,
     );
-    const points = currentData.nodes.flatMap((node): CameraFramingPoint[] => {
+    const points = data.nodes.flatMap((node): CameraFramingPoint[] => {
       const position = nodePosition(node);
       if (!position) return [];
-      const bodyRadius = node.type === "relation" ? 7.5 : 3;
+      // Shape metrics are shared with the default body's label anchor, so a
+      // flat capsule or disk never gets framed as if it were the old sphere.
+      const bodyRadius = defaultNodeSilhouette(node, data.links).cameraRadius;
       const focusScale = node.id === nodeId ? 1.22 : 1;
       // Reserve the renderer-owned micro-motion envelope inside the existing
       // camera padding, including compact portrait framing.
       return [{ ...position, radius: (bodyRadius * 1.16 * focusScale) + AMBIENT_MAX_OFFSET }];
     });
-    const viewport = currentData.selection.viewport;
+    const viewport = data.selection.viewport;
     // A small graph already reads as one constellation. With several
     // peripheral nodes, pull the look target closer to the selected subject
     // while the fit calculation still keeps every context point in frame.
@@ -2440,6 +2587,7 @@ export function createThreeForceGraphRenderer({
         bodyMaterialColor: object?.userData.graphDefaultNodeObject === true
           ? objectMaterialColor(graphChildWithRole(object, "body"))
           : null,
+        defaultBody: defaultNodeBodyObservation(object),
         label: nodeLabelObservation(id, object ? graphChildWithRole(object, "node-label") : null, scene),
         worldPosition: { id, ...livePosition },
         worldScale: objectTransformObservation(id, object).scale,

@@ -121,14 +121,18 @@ is still attached to the public Three.js scene, effectively visible, and the opa
 and line-width values of visible materials. It is `null` before mount and for legacy custom renderers. This
 is scene/object evidence only; it does not claim that a node is visible in rendered
 pixels. Detached stale factory objects are reported as not scene-attached and do not
-contribute material-opacity evidence.
+contribute material-opacity evidence. Built-in node bodies additionally report
+`defaultBody: { kind: "flat-2.5d", silhouette }`, where `silhouette` is one of
+`circle`, `capsule`, `dot`, or `disk`; host-provided node objects report `null`.
 
 내장 renderer는 선택을 하나의 취소 가능한 transaction으로 처리합니다. 모든 live node는
 현재 renderer-local 위치에서 deterministic target까지 보간되고, link emphasis, focus rim,
 scale, camera reframe은 같은 bounded animation frame에서 진행됩니다. 명시적 선택은 420 ms
 cubic transition, 선택 해제 복원은 250 ms를 사용하며 reduced motion에서는 즉시 settled
-상태가 됩니다. 기본 node material은 routine-harness Tauri의 semantic light/dark palette,
-Standard Material roughness/metalness, outline shell, focus rim을 사용합니다. host는
+상태가 됩니다. 기본 node material은 routine-harness Tauri의 semantic light/dark palette와
+flat 2.5D 원형·캡슐·점·디스크 silhouette을 사용합니다. 기본 body와 flow token은 카메라를
+향하는 billboard이므로 camera drift/orbit에서도 edge-on으로 사라지지 않습니다. 깊이는 조명,
+clearcoat, specular, sphere가 아니라 scale과 opacity 계층으로만 표현합니다. host는
 `getTransitionObservation()`으로 active generation, progress, duration, motion mode,
 실제 live node coordinates를 확인할 수 있습니다. 내장 renderer는 선택적으로 실제 camera
 pose evidence(`camera.position`, `camera.lookAt`)도 함께 제공합니다. mount 전과 legacy custom
@@ -152,7 +156,8 @@ renderer는 `ambientMotion` 힌트를 무시해도 호환됩니다.
 명시적 `master`는 별도의 최소 가독성 계층을 유지합니다. 실제 blur나 post-processing은 사용하지
 않습니다.
 
-idle edge는 거의 보이지 않습니다. hover 또는 selected focus의 기본 incident edge만 tessellated
+idle edge는 조용하지만 읽을 수 있는 0.22–0.28 opacity tier를 유지합니다. hover 또는 selected
+focus의 기본 incident edge만 tessellated
 quadratic curve 위에 2개의 작은 renderer-owned token을 focus에서 이웃 방향으로 흘립니다. custom
 link factory의 geometry와 animation은 건드리지 않습니다. `reducedMotion`에서는 node offset과
 flow가 즉시 0이 되고, document가 hidden이면 motion loop가 멈췄다가 visible에서 시간 점프 없이

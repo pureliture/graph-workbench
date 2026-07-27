@@ -31,6 +31,7 @@ export {
 export {
   type GraphLinkObjectFactory,
   type GraphNodeObjectFactory,
+  type GraphDefaultNodeSilhouette,
   type GraphAmbientMotionLinkFlowObservation,
   type GraphAmbientMotionNodePosition,
   type GraphAmbientMotionObservation,
@@ -42,6 +43,7 @@ export {
   type GraphRendererFactory,
   type GraphRendererFactoryOptions,
   type GraphRenderLinkObservation,
+  type GraphRenderDefaultNodeBodyObservation,
   type GraphRenderNodeLabelObservation,
   type GraphRenderNodeObservation,
   type GraphRenderObjectObservation,

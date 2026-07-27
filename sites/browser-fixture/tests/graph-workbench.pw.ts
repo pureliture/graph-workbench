@@ -190,8 +190,16 @@ interface RenderNodeLabelObservation extends RenderObjectObservation {
   readonly scale: RenderTransformObservation | null;
 }
 
+type DefaultNodeSilhouette = "capsule" | "circle" | "disk" | "dot";
+
+interface RenderDefaultNodeBodyObservation {
+  readonly kind: "flat-2.5d";
+  readonly silhouette: DefaultNodeSilhouette;
+}
+
 interface RenderNodeObservation extends RenderObjectObservation {
   readonly bodyMaterialColor: string | null;
+  readonly defaultBody: RenderDefaultNodeBodyObservation | null;
   readonly label: RenderNodeLabelObservation;
   readonly worldPosition: RenderTransformObservation;
   readonly worldScale: RenderTransformObservation | null;
@@ -1112,6 +1120,33 @@ test("actual WebGL scene exposes semantic default node colors across system them
   expect(lightColor("relation:ingest")).toBe("#334155");
 });
 
+test("actual WebGL scene attaches profile, workflow, leaf, and relation flat default bodies", async ({ page }) => {
+  await openFixture(page);
+
+  const { observation } = await waitForRenderObservation(page);
+  const expectedBodies: Readonly<Record<string, RenderDefaultNodeBodyObservation>> = {
+    "profile:platform": { kind: "flat-2.5d", silhouette: "circle" },
+    "relation:release": { kind: "flat-2.5d", silhouette: "capsule" },
+    // This relation has one incident edge, so the renderer's semantic leaf
+    // rule deliberately wins over its raw relation type.
+    "relation:orchestrate": { kind: "flat-2.5d", silhouette: "dot" },
+    "relation:ingest": { kind: "flat-2.5d", silhouette: "disk" },
+  };
+  const nodesById = new Map(observation.nodes.map((node) => [node.id, node]));
+
+  for (const [nodeId, defaultBody] of Object.entries(expectedBodies)) {
+    const node = nodesById.get(nodeId);
+    if (!node) throw new Error(`${nodeId} was absent from the live WebGL renderer observation.`);
+    expect(node).toMatchObject({
+      defaultBody,
+      objectTracked: true,
+      objectVisible: true,
+      sceneAttached: true,
+    });
+    expect(node.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(0);
+  }
+});
+
 test("keeps ambient motion live while deterministic anchors stay fixed", async ({ page }) => {
   await openFixture(page);
 
@@ -1180,7 +1215,10 @@ test("keeps ambient motion live while deterministic anchors stay fixed", async (
     ambientScreenPosition(first, "concept:session"),
     ambientScreenPosition(later, "concept:session"),
   ) / await canvasShortEdge(page);
-  expect(peripheralDrift).toBeGreaterThan(0.004);
+  // Flat camera-facing bodies change the fitted screen scale slightly. Keep a
+  // viewport-relative lower bound that still proves visible peripheral drift
+  // without coupling this renderer observation to the former sphere framing.
+  expect(peripheralDrift).toBeGreaterThan(0.0035);
   expect(peripheralDrift).toBeLessThan(0.08);
   expect(later.frames.length).toBeGreaterThanOrEqual(2);
 });
@@ -1194,6 +1232,12 @@ test("actual canvas hover differentiates bounded idle and focus flow particles w
   expect(idleRender.links.every(({ minimumVisibleMaterialOpacity, objectVisible, sceneAttached }) => (
     objectVisible && sceneAttached && (minimumVisibleMaterialOpacity ?? 0) > 0
   ))).toBe(true);
+  const idleApiWeb = idleRender.links.find(({ id }) => id === "api-web");
+  if (!idleApiWeb) throw new Error("The default idle api-web edge was absent from the live renderer observation.");
+  expect(idleApiWeb.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThanOrEqual(0.22);
+  expect(idleApiWeb.minimumVisibleMaterialOpacity ?? 1).toBeLessThanOrEqual(0.28);
+  expect(idleApiWeb.visibleMaterialLineWidths[0] ?? 0).toBeGreaterThanOrEqual(0.7);
+  expect(idleApiWeb.visibleMaterialLineWidths[0] ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(0.82);
   const idle = await waitForAmbientMotion(page, (motion) => (
     motion.focusNodeId === null
     && motion.visibleLinkFlow.length > 0
@@ -1306,6 +1350,13 @@ test("keeps hovered active link curves attached to rendered node positions acros
 
 test("observes the master floor and selection-distance opacity in attached scene objects", async ({ page }) => {
   await openFixture(page);
+  const idleRender = (await waitForRenderObservation(page)).observation;
+  const idleEdge = idleRender.links.find((link) => link.id === "api-web");
+  if (!idleEdge) throw new Error("The default idle api-web edge was absent from the live renderer observation.");
+  const idleOpacity = idleEdge.minimumVisibleMaterialOpacity;
+  const idleWidth = idleEdge.visibleMaterialLineWidths[0];
+  expect(idleOpacity).toBeGreaterThanOrEqual(0.22);
+  expect(idleOpacity).toBeLessThanOrEqual(0.28);
   const beforeMotion = await waitForMotionSettled(page);
   await selectMatrixNode(page, "component:web");
   expect(await waitForSelection(page, "matrix")).toMatchObject({
@@ -1385,6 +1436,11 @@ test("observes the master floor and selection-distance opacity in attached scene
   );
   expect(selectedEdge?.visual.opacity ?? 0).toBeGreaterThan(distantEdge?.visual.opacity ?? 0);
   expect(selectedEdge?.visual.width ?? 0).toBeGreaterThan(distantEdge?.visual.width ?? 0);
+  // `api-web` is the selected node's incident link. Its material tier has to
+  // rise above the independently readable idle default, not merely above a
+  // distant edge that was muted by the selection.
+  expect(selectedEdge?.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan((idleOpacity ?? 0) * 2);
+  expect((selectedEdge?.visibleMaterialLineWidths[0] ?? 0) - (idleWidth ?? 0)).toBeGreaterThan(0.35);
 
   const canvas = page.getByTestId("graph-canvas");
   const box = await canvas.boundingBox();
@@ -1828,6 +1884,9 @@ test("reduced motion reaches the same public selection target and deterministic 
     motion.active && !motion.reducedMotion && motion.focusNodeId === "component:web"
   ));
   const laterNormalAmbient = await waitForAmbientMotionAfter(normalPage, normalAmbient.frame, 12);
+  const normalBodies = (await waitForRenderObservation(normalPage)).observation.nodes
+    .filter(({ id }) => ["profile:platform", "relation:release", "relation:orchestrate", "relation:ingest"].includes(id))
+    .map(({ defaultBody, id }) => ({ defaultBody, id }));
 
   const reducedContext = await browser.newContext({ reducedMotion: "reduce" });
   const reducedPage = await reducedContext.newPage();
@@ -1838,9 +1897,19 @@ test("reduced motion reaches the same public selection target and deterministic 
   const reducedAmbient = await waitForAmbientMotion(reducedPage, (motion) => (
     motion.reducedMotion && !motion.active && motion.focusNodeId === "component:web"
   ));
+  const reducedBodies = (await waitForRenderObservation(reducedPage)).observation.nodes
+    .filter(({ id }) => ["profile:platform", "relation:release", "relation:orchestrate", "relation:ingest"].includes(id))
+    .map(({ defaultBody, id }) => ({ defaultBody, id }));
 
   expect(reduced).toEqual(normal);
   expect(reducedLayout).toEqual(normalLayout);
+  expect(reducedBodies).toEqual(normalBodies);
+  expect(reducedBodies).toEqual([
+    { defaultBody: { kind: "flat-2.5d", silhouette: "capsule" }, id: "relation:release" },
+    { defaultBody: { kind: "flat-2.5d", silhouette: "circle" }, id: "profile:platform" },
+    { defaultBody: { kind: "flat-2.5d", silhouette: "disk" }, id: "relation:ingest" },
+    { defaultBody: { kind: "flat-2.5d", silhouette: "dot" }, id: "relation:orchestrate" },
+  ]);
   expect((await waitForMotionSettled(normalPage)).transition).toMatchObject({
     active: false,
     progress: 1,

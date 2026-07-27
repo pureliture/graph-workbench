@@ -123,9 +123,18 @@ export interface GraphRenderNodeLabelObservation extends GraphRenderObjectObserv
     readonly alphaMasked: boolean | null;
     readonly transparent: boolean | null;
 }
+/** Flat 2.5D silhouette used by a renderer-owned default node body. */
+export type GraphDefaultNodeSilhouette = "capsule" | "circle" | "disk" | "dot";
+/** Read-only identity of the built-in flat default node body. */
+export interface GraphRenderDefaultNodeBodyObservation {
+    readonly kind: "flat-2.5d";
+    readonly silhouette: GraphDefaultNodeSilhouette;
+}
 export interface GraphRenderNodeObservation extends GraphRenderObjectObservation {
     /** Default node body's current material color, or null for custom objects. */
     readonly bodyMaterialColor: string | null;
+    /** Default flat body identity, or null when a host supplied the node object. */
+    readonly defaultBody: GraphRenderDefaultNodeBodyObservation | null;
     /** Scene-level Sprite label, anchored above the node and camera-facing. */
     readonly label: GraphRenderNodeLabelObservation;
     /** Renderer-local position used for perspective and distance cues. */
