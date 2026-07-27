@@ -530,6 +530,30 @@ interface UnavailableTelemetry {
 
 type SelectionTelemetry = ObservedSelectionTelemetry | UnavailableTelemetry;
 
+interface ObservedSelectionTransitionTelemetry {
+  readonly availability: "observed";
+  readonly generation: number;
+  readonly nodeId: string | null;
+  readonly source: GraphSelectionSource;
+}
+
+type SelectionTransitionTelemetry = ObservedSelectionTransitionTelemetry | UnavailableTelemetry;
+
+interface ObservedNodeHoverTelemetry {
+  readonly availability: "observed";
+  readonly nodeId: string | null;
+}
+
+type NodeHoverTelemetry = ObservedNodeHoverTelemetry | UnavailableTelemetry;
+
+interface ObservedInitialViewportTelemetry {
+  readonly availability: "observed";
+  /** Renderer transition that applied the fixture's initial zoom. */
+  readonly generation: number;
+}
+
+type InitialViewportTelemetry = ObservedInitialViewportTelemetry | UnavailableTelemetry;
+
 interface ObservedScreenPositionTelemetry {
   readonly availability: "observed";
   readonly nodeId: string;
@@ -760,6 +784,7 @@ export function BrowserGraphFixture() {
   const motionFramesRef = useRef<MotionTelemetryFrame[]>([]);
   const motionGenerationRef = useRef<number | null>(null);
   const motionPublishedKeyRef = useRef("");
+  const initialViewportGenerationRef = useRef<number | null>(null);
   const ambientFramesRef = useRef<AmbientMotionFrame[]>([]);
   const ambientPublishedKeyRef = useRef("");
   const reducedMotionRef = useRef(false);
@@ -769,6 +794,18 @@ export function BrowserGraphFixture() {
   const [selectionTelemetry, setSelectionTelemetry] = useState<SelectionTelemetry>({
     availability: "pending",
     reason: null,
+  });
+  const [selectionTransitionTelemetry, setSelectionTransitionTelemetry] = useState<SelectionTransitionTelemetry>({
+    availability: "pending",
+    reason: "Waiting for a selection-triggered renderer transition.",
+  });
+  const [nodeHoverTelemetry, setNodeHoverTelemetry] = useState<NodeHoverTelemetry>({
+    availability: "pending",
+    reason: "Waiting for a renderer node-hover callback.",
+  });
+  const [initialViewportTelemetry, setInitialViewportTelemetry] = useState<InitialViewportTelemetry>({
+    availability: "pending",
+    reason: "Waiting for the fixture's initial viewport transition.",
   });
   const [selectedScreenPosition, setSelectedScreenPosition] = useState<ScreenPositionTelemetry>({
     availability: "pending",
@@ -900,6 +937,7 @@ export function BrowserGraphFixture() {
     let colorSchemeMedia: MediaQueryList | null = null;
     let disposed = false;
     let fitFrame: number | null = null;
+    let zoomFrame: number | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let syncColorScheme: ((event: MediaQueryListEvent) => void) | null = null;
 
@@ -910,6 +948,10 @@ export function BrowserGraphFixture() {
       setWebglState("unavailable");
       setSelectionState(null);
       setSelectionTelemetry({ availability: "unavailable", reason });
+      setSelectionTransitionTelemetry({ availability: "unavailable", reason });
+      setNodeHoverTelemetry({ availability: "unavailable", reason });
+      initialViewportGenerationRef.current = null;
+      setInitialViewportTelemetry({ availability: "unavailable", reason });
       setSelectedScreenPosition({ availability: "unavailable", reason });
       setMasterScreenPosition({ availability: "unavailable", reason });
       setNodeProjectionTelemetry({ availability: "unavailable", reason });
@@ -942,6 +984,10 @@ export function BrowserGraphFixture() {
             }
             if (status === "mounted") setRenderer({ status, reason: null });
           },
+          onNodeHover: ({ nodeId }) => {
+            if (!rendererReadyRef.current) return;
+            setNodeHoverTelemetry({ availability: "observed", nodeId });
+          },
           onSelectionChange: (event: GraphSelectionEvent) => {
             if (!rendererReadyRef.current) return;
             const next = workbenchRef.current?.getSelectionState();
@@ -969,6 +1015,19 @@ export function BrowserGraphFixture() {
               settled: event.settled,
               source: event.source,
             });
+            // `onSelectionChange` runs after the workbench has started the
+            // corresponding scene transition. Record that exact generation at
+            // the event boundary so test evidence cannot mistake a prior
+            // background retry for this mouse selection.
+            const transition = workbenchRef.current?.getTransitionObservation();
+            if (transition) {
+              setSelectionTransitionTelemetry({
+                availability: "observed",
+                generation: transition.generation,
+                nodeId: event.nodeId,
+                source: event.source,
+              });
+            }
           },
         });
         workbenchRef.current = workbench;
@@ -1016,7 +1075,20 @@ export function BrowserGraphFixture() {
               fitFrame = window.requestAnimationFrame(() => {
                 if (!disposed && rendererReadyRef.current) {
                   workbench.fit(0);
-                  window.requestAnimationFrame(() => workbench.zoom(1.15));
+                  zoomFrame = window.requestAnimationFrame(() => {
+                    if (disposed || !rendererReadyRef.current) return;
+                    workbench.zoom(1.15);
+                    const transition = workbench.getTransitionObservation();
+                    if (!transition) {
+                      markRendererUnavailable("The initial viewport zoom did not expose transition evidence.");
+                      return;
+                    }
+                    initialViewportGenerationRef.current = transition.generation;
+                    setInitialViewportTelemetry({
+                      availability: "pending",
+                      reason: "Waiting for the initial viewport zoom to settle.",
+                    });
+                  });
                 }
               });
             });
@@ -1055,6 +1127,7 @@ export function BrowserGraphFixture() {
         colorSchemeMedia.removeEventListener("change", syncColorScheme);
       }
       if (fitFrame !== null) window.cancelAnimationFrame(fitFrame);
+      if (zoomFrame !== null) window.cancelAnimationFrame(zoomFrame);
       window.cancelAnimationFrame(animationFrame);
       workbenchRef.current?.destroy();
       workbenchRef.current = null;
@@ -1198,6 +1271,19 @@ export function BrowserGraphFixture() {
             availability: "observed",
             frames: motionFramesRef.current,
             ...liveFrame,
+          });
+        }
+        const initialViewportGeneration = initialViewportGenerationRef.current;
+        if (
+          initialViewportGeneration !== null
+          && transition.generation === initialViewportGeneration
+          && !transition.active
+          && transition.progress === 1
+        ) {
+          initialViewportGenerationRef.current = null;
+          setInitialViewportTelemetry({
+            availability: "observed",
+            generation: transition.generation,
           });
         }
       } else {
@@ -1720,6 +1806,9 @@ export function BrowserGraphFixture() {
           <Telemetry testId="graph-rendered-link-ids" value={renderedLinkIdsTelemetry} />
           <Telemetry testId="graph-render-observation" value={renderTelemetry} />
           <Telemetry testId="graph-selection" value={selectionTelemetry} />
+          <Telemetry testId="graph-selection-transition" value={selectionTransitionTelemetry} />
+          <Telemetry testId="graph-node-hover" value={nodeHoverTelemetry} />
+          <Telemetry testId="graph-initial-viewport-ready" value={initialViewportTelemetry} />
           <Telemetry testId="matrix-selection" value={selectionTelemetry} />
           <Telemetry testId="reduced-motion-selection" value={{ ...selectionTelemetry, reducedMotion }} />
           <Telemetry testId="graph-settled-layout" value={layoutTelemetry} />

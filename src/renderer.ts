@@ -167,18 +167,20 @@ const STATIC_LABEL_OPACITY = Object.freeze({
   selected: 1,
 });
 
-const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 7.2, y: 5.6, z: 1.8 });
-const AMBIENT_NODE_BREATHING = Object.freeze({ x: 2.8, y: 3.4, z: 1.2 });
-const AMBIENT_MAX_OFFSET = 12;
-const AMBIENT_RADIANS_PER_SECOND = 0.42;
+const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 11, y: 9, z: 3.2 });
+const AMBIENT_NODE_BREATHING = Object.freeze({ x: 4.5, y: 5.3, z: 2.2 });
+const AMBIENT_CAMERA_DRIFT = Object.freeze({ x: 3.8, y: 2.6, z: 1.2 });
+// Covers the largest common-plus-individual planar displacement (15.5).
+const AMBIENT_MAX_OFFSET = 16;
+const AMBIENT_RADIANS_PER_SECOND = 0.62;
 const FLOW_SPEED_CYCLES_PER_SECOND = 0.22;
 // Idle flow is deliberately much slower and smaller than an interaction flow.
 // It lets a settled graph read as a living system without turning every edge
 // into a competing animation.
 const IDLE_FLOW_SPEED_CYCLES_PER_SECOND = 0.075;
 const MAX_IDLE_FLOW_PARTICLES = 5;
-const IDLE_FLOW_PARTICLE_SCALE = 0.36;
-const INTERACTION_FLOW_PARTICLE_SCALE = 1.35;
+const IDLE_FLOW_PARTICLE_SCALE = 0.32;
+const INTERACTION_FLOW_PARTICLE_SCALE = 1.55;
 const MAX_FLOW_PARTICLES = 24;
 const AMBIENT_VISUAL_EPSILON = 0.0001;
 const AMBIENT_MASTER_BODY_OPACITY_FLOOR = 0.5;
@@ -1085,15 +1087,18 @@ export function createThreeForceGraphRenderer({
   let ambientFrameCount = 0;
   let ambientLastTimestamp: number | null = null;
   let ambientPaused = false;
+  let ambientCameraAnchor: CameraPose | null = null;
+  let ambientCameraAnchorElapsedMs = 0;
+  let ambientCameraLastPose: CameraPose | null = null;
   const ambientNodes = new Map<string, AmbientNodeState>();
   const ambientLinks = new Map<string, AmbientLinkState>();
   const particleGroup = new Group();
   particleGroup.name = "graph-workbench-flow-particles";
-  const particleGeometry = new SphereGeometry(1.35, 10, 8);
+  const particleGeometry = new SphereGeometry(1.5, 10, 8);
   const particleMaterial = new MeshBasicMaterial({
     color: THEME_PALETTES.dark.rim,
     depthWrite: false,
-    opacity: 0.94,
+    opacity: 0.96,
     transparent: true,
   });
   const projectedWorldPosition = new Vector3();
@@ -1545,6 +1550,65 @@ export function createThreeForceGraphRenderer({
     }
   }
 
+  function hasDefaultAmbientNodes(): boolean {
+    for (const state of ambientNodes.values()) {
+      if (state.object?.userData.graphDefaultNodeObject === true) return true;
+    }
+    return false;
+  }
+
+  function sameCameraPose(left: CameraPose, right: CameraPose): boolean {
+    return [
+      left.position.x - right.position.x,
+      left.position.y - right.position.y,
+      left.position.z - right.position.z,
+      left.lookAt.x - right.lookAt.x,
+      left.lookAt.y - right.lookAt.y,
+      left.lookAt.z - right.lookAt.z,
+    ].every((difference) => Math.abs(difference) <= AMBIENT_VISUAL_EPSILON);
+  }
+
+  function applyAmbientCameraDrift(): void {
+    if (
+      !ambientMotionEnabled()
+      || activeTransition !== null
+      || cameraControlInteractionActive
+      || !hasDefaultAmbientNodes()
+    ) {
+      ambientCameraAnchor = null;
+      ambientCameraLastPose = null;
+      return;
+    }
+    const current = cameraPose();
+    if (!ambientCameraAnchor || (ambientCameraLastPose && !sameCameraPose(current, ambientCameraLastPose))) {
+      ambientCameraAnchor = current;
+      ambientCameraAnchorElapsedMs = ambientElapsedMs;
+      ambientCameraLastPose = current;
+      return;
+    }
+    const phase = ((ambientElapsedMs - ambientCameraAnchorElapsedMs) / 1000) * AMBIENT_RADIANS_PER_SECOND;
+    const offset = {
+      x: Math.sin(phase) * AMBIENT_CAMERA_DRIFT.x,
+      y: (Math.cos(phase * 0.91) - 1) * AMBIENT_CAMERA_DRIFT.y,
+      z: Math.sin(phase * 0.67) * AMBIENT_CAMERA_DRIFT.z,
+    };
+    const next: CameraPose = {
+      position: {
+        x: ambientCameraAnchor.position.x + offset.x,
+        y: ambientCameraAnchor.position.y + offset.y,
+        z: ambientCameraAnchor.position.z + offset.z,
+      },
+      lookAt: {
+        x: ambientCameraAnchor.lookAt.x + (offset.x * 0.34),
+        y: ambientCameraAnchor.lookAt.y + (offset.y * 0.34),
+        z: ambientCameraAnchor.lookAt.z + (offset.z * 0.34),
+      },
+    };
+    if (ambientCameraLastPose && sameCameraPose(next, ambientCameraLastPose)) return;
+    graph.cameraPosition(next.position, next.lookAt, 0);
+    ambientCameraLastPose = next;
+  }
+
   function applyCameraRelativeDepth(): void {
     const data = currentData;
     if (!data) return;
@@ -1766,7 +1830,10 @@ export function createThreeForceGraphRenderer({
         particleGroup.updateWorldMatrix(true, false);
         particle.object.position.copy(particleGroup.worldToLocal(particleLocalPosition.copy(curvePointWorldPosition)));
         particle.object.visible = true;
-        particle.object.scale.setScalar(incident ? INTERACTION_FLOW_PARTICLE_SCALE : IDLE_FLOW_PARTICLE_SCALE);
+        const particleScale = incident
+          ? INTERACTION_FLOW_PARTICLE_SCALE * (0.9 + (Math.sin(outwardPhase * Math.PI * 2) * 0.18))
+          : IDLE_FLOW_PARTICLE_SCALE;
+        particle.object.scale.setScalar(particleScale);
         particle.linkId = state.id;
         particle.phase = outwardPhase;
         particle.x = curvePointWorldPosition.x;
@@ -1779,6 +1846,7 @@ export function createThreeForceGraphRenderer({
 
   function applyAmbientVisuals(): void {
     updateAmbientNodePositions();
+    applyAmbientCameraDrift();
     applyCameraRelativeDepth();
     applyFocusedLinkFlow();
   }
@@ -2053,29 +2121,28 @@ export function createThreeForceGraphRenderer({
 
   function cancelCameraTransition(): void {
     const cancelledTransition = activeTransition;
-    const cancelledProgress = cancelledTransition
-      ? transitionObservation.progress
-      : 1;
+    if (!cancelledTransition) return;
+    const cancelledProgress = transitionObservation.progress;
     transitionGeneration += 1;
     // A scheduled idle ambient tick is already the shared renderer loop; it
     // can immediately pick up a newly-started camera transition. Cancel only
     // a frame that belongs to a real active transaction.
-    if (cancelledTransition && motionFrame !== null) frameScheduler.cancel(motionFrame);
-    if (cancelledTransition) motionFrame = null;
-    if (cancelledTransition) transitionTick = null;
+    if (motionFrame !== null) frameScheduler.cancel(motionFrame);
+    motionFrame = null;
+    transitionTick = null;
     activeTransition = null;
-    if (cancelledTransition?.scene) {
+    if (cancelledTransition.scene) {
       applySceneFrame(cancelledTransition.scene, 1, true);
     }
     transitionObservation = {
       active: false,
-      durationMs: cancelledTransition?.durationMs ?? 0,
+      durationMs: cancelledTransition.durationMs,
       generation: transitionGeneration,
       nodePositions: liveTransitionNodePositions(),
-      progress: cancelledTransition?.scene ? 1 : cancelledProgress,
-      reducedMotion: cancelledTransition?.reducedMotion ?? false,
+      progress: cancelledTransition.scene ? 1 : cancelledProgress,
+      reducedMotion: cancelledTransition.reducedMotion,
     };
-    if (cancelledTransition?.scene) flushDeferredData();
+    if (cancelledTransition.scene) flushDeferredData();
     if (!destroyed) {
       applyAmbientVisuals();
       ensureMotionFrame();
@@ -2164,7 +2231,11 @@ export function createThreeForceGraphRenderer({
     readonly scene?: SceneTransition | null;
     readonly targetCamera?: CameraPose | null;
   }): void {
-    cancelCameraTransition();
+    if (activeTransition) cancelCameraTransition();
+    // A generation names one real transition. Stale OrbitControls `change`
+    // events can arrive after that transition settles; they must not rewrite
+    // its settled observation with a different generation.
+    transitionGeneration += 1;
     const startCamera = targetCamera ? cameraPose() : null;
     const active: ActiveTransition = {
       durationMs,
