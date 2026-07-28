@@ -1,0 +1,295 @@
+import { validateGraphInput } from "./contract.js";
+import { createRenderGraphData, } from "./layout.js";
+import { EMPTY_GRAPH_PRESENTATION } from "./presentation.js";
+function knownNodeIds(input) {
+    return new Set(input.nodes.map((node) => node.id));
+}
+function selectedNodeId(presentation) {
+    return presentation.selectedNodeIds?.[0] ?? null;
+}
+function normalizedPresentation(input, supplied) {
+    const known = knownNodeIds(input);
+    const selectedNodeIds = [...new Set(supplied.selectedNodeIds ?? [])].filter((id) => known.has(id));
+    const focusNodeId = supplied.focusNodeId && known.has(supplied.focusNodeId)
+        ? supplied.focusNodeId
+        : null;
+    return {
+        ambientMotion: supplied.ambientMotion !== false,
+        selectedNodeIds,
+        focusNodeId,
+        reducedMotion: supplied.reducedMotion === true,
+        theme: supplied.theme === "light" ? "light" : "dark",
+        nodeDescriptors: supplied.nodeDescriptors ?? {},
+        linkDescriptors: supplied.linkDescriptors ?? {},
+    };
+}
+function keyboardTarget(input, current, direction) {
+    if (input.nodes.length === 0)
+        return null;
+    const nodeIds = input.nodes.map((node) => node.id);
+    const currentIndex = current ? nodeIds.indexOf(current) : -1;
+    const nextIndex = currentIndex < 0
+        ? direction === 1 ? 0 : nodeIds.length - 1
+        : (currentIndex + direction + nodeIds.length) % nodeIds.length;
+    return nodeIds[nextIndex] ?? null;
+}
+function viewportFor(container, width, height) {
+    if (width !== undefined || height !== undefined) {
+        return {
+            width: Math.max(1, Math.floor(width ?? container?.clientWidth ?? 1)),
+            height: Math.max(1, Math.floor(height ?? container?.clientHeight ?? 1)),
+        };
+    }
+    if (!container)
+        return undefined;
+    return {
+        width: Math.max(1, Math.floor(container.clientWidth ?? 1)),
+        height: Math.max(1, Math.floor(container.clientHeight ?? 1)),
+    };
+}
+function sameTargetNodePositions(left, right) {
+    return left.length === right.length && left.every((position, index) => {
+        const other = right[index];
+        return other?.id === position.id
+            && other.x === position.x
+            && other.y === position.y
+            && other.z === position.z;
+    });
+}
+export function createGraphWorkbench(options) {
+    let input = validateGraphInput(options.input);
+    let presentation = normalizedPresentation(input, EMPTY_GRAPH_PRESENTATION);
+    let renderer = null;
+    let container = null;
+    let viewport;
+    let selectionState = createRenderGraphData(input, presentation, { viewport }).selection;
+    let destroyed = false;
+    const rendererFactory = options.rendererFactory;
+    const sync = () => {
+        const data = createRenderGraphData(input, presentation, { viewport });
+        selectionState = data.selection;
+        if (!renderer)
+            return;
+        renderer.setData(data);
+        renderer.setPresentation(presentation);
+    };
+    const transitionToSelection = (nodeId) => {
+        if (!renderer || !nodeId)
+            return;
+        renderer.cancelCameraTransition?.();
+        if (renderer.transitionToNode) {
+            renderer.transitionToNode(nodeId, { reducedMotion: presentation.reducedMotion === true });
+            return;
+        }
+        renderer.focus(nodeId);
+    };
+    const emitSelection = (source) => {
+        const nodeId = selectionState.nodeId;
+        const node = nodeId ? input.nodes.find((candidate) => candidate.id === nodeId) ?? null : null;
+        options.onFocusChange?.({ input, nodeId });
+        options.onSelectionChange?.({
+            input,
+            node,
+            nodeId,
+            neighborNodeIds: selectionState.neighborNodeIds,
+            settled: selectionState.settled,
+            source,
+        });
+    };
+    const selectNode = (nodeId, source) => {
+        const nextNodeId = nodeId && knownNodeIds(input).has(nodeId) ? nodeId : null;
+        if (!nextNodeId)
+            renderer?.cancelCameraTransition?.();
+        presentation = normalizedPresentation(input, {
+            ...presentation,
+            focusNodeId: nextNodeId,
+            selectedNodeIds: nextNodeId ? [nextNodeId] : [],
+        });
+        sync();
+        if (nextNodeId)
+            transitionToSelection(nextNodeId);
+        emitSelection(source);
+    };
+    const callbacks = {
+        onBackgroundClick() {
+            selectNode(null, "background");
+            options.onBackgroundClick?.();
+        },
+        onNodeClick(nodeId) {
+            if (!knownNodeIds(input).has(nodeId))
+                return;
+            selectNode(nodeId, "mouse");
+            options.onNodeClick?.({ input, nodeId });
+        },
+        onNodeHover(nodeId) {
+            options.onNodeHover?.({ input, nodeId });
+        },
+    };
+    const onKeyDown = (event) => {
+        if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+            event.preventDefault();
+            const next = keyboardTarget(input, selectionState.nodeId ?? presentation.focusNodeId ?? null, 1);
+            if (next)
+                selectNode(next, "keyboard");
+            return;
+        }
+        if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+            event.preventDefault();
+            const previous = keyboardTarget(input, selectionState.nodeId ?? presentation.focusNodeId ?? null, -1);
+            if (previous)
+                selectNode(previous, "keyboard");
+            return;
+        }
+        if (event.key === "Enter" && selectionState.nodeId) {
+            event.preventDefault();
+            callbacks.onNodeClick(selectionState.nodeId);
+            return;
+        }
+        if (event.key === "Escape") {
+            event.preventDefault();
+            callbacks.onBackgroundClick();
+        }
+    };
+    return {
+        destroy() {
+            if (destroyed)
+                return;
+            this.unmount();
+            destroyed = true;
+        },
+        fit(durationMs) {
+            renderer?.fit(durationMs);
+        },
+        focusNode(nodeId) {
+            const nextNodeId = nodeId && knownNodeIds(input).has(nodeId) ? nodeId : null;
+            presentation = normalizedPresentation(input, { ...presentation, focusNodeId: nextNodeId });
+            renderer?.setPresentation(presentation);
+            if (nextNodeId)
+                transitionToSelection(nextNodeId);
+            options.onFocusChange?.({ input, nodeId: nextNodeId });
+        },
+        getAmbientMotionObservation() {
+            return renderer?.getAmbientMotionObservation?.() ?? null;
+        },
+        getNodeScreenPosition(nodeId) {
+            if (!knownNodeIds(input).has(nodeId))
+                return null;
+            return renderer?.getNodeScreenPosition?.(nodeId) ?? null;
+        },
+        getRenderObservation() {
+            return renderer?.getRenderObservation?.() ?? null;
+        },
+        getTransitionObservation() {
+            return renderer?.getTransitionObservation?.() ?? null;
+        },
+        getSelectionState() {
+            return selectionState;
+        },
+        mount(nextContainer) {
+            if (destroyed)
+                throw new Error("graph workbench is destroyed");
+            if (container === nextContainer && renderer)
+                return;
+            this.unmount();
+            container = nextContainer;
+            viewport = viewportFor(container);
+            if (container.tabIndex < 0)
+                container.tabIndex = 0;
+            container.setAttribute("role", "application");
+            container.setAttribute("aria-label", "3D graph workbench");
+            container.addEventListener("keydown", onKeyDown);
+            try {
+                if (!rendererFactory) {
+                    throw new Error("a rendererFactory is required; import @pureliture/graph-workbench/browser for Three.js support");
+                }
+                renderer = rendererFactory({ callbacks, container });
+                sync();
+                renderer.resize();
+                transitionToSelection(selectionState.nodeId);
+                options.onRendererStateChange?.({ status: "mounted" });
+            }
+            catch (error) {
+                container.removeEventListener("keydown", onKeyDown);
+                container = null;
+                renderer = null;
+                const reason = error instanceof Error ? error.message : String(error);
+                options.onRendererStateChange?.({ status: "failed", reason });
+                throw error;
+            }
+        },
+        resize(width, height) {
+            viewport = viewportFor(container, width, height);
+            renderer?.resize(width, height);
+            sync();
+            // ResizeObserver preserves the selected identity, so `sync()` alone
+            // updates graphData without re-running the renderer's selection camera
+            // target. Reframe after the viewport-derived data is current; this uses
+            // the same reduced-motion and cancellation policy as an initial select.
+            transitionToSelection(selectionState.nodeId);
+        },
+        restoreCamera() {
+            renderer?.restoreCamera();
+        },
+        selectNode(nodeId, source = "programmatic") {
+            selectNode(nodeId, source);
+        },
+        setInput(nextInput) {
+            const validatedInput = validateGraphInput(nextInput);
+            const nextPresentation = normalizedPresentation(validatedInput, presentation);
+            const previousSelection = selectionState;
+            const previousNodeId = previousSelection.nodeId;
+            const nextNodeId = selectedNodeId(nextPresentation);
+            if (previousNodeId && !nextNodeId)
+                renderer?.cancelCameraTransition?.();
+            input = validatedInput;
+            presentation = nextPresentation;
+            sync();
+            const selectionChanged = selectionState.nodeId !== previousNodeId;
+            const relationshipLayoutChanged = selectionState.nodeId !== null
+                && !sameTargetNodePositions(previousSelection.targetNodePositions, selectionState.targetNodePositions);
+            // A host can update links or layout hints without changing the selected
+            // identity. Reframe only when those actual targets changed, so the
+            // camera follows the new relationship constellation while metadata-only
+            // updates, collapse state, and a user's current camera remain untouched.
+            if (selectionChanged || relationshipLayoutChanged) {
+                if (selectionState.nodeId)
+                    transitionToSelection(selectionState.nodeId);
+            }
+            if (selectionChanged) {
+                emitSelection("programmatic");
+            }
+        },
+        setPresentation(nextPresentation) {
+            const previousNodeId = selectionState.nodeId;
+            const normalized = normalizedPresentation(input, nextPresentation);
+            const nextNodeId = selectedNodeId(normalized);
+            if (previousNodeId && !nextNodeId)
+                renderer?.cancelCameraTransition?.();
+            presentation = normalized;
+            sync();
+            if (selectionState.nodeId !== previousNodeId) {
+                if (selectionState.nodeId)
+                    transitionToSelection(selectionState.nodeId);
+                emitSelection("programmatic");
+            }
+        },
+        setReducedMotion(reducedMotion) {
+            presentation = normalizedPresentation(input, { ...presentation, reducedMotion });
+            sync();
+            transitionToSelection(selectionState.nodeId);
+        },
+        unmount() {
+            if (!container && !renderer)
+                return;
+            container?.removeEventListener("keydown", onKeyDown);
+            renderer?.destroy();
+            renderer = null;
+            container = null;
+            viewport = undefined;
+            options.onRendererStateChange?.({ status: "unmounted" });
+        },
+        zoom(scale) {
+            renderer?.zoom(scale);
+        },
+    };
+}
