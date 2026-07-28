@@ -175,11 +175,18 @@ const THEME_PALETTES: Readonly<Record<"dark" | "light", GraphThemePalette>> = {
 };
 
 // Selection still carries the strongest readability tier. Ambient depth may
-// intentionally take unrelated far labels below this former static floor.
+// intentionally hide unrelated far labels below this former static floor.
 const STATIC_LABEL_OPACITY = Object.freeze({
   far: 0.18,
   neighbor: 0.72,
   selected: 1,
+});
+// `near` is normalized along the live camera axis: 0 is the deepest node and
+// 1 is the nearest. Unrelated labels fade through the middle band, then leave
+// the scene entirely so a dense graph does not turn into a wall of names.
+const DISTANT_LABEL_VISIBILITY = Object.freeze({
+  fullyVisibleAt: 0.82,
+  hiddenUntil: 0.68,
 });
 
 const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 4.8, y: 3.6, z: 1.25 });
@@ -206,10 +213,6 @@ const DEFAULT_LINK_BOUNDARY_PROBE_PROGRESS = 2 / (
 const AMBIENT_VISUAL_EPSILON = 0.0001;
 const AMBIENT_MASTER_BODY_OPACITY_FLOOR = 0.5;
 const AMBIENT_MASTER_LABEL_OPACITY_FLOOR = 0.5;
-// Distant labels remain part of the interaction surface even at their most
-// subdued depth tier. Fading them below this would make the sprite invisible,
-// which breaks the graph's persistent node hierarchy.
-const AMBIENT_FAR_LABEL_OPACITY_FLOOR = 0.02;
 // The previous far tier disappears against a white canvas. Keep light-mode
 // context readable without approaching selected or incident emphasis.
 const LIGHT_SELECTED_CONTEXT_FLOOR = Object.freeze({
@@ -228,6 +231,15 @@ const IDLE_LABEL_OPACITY = Object.freeze({ far: 0.28, nearRange: 0.46 });
 const IDLE_LINK_OPACITY = Object.freeze({ maximum: 0.28, minimum: 0.22 });
 const IDLE_NODE_SCALE = Object.freeze({ far: 0.86, nearRange: 0.28 });
 const IDLE_LABEL_SCALE = Object.freeze({ far: 0.8, nearRange: 0.2 });
+
+function distantLabelVisibility(near: number): number {
+  const progress = Math.max(0, Math.min(
+    1,
+    (near - DISTANT_LABEL_VISIBILITY.hiddenUntil)
+      / (DISTANT_LABEL_VISIBILITY.fullyVisibleAt - DISTANT_LABEL_VISIBILITY.hiddenUntil),
+  ));
+  return progress * progress * (3 - (2 * progress));
+}
 
 function themePalette(theme: GraphPresentation["theme"]): GraphThemePalette {
   return theme === "light" ? THEME_PALETTES.light : THEME_PALETTES.dark;
@@ -1915,7 +1927,9 @@ export function createThreeForceGraphRenderer({
       minimumDepth = Math.min(minimumDepth, depth);
       maximumDepth = Math.max(maximumDepth, depth);
     }
-    const depthRange = Math.max(1, maximumDepth - minimumDepth);
+    const depthSpan = maximumDepth - minimumDepth;
+    const depthRange = Math.max(1, depthSpan);
+    const hasMeaningfulDepthRange = Number.isFinite(depthSpan) && depthSpan > 1;
     const selectedNodeId = data.selection.nodeId;
     const focusNodeId = ambientFocusNodeId();
     const lightSelectedContext = data.presentation.theme === "light" && selectedNodeId !== null;
@@ -1929,6 +1943,7 @@ export function createThreeForceGraphRenderer({
       const selected = node.id === selectedNodeId;
       const neighbor = data.selection.neighborNodeIds.includes(node.id);
       const focused = node.id === focusNodeId;
+      const hovered = node.id === hoverNodeId;
       // Keep semantic readability floors in the renderer-owned state built
       // from the canonical visual contract, not a vendor live node's fields.
       const master = state.isMaster;
@@ -1947,20 +1962,24 @@ export function createThreeForceGraphRenderer({
           : 0,
         state.baseOpacity * bodyFactor,
       );
-      const labelOpacity = selected
+      const labelAlwaysVisible = selected || neighbor || focused || hovered || master;
+      const labelDistanceVisibility = labelAlwaysVisible || !hasMeaningfulDepthRange
         ? 1
-        : neighbor || focused
+        : distantLabelVisibility(near);
+      const baseLabelOpacity = selected
+        ? 1
+        : neighbor || focused || hovered
           ? 0.68 + (near * 0.2)
           : master
             ? Math.max(AMBIENT_MASTER_LABEL_OPACITY_FLOOR, 0.32 + (near * 0.26))
             : selectedNodeId
-            ? Math.max(AMBIENT_FAR_LABEL_OPACITY_FLOOR, 0.02 + (near * 0.24))
+              ? 0.02 + (near * 0.24)
               : IDLE_LABEL_OPACITY.far + (near * IDLE_LABEL_OPACITY.nearRange);
-      const readableLabelOpacity = lightSelectedContext && !selected && !neighbor && !focused
-        ? Math.max(labelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity)
-        : labelOpacity;
-      const labelVisible = selected || neighbor || focused || master
-        || readableLabelOpacity >= AMBIENT_FAR_LABEL_OPACITY_FLOOR;
+      const contextLabelOpacity = lightSelectedContext && !selected && !neighbor && !focused && !hovered
+        ? Math.max(baseLabelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity)
+        : baseLabelOpacity;
+      const readableLabelOpacity = contextLabelOpacity * labelDistanceVisibility;
+      const labelVisible = labelAlwaysVisible || labelDistanceVisibility > 0;
       const viewportScale = Math.max(
         0.82,
         Math.min(1.15, 480 / Math.max(1, Math.min(data.selection.viewport.width, data.selection.viewport.height))),

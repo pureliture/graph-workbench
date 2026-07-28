@@ -479,23 +479,23 @@ async function waitForMotionFramesForGeneration(
       && frame.transition.progress > 0
       && frame.transition.progress < 1
     ));
-    // `frames` is a renderer requestAnimationFrame history, but the first
-    // observable publish can legitimately contain only its initial sample.
-    // The path proof below needs a start and a later in-flight sample, so wait
-    // for two progress-distinct frames from this exact selection generation.
+    // A throttled headless renderer can cross the full 420ms transition in the
+    // frame after its first in-flight sample. The path proof below combines
+    // the pre-transition frame, at least one real in-flight sample, and the
+    // settled frame, so it does not require a second scheduler-dependent sample.
     const distinctActiveFrames = activeFrames.filter((frame, index) => (
       activeFrames.findIndex((candidate) => (
         candidate.transition.progress === frame.transition.progress
       )) === index
     ));
-    if (distinctActiveFrames.length >= 2) observed = distinctActiveFrames;
-    return distinctActiveFrames.length >= 2
+    if (distinctActiveFrames.length >= 1) observed = distinctActiveFrames;
+    return distinctActiveFrames.length >= 1
       && !candidate.transition.active
       && candidate.transition.progress === 1
       && candidate.transition.generation === generation;
   }).toBe(true);
-  if (observed.length < 2) {
-    throw new Error(`Motion generation ${generation} did not expose two distinct active frames.`);
+  if (observed.length < 1) {
+    throw new Error(`Motion generation ${generation} did not expose an active frame.`);
   }
   return observed;
 }
@@ -1029,7 +1029,7 @@ async function advanceAnimationFrames(page: Page, frameCount: number): Promise<v
   }), frameCount);
 }
 
-async function clickProjectedCanvasNode(page: Page, nodeId: string): Promise<void> {
+async function clickProjectedCanvasNode(page: Page, nodeId: string): Promise<MotionTelemetryFrame> {
   const canvas = page.getByTestId("graph-canvas");
   const canvasBox = await canvas.boundingBox();
   if (!canvasBox) throw new Error("graph canvas does not have a measurable bounding box");
@@ -1059,12 +1059,16 @@ async function clickProjectedCanvasNode(page: Page, nodeId: string): Promise<voi
     // real pointer stays fixed rather than sampling it in the move's same turn.
     if (!await waitForRawCanvasHover(page, nodeId)) continue;
     await page.mouse.down();
+    const beforeSelection = await readTelemetry<MotionTelemetry>(page, "graph-motion-observation");
     await page.mouse.up();
     // The initial fit/zoom and vendor raycast cache can make a fresh projection
     // miss on first mount. Preserve the real canvas path, then accept it only
     // when its own mouse-selection telemetry identifies the requested node.
     if (await clickReachedRequestedNode(page, nodeId, previous)) {
-      return;
+      if (beforeSelection.availability !== "observed") {
+        throw new Error(`Canvas click for ${nodeId} did not expose its pre-selection motion frame.`);
+      }
+      return beforeSelection;
     }
   }
   throw new Error(
@@ -1530,8 +1534,13 @@ test("observes the master floor and selection-distance opacity in attached scene
   expect(masterScreen.y).toBeLessThan(box.height);
 });
 
-test("keeps persistent scene labels above nodes with renderer-observed near and far depth cues", async ({ page }) => {
+test("keeps important scene labels visible while hiding distant peripheral names", async ({ page }) => {
   await openFixture(page);
+  const idleObservation = (await waitForRenderObservation(page)).observation;
+  const idleVisibleLabelCount = idleObservation.nodes
+    .filter((node) => node.label.objectVisible === true).length;
+  expect(idleVisibleLabelCount).toBeLessThanOrEqual(24);
+
   await selectMatrixNode(page, "relation:query");
   expect(await waitForSelection(page, "matrix")).toMatchObject({
     nodeId: "relation:query",
@@ -1547,7 +1556,7 @@ test("keeps persistent scene labels above nodes with renderer-observed near and 
     throw new Error("Required label observations were absent from the live scene.");
   }
 
-  for (const node of [selected, neighbor, master, far]) {
+  for (const node of [selected, neighbor, master]) {
     expect(node.label).toMatchObject({
       objectTracked: true,
       objectVisible: true,
@@ -1558,19 +1567,21 @@ test("keeps persistent scene labels above nodes with renderer-observed near and 
     expect(node.label.position?.y ?? 0).toBeGreaterThan(0);
     expect(node.label.visibleMaterialOpacities[0]).toBeGreaterThan(0);
   }
+  const visibleLabelCount = observation.nodes.filter((node) => node.label.objectVisible === true).length;
+  expect(visibleLabelCount).toBeLessThanOrEqual(12);
+  expect(far.label).toMatchObject({
+    minimumVisibleMaterialOpacity: null,
+    objectTracked: true,
+    objectVisible: false,
+    sceneAttached: true,
+    visibleMaterialOpacities: [],
+  });
   expect(selected.label.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(
     neighbor.label.minimumVisibleMaterialOpacity ?? 0,
   );
-  expect(neighbor.label.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(
-    far.label.minimumVisibleMaterialOpacity ?? 0,
-  );
-  // Master stays readable even when it is outside the selected neighborhood;
-  // a far peripheral label fades well below both master and selected focus.
+  // Master stays readable even when it is outside the selected neighborhood.
   expect(selected.label.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(
     master.label.minimumVisibleMaterialOpacity ?? 0,
-  );
-  expect(master.label.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(
-    far.label.minimumVisibleMaterialOpacity ?? 0,
   );
   expect(selected.worldScale?.x ?? 0).toBeGreaterThan(neighbor.worldScale?.x ?? 0);
   expect(neighbor.worldScale?.x ?? 0).toBeGreaterThan(far.worldScale?.x ?? 0);
@@ -1725,7 +1736,7 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
     (await screenDiscernibilityThreshold(page)) * 3,
   );
 
-  await clickProjectedCanvasNode(page, "relation:query");
+  const secondStart = await clickProjectedCanvasNode(page, "relation:query");
   expect(await waitForSelection(page, "mouse")).toMatchObject({ nodeId: "relation:query" });
   const secondGeneration = await waitForSelectionTransitionGeneration(
     page,
@@ -1744,18 +1755,14 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
     expect([...frame.transition.nodePositions.map(({ id }) => id)].sort()).toEqual([...allNodeIds].sort());
   }
   expectLiveTransitionTargets(secondSettled, secondLayout, allNodeIds);
-  // A bounded background retry can settle the renderer to its neutral layout
-  // before the exact Query mouse event starts g5. Its settled g3 state is not
-  // therefore the start of g5. Keep g4 observable through the event/generation
-  // proof above, then test the actual Query transition's own live path.
-  const [secondStart, ...secondLaterFrames] = secondActiveFrames;
-  if (!secondStart || secondLaterFrames.length === 0) {
-    throw new Error("Query selection did not expose enough exact active frames for a path proof.");
-  }
-  expectWorldMotionForNode(secondStart, secondLaterFrames, secondSettled, "relation:query");
-  expectWorldMotionForNode(secondStart, secondLaterFrames, secondSettled, "concept:index");
-  expectWorldMotionForNode(secondStart, secondLaterFrames, secondSettled, "concept:session");
-  expectCameraMotion(secondStart, secondLaterFrames, secondSettled);
+  // A bounded background retry can move the renderer before the exact Query
+  // mouse event. The click helper captures the live frame between pointer-down
+  // and the selecting pointer-up, giving this path proof its actual start even
+  // when a throttled browser exposes only one later in-flight frame.
+  expectWorldMotionForNode(secondStart, secondActiveFrames, secondSettled, "relation:query");
+  expectWorldMotionForNode(secondStart, secondActiveFrames, secondSettled, "concept:index");
+  expectWorldMotionForNode(secondStart, secondActiveFrames, secondSettled, "concept:session");
+  expectCameraMotion(secondStart, secondActiveFrames, secondSettled);
 
   const ambientAfterSelection = await waitForAmbientMotion(page, (motion) => (
     motion.focusNodeId === "relation:query"
