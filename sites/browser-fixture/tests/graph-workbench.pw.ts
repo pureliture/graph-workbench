@@ -1536,6 +1536,11 @@ test("observes the master floor and selection-distance opacity in attached scene
 
 test("keeps important scene labels visible while hiding distant peripheral names", async ({ page }) => {
   await openFixture(page);
+  const idleObservation = (await waitForRenderObservation(page)).observation;
+  const idleVisibleLabelCount = idleObservation.nodes
+    .filter((node) => node.label.objectVisible === true).length;
+  expect(idleVisibleLabelCount).toBeLessThanOrEqual(24);
+
   await selectMatrixNode(page, "relation:query");
   expect(await waitForSelection(page, "matrix")).toMatchObject({
     nodeId: "relation:query",

@@ -185,8 +185,8 @@ const STATIC_LABEL_OPACITY = Object.freeze({
 // 1 is the nearest. Unrelated labels fade through the middle band, then leave
 // the scene entirely so a dense graph does not turn into a wall of names.
 const DISTANT_LABEL_VISIBILITY = Object.freeze({
-  fullyVisibleAt: 0.7,
-  hiddenUntil: 0.46,
+  fullyVisibleAt: 0.82,
+  hiddenUntil: 0.68,
 });
 
 const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 4.8, y: 3.6, z: 1.25 });

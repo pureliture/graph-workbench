@@ -1353,7 +1353,7 @@ describe("Three.js camera transitions", () => {
     const depthById = new Map([
       ["relation:release", -100],
       ["component:api", -12],
-      ["component:web", 20],
+      ["component:web", 50],
       ["component:docs", 100],
     ]);
     renderer.setData({
