@@ -1337,6 +1337,53 @@ describe("Three.js camera transitions", () => {
     });
   });
 
+  it("keeps only the camera-nearest ordinary labels while preserving node bodies", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const input: GraphInput = {
+      ...graphFixture,
+      nodes: [
+        ...graphFixture.nodes,
+        { id: "component:docs", type: "component", kind: "service", label: "Docs" },
+      ],
+    };
+    const data = createRenderGraphData(input, { ambientMotion: false });
+    const depthById = new Map([
+      ["relation:release", -100],
+      ["component:api", -12],
+      ["component:web", 20],
+      ["component:docs", 100],
+    ]);
+    renderer.setData({
+      ...data,
+      nodes: data.nodes.map((node) => ({
+        ...node,
+        fz: depthById.get(node.id),
+        z: depthById.get(node.id) ?? node.z,
+      })),
+    });
+
+    const observation = renderer.getRenderObservation!();
+    const hidden = observation.nodes.find((node) => node.id === "component:api")!;
+    const fading = observation.nodes.find((node) => node.id === "component:web")!;
+    const nearest = observation.nodes.find((node) => node.id === "component:docs")!;
+
+    expect(hidden.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
+    expect(hidden.label).toMatchObject({
+      minimumVisibleMaterialOpacity: null,
+      objectVisible: false,
+      visibleMaterialOpacities: [],
+    });
+    expect(fading.label.objectVisible).toBe(true);
+    expect(fading.label.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
+    expect(nearest.label.objectVisible).toBe(true);
+    expect(nearest.label.minimumVisibleMaterialOpacity).toBeGreaterThan(
+      fading.label.minimumVisibleMaterialOpacity!,
+    );
+  });
+
   it("moves live node coordinates, labels, links, and camera through one cancellable selection transaction", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
