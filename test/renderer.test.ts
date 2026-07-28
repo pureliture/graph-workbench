@@ -124,6 +124,7 @@ class FakeForceGraph {
     link: { id: string; source: unknown; target: unknown },
   ) => boolean) | undefined;
   nodeDragCallback: (() => void) | undefined;
+  nodeHoverCallback: ((node: (Coordinates & { id: string }) | null) => void) | undefined;
   nodeObjectFactory: ((node: Coordinates & { id: string }) => Object3D) | undefined;
   nodePositionUpdater: ((object: Object3D, coordinates: Coordinates, node: Coordinates & { id: string }) => boolean) | undefined;
   nodeObjects = new Map<string, Object3D>();
@@ -193,7 +194,10 @@ class FakeForceGraph {
   }
   onBackgroundClick(): this { return this; }
   onNodeClick(): this { return this; }
-  onNodeHover(): this { return this; }
+  onNodeHover(callback: (node: (Coordinates & { id: string }) | null) => void): this {
+    this.nodeHoverCallback = callback;
+    return this;
+  }
   renderer(): { domElement: { ownerDocument: FakeOwnerDocument } } {
     return { domElement: { ownerDocument: this.ownerDocument } };
   }
@@ -1252,7 +1256,7 @@ describe("Three.js camera transitions", () => {
     expect("roughness" in selectedMaterial).toBe(false);
   });
 
-  it("keeps quiet light-mode selection context readable below incident hierarchy", () => {
+  it("keeps quiet light-mode bodies and links readable while hiding distant labels", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
@@ -1281,7 +1285,11 @@ describe("Three.js camera transitions", () => {
     const quietNode = observation.nodes.find((node) => node.id === "concept:docs")!;
 
     expect(quietNode.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.2);
-    expect(quietNode.label.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.36);
+    expect(quietNode.label).toMatchObject({
+      minimumVisibleMaterialOpacity: null,
+      objectVisible: false,
+      visibleMaterialOpacities: [],
+    });
     expect(quietLink).toMatchObject({
       minimumVisibleMaterialOpacity: 0.16,
       visibleMaterialLineWidths: [0.68],
@@ -1300,10 +1308,32 @@ describe("Three.js camera transitions", () => {
     const reducedQuietLink = reduced.links.find((link) => link.id === "docs-archive")!;
     const reducedQuietNode = reduced.nodes.find((node) => node.id === "concept:docs")!;
     expect(reducedQuietNode.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.2);
-    expect(reducedQuietNode.label.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.36);
+    expect(reducedQuietNode.label).toMatchObject({
+      minimumVisibleMaterialOpacity: null,
+      objectVisible: false,
+      visibleMaterialOpacities: [],
+    });
     expect(reducedQuietLink).toMatchObject({
       minimumVisibleMaterialOpacity: 0.16,
       visibleMaterialLineWidths: [0.68],
+    });
+  });
+
+  it("keeps ordinary labels visible when the live graph has no meaningful camera-depth range", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const data = createRenderGraphData(graphFixture, { ambientMotion: false });
+    renderer.setData({
+      ...data,
+      nodes: data.nodes.map((node) => ({ ...node, fz: 0, z: 0 })),
+    });
+
+    const observation = renderer.getRenderObservation!();
+    observation.nodes.forEach((node) => {
+      expect(node.label.objectVisible).toBe(true);
+      expect(node.label.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     });
   });
 
@@ -1368,7 +1398,7 @@ describe("Three.js camera transitions", () => {
     });
   });
 
-  it("moves selected, one-hop, and distant nodes through the same world-space selection choreography", () => {
+  it("hides distant labels after selection while preserving selected, neighbor, hover, and master labels", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -1409,17 +1439,35 @@ describe("Three.js camera transitions", () => {
     runLatestFrame(420);
     expect(graph.data.nodes.find((node) => node.id === "component:docs")).toMatchObject(targetById.get("component:docs")!);
     const settledObservation = renderer.getRenderObservation!();
-    const selectedLabelOpacity = settledObservation.nodes.find((node) => node.id === "component:api")
-      ?.label.minimumVisibleMaterialOpacity;
-    const neighborLabelOpacity = settledObservation.nodes.find((node) => node.id === "component:web")
-      ?.label.minimumVisibleMaterialOpacity;
-    const farLabelOpacity = settledObservation.nodes.find((node) => node.id === "component:docs")
-      ?.label.minimumVisibleMaterialOpacity;
+    const selectedLabel = settledObservation.nodes.find((node) => node.id === "component:api")!.label;
+    const neighborLabel = settledObservation.nodes.find((node) => node.id === "component:web")!.label;
+    const masterLabel = settledObservation.nodes.find((node) => node.id === "relation:release")!.label;
+    const farLabel = settledObservation.nodes.find((node) => node.id === "component:docs")!.label;
+    const selectedLabelOpacity = selectedLabel.minimumVisibleMaterialOpacity;
+    const neighborLabelOpacity = neighborLabel.minimumVisibleMaterialOpacity;
     expect(selectedLabelOpacity).toBe(1);
     expect(neighborLabelOpacity).toBeGreaterThanOrEqual(0.68);
-    expect(farLabelOpacity ?? 0).toBeLessThan(0.35);
+    expect(selectedLabel.objectVisible).toBe(true);
+    expect(neighborLabel.objectVisible).toBe(true);
+    expect(masterLabel.objectVisible).toBe(true);
+    expect(farLabel).toMatchObject({
+      minimumVisibleMaterialOpacity: null,
+      objectTracked: true,
+      objectVisible: false,
+      sceneAttached: true,
+      visibleMaterialOpacities: [],
+    });
     expect(selectedLabelOpacity).toBeGreaterThan(neighborLabelOpacity!);
-    expect(neighborLabelOpacity).toBeGreaterThan(farLabelOpacity ?? 0);
+
+    graph.nodeHoverCallback?.(graph.data.nodes.find((node) => node.id === "component:docs")!);
+    const hoveredFarLabel = renderer.getRenderObservation!()
+      .nodes.find((node) => node.id === "component:docs")!.label;
+    expect(hoveredFarLabel.objectVisible).toBe(true);
+    expect(hoveredFarLabel.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.68);
+
+    graph.nodeHoverCallback?.(null);
+    expect(renderer.getRenderObservation!().nodes.find((node) => node.id === "component:docs")!.label)
+      .toMatchObject({ minimumVisibleMaterialOpacity: null, objectVisible: false });
   });
 
   it("settles selection choreography before Orbit, node-drag, fit, zoom, or reduced-motion cancellation", () => {
@@ -1583,12 +1631,22 @@ describe("Three.js camera transitions", () => {
           new BoxGeometry(2, 2, 2),
           new MeshStandardMaterial({ opacity: 1, transparent: true }),
         ));
+        const label = new Sprite(new SpriteMaterial({ opacity: 0.83, transparent: true }));
+        label.userData.graphVisualRole = "node-label";
+        object.add(label);
         customObjects.set(node.id, object);
         return object;
       },
     });
-    const initial = createRenderGraphData(graphFixture, {});
-    const selected = createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] });
+    const expandedInput = {
+      ...graphFixture,
+      nodes: [
+        ...graphFixture.nodes,
+        { id: "component:docs", type: "component" as const, kind: "service", label: "Docs" },
+      ],
+    };
+    const initial = createRenderGraphData(expandedInput, {});
+    const selected = createRenderGraphData(expandedInput, { selectedNodeIds: ["component:api"] });
     renderer.setData(initial);
     expect(customObjects.get("component:api")?.scale.toArray()).toEqual([2, 3, 4]);
     const customBody = customObjects.get("component:api")?.children[0] as Mesh;
@@ -1604,6 +1662,10 @@ describe("Three.js camera transitions", () => {
     expect(customObjects.get("component:api")?.scale.toArray()).toEqual([2, 3, 4]);
     runLatestFrame(420);
     expect(customObjects.get("component:api")?.scale.toArray()).toEqual([2, 3, 4]);
+    const distantCustomLabel = customObjects.get("component:docs")
+      ?.children.find((child) => child.userData.graphVisualRole === "node-label") as Sprite;
+    expect(distantCustomLabel.visible).toBe(true);
+    expect((distantCustomLabel.material as SpriteMaterial).opacity).toBeGreaterThan(0);
   });
 
   it("fits the initial deterministic base graph once after its first resize", () => {

@@ -1530,7 +1530,7 @@ test("observes the master floor and selection-distance opacity in attached scene
   expect(masterScreen.y).toBeLessThan(box.height);
 });
 
-test("keeps persistent scene labels above nodes with renderer-observed near and far depth cues", async ({ page }) => {
+test("keeps important scene labels visible while hiding distant peripheral names", async ({ page }) => {
   await openFixture(page);
   await selectMatrixNode(page, "relation:query");
   expect(await waitForSelection(page, "matrix")).toMatchObject({
@@ -1547,7 +1547,7 @@ test("keeps persistent scene labels above nodes with renderer-observed near and 
     throw new Error("Required label observations were absent from the live scene.");
   }
 
-  for (const node of [selected, neighbor, master, far]) {
+  for (const node of [selected, neighbor, master]) {
     expect(node.label).toMatchObject({
       objectTracked: true,
       objectVisible: true,
@@ -1558,19 +1558,19 @@ test("keeps persistent scene labels above nodes with renderer-observed near and 
     expect(node.label.position?.y ?? 0).toBeGreaterThan(0);
     expect(node.label.visibleMaterialOpacities[0]).toBeGreaterThan(0);
   }
+  expect(far.label).toMatchObject({
+    minimumVisibleMaterialOpacity: null,
+    objectTracked: true,
+    objectVisible: false,
+    sceneAttached: true,
+    visibleMaterialOpacities: [],
+  });
   expect(selected.label.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(
     neighbor.label.minimumVisibleMaterialOpacity ?? 0,
   );
-  expect(neighbor.label.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(
-    far.label.minimumVisibleMaterialOpacity ?? 0,
-  );
-  // Master stays readable even when it is outside the selected neighborhood;
-  // a far peripheral label fades well below both master and selected focus.
+  // Master stays readable even when it is outside the selected neighborhood.
   expect(selected.label.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(
     master.label.minimumVisibleMaterialOpacity ?? 0,
-  );
-  expect(master.label.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(
-    far.label.minimumVisibleMaterialOpacity ?? 0,
   );
   expect(selected.worldScale?.x ?? 0).toBeGreaterThan(neighbor.worldScale?.x ?? 0);
   expect(neighbor.worldScale?.x ?? 0).toBeGreaterThan(far.worldScale?.x ?? 0);
