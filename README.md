@@ -1,39 +1,90 @@
-# graph-workbench
+<div align="center">
 
-Reusable TypeScript 3D graph workbench powered by Three.js and `3d-force-graph`.
+<h1>graph-workbench</h1>
 
-The package only consumes normalized graph input. It does not read files, call Tauri,
-invoke backend commands, or infer domain semantics from the rendered scene.
+<p>
+  정규화된 그래프 데이터를 선택 중심의 결정적 3D 작업대로 렌더링하는<br/>
+  host-neutral TypeScript 라이브러리입니다.<br/><br/>
+  파일, Tauri IPC, backend, domain semantics는 읽지 않으며 영속적인 domain state와<br/>
+  사용자 action의 소유권은 host에 남깁니다.
+</p>
 
-## Install
+<p>
+  <img src="https://img.shields.io/badge/TypeScript-ESM-3178c6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript ESM" />
+  <img src="https://img.shields.io/badge/Three.js-WebGL-111827?style=for-the-badge&logo=threedotjs&logoColor=white" alt="Three.js WebGL" />
+  <img src="https://img.shields.io/badge/Node.js-%3E%3D20-339933?style=for-the-badge&logo=nodedotjs&logoColor=white" alt="Node.js 20 or newer" />
+  <img src="https://img.shields.io/badge/license-MIT-7c3aed?style=for-the-badge" alt="MIT license" />
+</p>
+
+<p>
+  <a href="#빠른-시작">빠른 시작</a> ·
+  <a href="#작동-구조">작동 구조</a> ·
+  <a href="#공개-api">공개 API</a> ·
+  <a href="#host-경계">Host 경계</a> ·
+  <a href="#기여지원보안">기여·지원·보안</a>
+</p>
+
+</div>
+
+![Release workflow를 선택한 graph-workbench browser fixture](assets/readme/graph-workbench-preview.png)
+
+위 화면은 repository의 sanitized browser fixture를 직접 실행해 캡처했습니다. 선택된 node,
+1-hop 이웃, camera reframe, host-owned detail panel이 하나의 selection identity를 공유합니다.
+
+## 핵심 가치
+
+- **선택 중심 상호작용**: mouse, keyboard, programmatic selection이 같은 node identity와
+  `onSelectionChange` 계약을 사용합니다.
+- **결정적 layout**: `layout.seed`와 viewport에서 선택 node와 1-hop 이웃의 target을 계산하며
+  원본 `GraphInput`을 mutate하지 않습니다.
+- **Host-neutral core**: renderer-neutral core와 Three.js browser adapter가 분리되어 test host나
+  custom renderer를 연결할 수 있습니다.
+- **관찰 가능한 renderer**: selection, screen projection, transition, scene object, ambient motion을
+  read-only observation으로 확인할 수 있습니다.
+- **접근 가능한 motion**: light/dark presentation과 reduced motion을 지원하며 browser entry는
+  `prefers-reduced-motion`을 자동 반영합니다.
+
+## 빠른 시작
+
+### 요구사항
+
+- Node.js 20 이상
+- Git client와 GitHub repository 접근
+- ESM을 지원하는 TypeScript/JavaScript build 환경
+- `/browser` entry 사용 시 WebGL을 지원하는 browser 또는 WebView
+
+현재 package registry, tag, GitHub Release는 제공하지 않습니다. Git dependency를 immutable commit으로
+고정해 설치하세요.
 
 ```sh
-npm install git+https://github.com/pureliture/graph-workbench.git#2b40f3936dc05bcf6493cad82009d254825a156f
+npm install git+https://github.com/pureliture/graph-workbench.git#1b4de61af13fdfdc513f5d153c94d050a0cb4726
 ```
 
-This first release is consumed from Git rather than a package registry. Pin an immutable
-commit rather than a moving branch.
+설치 source는 Git이지만 import에는 repository의 package name인
+`@pureliture/graph-workbench`를 사용합니다.
 
-```json
-{
-  "dependencies": {
-    "@pureliture/graph-workbench": "git+https://github.com/pureliture/graph-workbench.git#<commit>"
-  }
+먼저 mount 대상에 실제 크기를 부여합니다.
+
+```html
+<div id="graph"></div>
+```
+
+```css
+#graph {
+  width: 100%;
+  min-height: 32rem;
 }
 ```
 
-## Graph input
-
-`GraphInput` has both static TypeScript types and the exported
-`graphInputJsonSchema` / `validateGraphInput()` runtime contract.
+그다음 정규화된 `GraphInput`을 browser workbench에 전달합니다.
 
 ```ts
-import { createBrowserGraphWorkbench } from "@pureliture/graph-workbench/browser";
 import type { GraphInput } from "@pureliture/graph-workbench";
+import { createBrowserGraphWorkbench } from "@pureliture/graph-workbench/browser";
 
 const input: GraphInput = {
   schemaVersion: 1,
-  layout: { seed: "demo-v1" },
+  layout: { seed: "release-v1" },
   nodes: [
     {
       id: "workflow:release",
@@ -55,140 +106,217 @@ const input: GraphInput = {
       source: "workflow:release",
       target: "component:api",
       relationKind: "workflow-step",
-      ordinal: 1,
-      occurrences: [{ ordinal: 1, id: "release-api" }],
+      occurrences: [{ ordinal: 0, id: "validate-api" }],
     },
   ],
 };
 
 const workbench = createBrowserGraphWorkbench({
   input,
-  onNodeClick: ({ nodeId }) => console.log(nodeId),
-  onSelectionChange: ({ node, neighborNodeIds, settled }) => {
-    // node is the original GraphInput node object; no renderer-local identity leaks.
-    console.log(node?.id, neighborNodeIds, settled);
+  onSelectionChange: ({ node, neighborNodeIds, source }) => {
+    console.log(node?.id, neighborNodeIds, source);
+  },
+  onRendererStateChange: ({ status, reason }) => {
+    if (status === "failed") console.error(reason);
   },
 });
-workbench.mount(document.querySelector("#graph")!);
+
+const graph = document.querySelector<HTMLElement>("#graph");
+if (!graph) throw new Error("#graph mount element is missing");
+
+workbench.mount(graph);
+workbench.fit(0); // 0 ms initial camera fit
+
+export function destroyGraphWorkbench() {
+  workbench.destroy();
+}
 ```
 
-`master` is an explicit role. The renderer does not infer it from node degree,
-screen position, or visual size. Inputs without a master node are valid.
-Bundled links can preserve more than one ordered occurrence through `occurrences`.
+SPA나 component framework에서는 component cleanup에서 `destroyGraphWorkbench()`를 호출하세요.
+같은 instance를 나중에 다시 mount할 예정이면 `destroy()` 대신 `unmount()`를 사용합니다.
+`onRendererStateChange`가 `failed`를 반환하면 host가 fallback UI를 표시해야 합니다.
 
-## Public API
+외부 JSON처럼 type이 확인되지 않은 값은 runtime contract로 검증할 수 있습니다.
 
-- `mount`, `unmount`, `destroy`
-- `setInput`, `setPresentation`, `setReducedMotion`
-- `resize`, `fit`, `zoom`, `selectNode`, `focusNode`, `getSelectionState`,
-  `getNodeScreenPosition`, `getRenderObservation`, `getTransitionObservation`,
-  `restoreCamera`
-- `onNodeClick`, `onNodeHover`, `onFocusChange`, `onSelectionChange`,
-  `onBackgroundClick`, `onRendererStateChange`
+```ts
+import { validateGraphInput } from "@pureliture/graph-workbench";
 
-The root entry is renderer-neutral and can be used with a test or host-provided
-`rendererFactory`. The `/browser` entry is the browser-only Three.js and
-`3d-force-graph` adapter.
+export function parseGraphInput(rawValue: unknown) {
+  return validateGraphInput(rawValue);
+}
+```
 
-The host owns selection persistence and any domain-specific action. It can pass generic
-presentation descriptors for labels, colors, opacity, and link width without exposing
-host actions or private metadata to the core.
+검증 실패 시 `GraphInputValidationError`가 정확한 path별 issue를 포함해 throw됩니다.
 
-`selectNode()` is the canonical programmatic selection path. Mouse clicks, arrow-key
-navigation, and `selectNode()` produce the same selected identity, 1-hop neighborhood,
-and `onSelectionChange` payload. Hosts may provide an optional source label (for example,
-`"matrix"`) when calling `selectNode`. `focusNode()` remains a camera-only compatibility
-method. The payload's `node` is the original node object from the active `GraphInput`;
-graph data is never reconstructed or fetched during selection.
+## 작동 구조
 
-For a selected node, the selected node and its 1-hop neighbors receive deterministic,
-settled renderer-local targets derived from `layout.seed` and the viewport. The core
-does not mutate the input. `getSelectionState()` exposes the selected identity,
-ordered 1-hop IDs, viewport, settled result, and raw `targetNodePositions` actually sent
-to the renderer. Target positions use stable UTF-16 code-unit ID order so hydrated hosts
-can round values only at their display boundary. Re-selecting cancels an enhanced renderer
-camera transition before starting the next target. Existing custom
-`GraphRenderer` implementations remain valid; they may optionally implement
-`cancelCameraTransition()` and `transitionToNode()` for that behavior.
-`getNodeScreenPosition(nodeId)` returns the built-in renderer's current canvas-local
-projection after layout and camera updates. It returns `null` before mount, for an
-unknown node, or when a legacy custom renderer does not implement the optional
-projection seam.
+```mermaid
+flowchart LR
+    H["Host application"] --> I["Normalized GraphInput"]
+    I --> V["validateGraphInput"]
+    V --> C["createGraphWorkbench core"]
+    C --> R["GraphRenderer contract"]
+    R --> B["Three.js browser adapter"]
+    B --> W["WebGL scene"]
+    C --> E["Stable identity events"]
+    E --> H
+```
 
-`getRenderObservation()` exposes the built-in renderer's current graphData IDs
-and read-only evidence for factory-return `Object3D` instances: whether each object
-is still attached to the public Three.js scene, effectively visible, and the opacity
-and line-width values of visible materials. It is `null` before mount and for legacy custom renderers. This
-is scene/object evidence only; it does not claim that a node is visible in rendered
-pixels. Detached stale factory objects are reported as not scene-attached and do not
-contribute material-opacity evidence. Built-in node bodies additionally report
-`defaultBody: { kind: "flat-2.5d", silhouette }`, where `silhouette` is one of
-`circle`, `capsule`, `dot`, or `disk`; host-provided node objects report `null`.
-`defaultBody`는 기존 custom renderer observation과의 source compatibility를 위해 optional이며,
-내장 renderer는 항상 이 필드를 제공합니다.
+| 계층 | 책임 |
+|---|---|
+| Host | graph 생성, domain semantics, selection persistence, detail UI, backend action |
+| Core | input 검증, selection/layout 계산, presentation 정규화, stable event 전달 |
+| Renderer contract | data·camera·observation을 host-provided renderer와 연결 |
+| Browser adapter | Three.js와 `3d-force-graph`를 사용해 WebGL scene 렌더링 |
 
-내장 renderer는 선택을 하나의 취소 가능한 transaction으로 처리합니다. 모든 live node는
-현재 renderer-local 위치에서 deterministic target까지 보간되고, link emphasis, focus rim,
-scale, camera reframe은 같은 bounded animation frame에서 진행됩니다. 명시적 선택은 420 ms
-cubic transition, 선택 해제 복원은 250 ms를 사용하며 reduced motion에서는 즉시 settled
-상태가 됩니다. 기본 node material은 routine-harness Tauri의 semantic light/dark palette와
-flat 2.5D 원형·캡슐·점·디스크 silhouette을 사용합니다. 기본 body와 flow token은 카메라를
-향하는 billboard이므로 camera drift/orbit에서도 edge-on으로 사라지지 않습니다. 깊이는 조명,
-clearcoat, specular, sphere가 아니라 scale과 opacity 계층으로만 표현합니다. host는
-`getTransitionObservation()`으로 active generation, progress, duration, motion mode,
-실제 live node coordinates를 확인할 수 있습니다. 내장 renderer는 선택적으로 실제 camera
-pose evidence(`camera.position`, `camera.lookAt`)도 함께 제공합니다. mount 전과 legacy custom
-renderer에서는 `null`을 반환합니다.
+## `GraphInput` 계약
 
-`setReducedMotion(true)` (or `GraphPresentation.reducedMotion`) keeps the same selection
-and camera target while requesting an immediate transition. Selection distance controls
-node/link opacity, contrast, and label cues. Distant nodes remain present, and an
-explicit `master` role always receives the built-in readability floor.
+`GraphInput`은 TypeScript type과 `graphInputJsonSchema`/`validateGraphInput()` runtime contract를
+함께 제공합니다.
 
-## Ambient motion and depth
+| 필드 | 계약 |
+|---|---|
+| `schemaVersion` | 현재 `1` |
+| `layout.seed` | 비어 있지 않은 deterministic layout seed |
+| `nodes` | unique `id`와 `type`, `kind`, `label`을 가진 node 목록 |
+| `nodes[].roles` | optional array; 현재 허용 role은 `master`뿐이며 전체 input에서 최대 하나만 지정 가능 |
+| `links` | unique `id`, 존재하는 source/target, self-link 금지 |
+| `links[].occurrences` | 하나의 bundled link에 보존할 ordered occurrence 목록 |
+| `metadata` / `extensions` | core가 해석하지 않고 보존하는 host-owned 확장 데이터 |
 
-내장 browser renderer는 기본적으로 `ambientMotion: true`인 조용한 kinetic constellation을
-표현합니다. deterministic `targetNodePositions`와 selection/resize 계산은 그대로 앵커로
-남고, 기본 node Object3D에만 공통의 느린 float와 안정적인 node별 breathing offset을 별도로
-더합니다. 따라서 selection transaction이 끝난 뒤에도 그래프가 멈추지 않으며, legacy/custom
-renderer는 `ambientMotion` 힌트를 무시해도 호환됩니다.
+`master`는 degree, 화면 위치, 크기로 추론되지 않습니다. master가 없는 input도 유효합니다.
+자세한 schema와 validation rule은 [`src/contract.ts`](src/contract.ts)를 참고하세요.
 
-카메라 상대 깊이에 따라 기본 node body와 label의 opacity/scale이 달라집니다. 선택 node와
-1-hop node는 읽기 쉬운 계층을 유지하고, 관련 없는 먼 label은 거의 사라질 수 있습니다.
-명시적 `master`는 별도의 최소 가독성 계층을 유지합니다. 실제 blur나 post-processing은 사용하지
-않습니다.
+## 선택과 표현
 
-idle edge는 조용하지만 읽을 수 있는 0.22–0.28 opacity tier를 유지합니다. hover 또는 selected
-focus의 기본 incident edge만 tessellated
-quadratic curve 위에 2개의 작은 renderer-owned token을 focus에서 이웃 방향으로 흘립니다. custom
-link factory의 geometry와 animation은 건드리지 않습니다. `reducedMotion`에서는 node offset과
-flow가 즉시 0이 되고, document가 hidden이면 motion loop가 멈췄다가 visible에서 시간 점프 없이
-재개됩니다.
+`selectNode()`가 programmatic selection의 canonical path입니다. Mouse click, keyboard navigation,
+`selectNode()`는 같은 selected identity와 ordered 1-hop neighborhood를 만듭니다. `focusNode()`는
+selection을 바꾸지 않는 camera-only compatibility method입니다.
 
-`getAmbientMotionObservation()`은 mount된 내장 renderer의 read-only 관찰 seam입니다. anchor와
-실제 rendered/world·screen node position, elapsed time/frame/phase, focus/lifecycle 상태, link flow와
-particle phase/position을 반환합니다. transition의 앵커 transaction은 기존
-`getTransitionObservation()`으로 계속 확인합니다. `getNodeScreenPosition()` 역시 실제 raycast
-Object3D의 live world transform을 투영하므로, host/fixture는 움직이는 node를 정확한 위치에서
-클릭할 수 있습니다. mount 전 또는 legacy custom renderer에서는 ambient observation이 `null`입니다.
-기본 Line endpoint에는 optional `sourceBoundary`/`targetBoundary` evidence가 추가될 수 있습니다.
-이 값은 기본 flat body에서만 silhouette과 camera-facing bisection trim의 안쪽·바깥쪽 probe 결과를
-제공하며, custom body 또는 legacy observation에서는 `null` 또는 생략될 수 있습니다.
+```ts
+workbench.selectNode("component:api", "matrix");
 
-## Development
+workbench.setPresentation({
+  ambientMotion: true,
+  theme: "dark",
+  nodeDescriptors: {
+    "component:api": { color: "#38bdf8", label: "Public API" },
+  },
+});
+
+// 앱 설정이 reduced motion을 요청할 때만 사용합니다.
+// workbench.setReducedMotion(true);
+```
+
+Mount된 container는 focus 가능해집니다. Arrow keys는 node selection을 이동하고, `Enter`는 현재 node의
+click path를 실행하며, `Escape`는 selection을 해제합니다. Canvas 밖의 접근 가능한 detail/fallback UI는
+host가 제공합니다.
+
+선택 transition은 선택 node, 1-hop 이웃, 나머지 node의 renderer-local target을 같은 transaction에서
+계산합니다. Built-in renderer는 flat 2.5D silhouette, camera-facing label, depth-aware opacity,
+focused edge flow를 제공하며, reduced motion에서는 같은 target에 즉시 도달합니다.
+
+## 공개 API
+
+### Entrypoint
+
+| Import | 용도 | 주요 export |
+|---|---|---|
+| `@pureliture/graph-workbench` | renderer-neutral core, validation, test/custom host | `createGraphWorkbench`, `validateGraphInput`, types |
+| `@pureliture/graph-workbench/browser` | browser/WebView Three.js renderer | `createBrowserGraphWorkbench`, `createThreeForceGraphRenderer`, default node/link factories |
+
+### `GraphWorkbench`
+
+| 범주 | API |
+|---|---|
+| Lifecycle | `mount`, `unmount`, `destroy` |
+| Input/presentation | `setInput`, `setPresentation`, `setReducedMotion` |
+| Selection | `selectNode`, `focusNode`, `getSelectionState` |
+| Camera/layout | `resize`, `fit`, `zoom`, `restoreCamera` |
+| Observation | `getNodeScreenPosition`, `getRenderObservation`, `getTransitionObservation`, `getAmbientMotionObservation` |
+
+Host callback은 `onNodeClick`, `onNodeHover`, `onFocusChange`, `onSelectionChange`,
+`onBackgroundClick`, `onRendererStateChange`입니다. Selection callback의 `node`는 renderer copy가
+아니라 현재 input의 원본 node object입니다.
+
+### Observation 범위
+
+- `getSelectionState()`는 selected identity, ordered 1-hop IDs, viewport, settled target을 반환합니다.
+- `getNodeScreenPosition()`은 현재 camera와 live node transform의 canvas-local projection을 반환합니다.
+- `getTransitionObservation()`은 cancellable selection transition의 generation, progress, live coordinates,
+  optional camera pose를 반환합니다.
+- `getRenderObservation()`은 public scene에 연결된 current factory object와 material evidence를 반환합니다.
+  실제 pixel visibility를 주장하지는 않습니다.
+- `getAmbientMotionObservation()`은 deterministic anchor와 실제 rendered/world/screen position,
+  lifecycle, focused link flow를 반환합니다.
+
+Observation은 상태를 바꾸는 command가 아니라 호출 시점의 read-only evidence snapshot입니다.
+Mount 전이나 해당 optional seam을 구현하지 않은 legacy/custom renderer에서는 `null`일 수 있습니다.
+Observation type과 renderer compatibility contract는
+[`src/renderer-contract.ts`](src/renderer-contract.ts)를 참고하세요.
+
+## 검증과 개발
 
 ```sh
-npm install
+npm ci
 npm run check
 npm run demo
 ```
 
-The browser fixture uses only sanitized example data. It is independent of Tauri and
-can be replaced with any valid `GraphInput`.
+전체 browser fixture 검증은 별도 dependency 설치 후 실행합니다.
+Package 자체는 Node.js 20 이상을 지원하지만, 현재 fixture toolchain은 Node.js 22.13 이상을 요구합니다.
+`check:browser`는 `check`를 먼저 실행하므로 두 명령을 따로 반복할 필요는 없습니다.
 
-## Limits
+```sh
+npm --prefix sites/browser-fixture ci
+npm run check:browser
+```
 
-- The core does not produce graph data or call host IPC.
-- Domain-specific panels, fallback copy, scanning, and SoT readers stay in the host.
-- It does not provide domain-specific collapse state; hosts may change valid input or
-  presentation without any per-click backend work.
+| 검증 경로 | 증명 범위 |
+|---|---|
+| `npm run check` | TypeScript build와 core/unit contract |
+| fixture lint·SSR checks | host fixture와 server-rendered shell |
+| Playwright browser suite | 실제 WebGL canvas, selection, projection, motion, theme, failure path |
+
+[`sites/browser-fixture`](sites/browser-fixture)는 sanitized example data만 사용하는 독립 host입니다.
+Tauri나 production backend를 필요로 하지 않으며 production application qualification을 주장하지 않습니다.
+
+## Host 경계
+
+이 package가 담당하지 않는 영역은 의도적인 contract입니다.
+
+- file discovery, graph 생성, source scanning을 수행하지 않습니다.
+- Tauri command, host IPC, backend API를 호출하지 않습니다.
+- domain-specific panel, fallback copy, action, collapse state를 소유하지 않습니다.
+- host metadata를 해석해 node role이나 topology를 추론하지 않습니다.
+- selection마다 graph를 재조회하거나 input object를 mutate하지 않습니다.
+
+Host는 유효한 input과 presentation을 언제든 교체할 수 있고, selection event를 자체 reducer나
+domain action으로 연결할 수 있습니다.
+
+## 기여·지원·보안
+
+- 재현 가능한 bug report와 기능 제안은 [GitHub Issues](https://github.com/pureliture/graph-workbench/issues)에
+  남겨주세요. 환경, 최소 재현 절차, 기대 동작과 실제 동작을 함께 적으면 확인에 도움이 됩니다.
+- 개발 환경과 pull request 기준은 [CONTRIBUTING.md](CONTRIBUTING.md)를 따릅니다.
+- 취약점이나 민감한 정보가 포함된 문제는 공개 Issue에 세부 내용을 올리지 마세요.
+  안전한 신고 절차는 [SECURITY.md](SECURITY.md)를 확인하세요.
+
+이 프로젝트는 현재 실험적 `0.x` 단계이며 지원 응답 시간이나 호환성 SLA를 보장하지 않습니다.
+
+## 배포 상태
+
+| 항목 | 현재 기준 |
+|---|---|
+| 패키지 버전 | `0.1.0` |
+| 검증한 source commit | `1b4de61af13fdfdc513f5d153c94d050a0cb4726` |
+| 최근 로컬 검증 | 2026-08-02; `npm run check`, `npm run check:browser` |
+| 배포 방식 | Git commit dependency; registry, tag, GitHub Release 없음 |
+| 안정성 | Experimental `0.x`; `1.0.0` 전에는 public API가 변경될 수 있음 |
+
+새 release surface가 생기기 전까지 moving branch 대신 위 immutable SHA를 사용하세요.
+위 검증 기록은 해당 commit에 대한 local test snapshot이며 지속적인 public CI 보장을 의미하지 않습니다.
+
+## License
+
+MIT. 자세한 내용은 [LICENSE](LICENSE)를 참고하세요.

@@ -1,0 +1,21 @@
+name: 비공개 보안 신고 경로 요청
+description: 취약점 세부정보 없이 private reporting channel을 요청합니다.
+title: "security: private channel request"
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        이 Issue는 공개됩니다. 취약점 설명, 재현 절차, exploit, credential, token, 개인 정보,
+        실제 URL·IP·파일 경로, 고객·운영 data를 포함하지 마세요.
+
+        유지보수자는 private GitHub Security Advisory를 만든 뒤 신고자를 collaborator로
+        초대해 세부 내용을 요청합니다.
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: 공개 정보 확인
+      options:
+        - label: 이 요청에는 취약점의 대상·영향·재현 절차를 포함한 어떤 세부정보나 민감정보도 없습니다.
+          required: true

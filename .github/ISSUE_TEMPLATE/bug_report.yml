@@ -1,0 +1,67 @@
+name: 버그 보고
+description: 재현 가능한 동작 오류를 알려 주세요.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        재현에 필요한 정보만 작성해 주세요. token, credential, 개인 정보, 내부 URL·host명,
+        고객 데이터, 비공개 source code를 포함하지 마세요.
+
+        보안 취약점 또는 보안 영향이 의심되는 내용은 공개 issue로 제출하지 말고
+        [보안 정책](https://github.com/pureliture/graph-workbench/security/policy)의 신고 절차를 따라 주세요.
+  - type: textarea
+    id: summary
+    attributes:
+      label: 문제 요약
+      description: 어떤 동작이 기대와 달랐는지 한두 문장으로 설명해 주세요.
+      placeholder: selection 변경 뒤 renderer observation이 갱신되지 않습니다.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 재현 절차
+      description: 공개 가능한 최소 입력과 순서를 번호로 작성해 주세요.
+      placeholder: |
+        1. `createGraphWorkbench`에 최소 `GraphInput`을 전달합니다.
+        2. node를 선택합니다.
+        3. renderer observation을 확인합니다.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 기대한 동작
+      description: 정상 동작을 구체적으로 설명해 주세요.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 실제 동작
+      description: 실제 결과와 공개 가능한 error message를 작성해 주세요.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 환경
+      description: package version 또는 commit, Node.js, browser/WebView, OS, renderer adapter를 알려 주세요.
+      placeholder: |
+        - graph-workbench: 0.1.0 / commit abc1234
+        - Node.js: 22.13.0
+        - Browser 또는 WebView: Chrome 140
+        - OS: macOS 15
+        - Entry: @pureliture/graph-workbench/browser
+    validations:
+      required: true
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: 공개 정보 확인
+      options:
+        - label: 이 보고서에는 secret, private data, security vulnerability 세부정보가 없습니다.
+          required: true

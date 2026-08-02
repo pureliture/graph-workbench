@@ -1,0 +1,61 @@
+name: 작업 제안
+description: 공개 API 또는 host 통합에 필요한 개선을 제안해 주세요.
+title: "task: "
+labels:
+  - type:task
+body:
+  - type: markdown
+    attributes:
+      value: |
+        이 양식은 제품 요구를 검토하기 위한 공개 제안입니다. token, credential, 개인 정보,
+        내부 URL·host명, 고객 데이터, 비공개 source code는 포함하지 마세요.
+
+        보안 취약점 또는 보안 영향이 의심되는 내용은 공개 issue로 제출하지 말고
+        [보안 정책](https://github.com/pureliture/graph-workbench/security/policy)의 신고 절차를 따라 주세요.
+  - type: textarea
+    id: problem
+    attributes:
+      label: 해결하려는 사용 사례
+      description: 누가, 어떤 흐름에서, 무엇을 달성하기 어려운지 설명해 주세요.
+      placeholder: host application에서 selection 상태를 유지한 채 그래프 input을 교체해야 합니다.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 제안하는 결과
+      description: 원하는 API, behavior, 또는 사용자 경험을 설명해 주세요. 구현 방식은 선택 사항입니다.
+    validations:
+      required: true
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: 소유 경계
+      description: 제안의 주된 책임 위치를 선택해 주세요.
+      options:
+        - Core — validation, selection, layout, presentation, stable events
+        - Renderer contract — data, camera, observation 연결
+        - Browser adapter — Three.js 및 browser/WebView 동작
+        - Host application — domain semantics, persistence, detail UI, backend action
+        - 불확실함
+    validations:
+      required: true
+  - type: textarea
+    id: boundary_detail
+    attributes:
+      label: host/core 경계 설명
+      description: host가 계속 소유해야 하는 domain semantics·backend action과 core가 제공해야 할 일반 동작을 구분해 주세요.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 대안 또는 우회 방법
+      description: 이미 시도한 방법이나 고려한 trade-off가 있다면 적어 주세요.
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: 공개 정보 확인
+      options:
+        - label: 이 제안에는 secret, private data, security vulnerability 세부정보가 없습니다.
+          required: true
