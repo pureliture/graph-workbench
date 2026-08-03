@@ -1333,6 +1333,12 @@ export function BrowserGraphFixture() {
           frame.focusNodeId ?? "",
           frame.visibleLinkFlow.map(({ id, particleCount }) => `${id}:${particleCount}`).join(","),
           frame.visibleParticles.length,
+          // A reduced-motion graph may keep the same ambient frame while the
+          // user orbits the camera. Include live projections so this fixture
+          // does not publish a stale camera state after a real drag.
+          frame.renderedScreenPositions.map(({ id, x, y }) => (
+            `${id}:${x.toFixed(3)}:${y.toFixed(3)}`
+          )).join(","),
         ].join(":");
         const shouldPublish = publishedKey !== ambientPublishedKeyRef.current
           && (force || shouldStoreFrame || frame.frame === 0 || frame.paused || frame.reducedMotion);

@@ -1534,12 +1534,12 @@ test("observes the master floor and selection-distance opacity in attached scene
   expect(masterScreen.y).toBeLessThan(box.height);
 });
 
-test("keeps important scene labels visible while hiding distant peripheral names", async ({ page }) => {
+test("keeps every scene label continuously visible while preserving semantic emphasis", async ({ page }) => {
   await openFixture(page);
   const idleObservation = (await waitForRenderObservation(page)).observation;
   const idleVisibleLabelCount = idleObservation.nodes
     .filter((node) => node.label.objectVisible === true).length;
-  expect(idleVisibleLabelCount).toBeLessThanOrEqual(24);
+  expect(idleVisibleLabelCount).toBe(idleObservation.nodes.length);
 
   await selectMatrixNode(page, "relation:query");
   expect(await waitForSelection(page, "matrix")).toMatchObject({
@@ -1568,14 +1568,13 @@ test("keeps important scene labels visible while hiding distant peripheral names
     expect(node.label.visibleMaterialOpacities[0]).toBeGreaterThan(0);
   }
   const visibleLabelCount = observation.nodes.filter((node) => node.label.objectVisible === true).length;
-  expect(visibleLabelCount).toBeLessThanOrEqual(12);
+  expect(visibleLabelCount).toBe(observation.nodes.length);
   expect(far.label).toMatchObject({
-    minimumVisibleMaterialOpacity: null,
     objectTracked: true,
-    objectVisible: false,
+    objectVisible: true,
     sceneAttached: true,
-    visibleMaterialOpacities: [],
   });
+  expect(far.label.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(0);
   expect(selected.label.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(
     neighbor.label.minimumVisibleMaterialOpacity ?? 0,
   );
@@ -1943,34 +1942,48 @@ test("actual canvas hover preserves the current public selection identity", asyn
   expect(normalizedScreenDrift).toBeLessThan(0.05);
 });
 
-test("actual canvas navigation drag preserves the selected public identity", async ({ page }) => {
+test("actual node left-drag orbits the camera without moving the selected node", async ({ page }) => {
   await openFixture(page);
+  await page.getByTestId("reduced-motion-toggle").check();
+  await expect(page.getByTestId("reduced-motion-toggle")).toBeChecked();
+  await waitForMotionSettled(page);
   const canvas = page.getByTestId("graph-canvas");
   const box = await canvas.boundingBox();
   if (!box) throw new Error("graph canvas does not have a measurable bounding box");
 
   await selectMatrixNode(page, "component:api");
   const beforeSelection = await waitForSelection(page, "matrix");
-  const beforeDrag = await waitForAmbientMotion(page, (motion) => (
-    motion.focusNodeId === "component:api" && motion.visibleLinkFlow.some(({ id }) => id === "api-web")
+  await waitForMotionSettled(page);
+  const beforeAmbient = await waitForAmbientMotion(page, (motion) => (
+    motion.reducedMotion
+    && !motion.active
+    && motion.renderedNodePositions.length === fixtureNodeCount
+    && motion.renderedScreenPositions.length === fixtureNodeCount
   ));
-  const render = (await waitForRenderObservation(page)).observation;
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(beforeDrag, render, ["api-web"], "component:api");
-
-  await page.mouse.move(box.x + box.width - 32, box.y + box.height - 32);
-  await page.mouse.down({ button: "right" });
-  await page.mouse.move(box.x + box.width - 200, box.y + box.height - 120, { steps: 4 });
-  await page.mouse.up({ button: "right" });
+  const beforeApiPosition = ambientPosition(beforeAmbient, "component:api", "renderedNodePositions");
+  const beforeWebProjection = ambientScreenPosition(beforeAmbient, "component:web");
+  const apiProjection = await waitForProjectedNodeSeparation(page, "component:api", 22);
+  const startX = box.x + apiProjection.x;
+  const startY = box.y + apiProjection.y;
+  await page.mouse.move(startX, startY);
+  expect(await waitForRawCanvasHover(page, "component:api")).toBe(true);
+  await page.mouse.down({ button: "left" });
+  await page.mouse.move(startX + 120, startY + 64, { steps: 4 });
+  await page.mouse.up({ button: "left" });
 
   await expect(canvas).toBeVisible();
   expect(await readTelemetry<ObservedSelectionState>(page, "graph-selection")).toEqual(beforeSelection);
-  const afterDrag = await waitForAmbientMotionAfter(
-    page,
-    beforeDrag.frame,
-    1,
-    (motion) => motion.focusNodeId === "component:api" && motion.visibleLinkFlow.some(({ id }) => id === "api-web"),
-  );
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(afterDrag, render, ["api-web"], "component:api");
+  let afterAmbient: ObservedAmbientMotion | null = null;
+  await expect.poll(async () => {
+    const candidate = await readTelemetry<AmbientMotion>(page, "graph-ambient-motion");
+    if (candidate.availability !== "observed" || !candidate.reducedMotion) return 0;
+    const afterWebProjection = ambientScreenPosition(candidate, "component:web");
+    const projectionDistance = distanceBetween(beforeWebProjection, afterWebProjection);
+    if (projectionDistance > 4) afterAmbient = candidate;
+    return projectionDistance;
+  }).toBeGreaterThan(4);
+  if (!afterAmbient) throw new Error("A post-drag live renderer observation was not observed.");
+  expect(ambientPosition(afterAmbient, "component:api", "renderedNodePositions")).toEqual(beforeApiPosition);
 });
 
 test("reduced motion reaches the same public selection target and deterministic layout", async ({ browser }) => {
