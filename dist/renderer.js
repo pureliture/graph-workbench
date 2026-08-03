@@ -70,12 +70,13 @@ const STATIC_LABEL_OPACITY = Object.freeze({
     neighbor: 0.72,
     selected: 1,
 });
-// `near` is normalized along the live camera axis: 0 is the deepest node and
-// 1 is the nearest. Unrelated labels fade through the middle band, then leave
-// the scene entirely so a dense graph does not turn into a wall of names.
-const DISTANT_LABEL_VISIBILITY = Object.freeze({
-    fullyVisibleAt: 0.82,
-    hiddenUntil: 0.68,
+// Labels must remain in the scene across the full zoom range. Their perceived
+// size already follows camera distance through SpriteMaterial size attenuation;
+// this soft band only adjusts readability from that projected size.
+const LABEL_PROJECTED_READABILITY = Object.freeze({
+    fullyReadableAtPixels: 14,
+    minimum: 0.18,
+    startsAtPixels: 3,
 });
 const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 4.8, y: 3.6, z: 1.25 });
 const AMBIENT_NODE_BREATHING = Object.freeze({ x: 1.55, y: 1.85, z: 0.72 });
@@ -117,10 +118,18 @@ const IDLE_LABEL_OPACITY = Object.freeze({ far: 0.28, nearRange: 0.46 });
 const IDLE_LINK_OPACITY = Object.freeze({ maximum: 0.28, minimum: 0.22 });
 const IDLE_NODE_SCALE = Object.freeze({ far: 0.86, nearRange: 0.28 });
 const IDLE_LABEL_SCALE = Object.freeze({ far: 0.8, nearRange: 0.2 });
-function distantLabelVisibility(near) {
-    const progress = Math.max(0, Math.min(1, (near - DISTANT_LABEL_VISIBILITY.hiddenUntil)
-        / (DISTANT_LABEL_VISIBILITY.fullyVisibleAt - DISTANT_LABEL_VISIBILITY.hiddenUntil)));
-    return progress * progress * (3 - (2 * progress));
+function smoothstep(progress) {
+    const bounded = Math.max(0, Math.min(1, progress));
+    return bounded * bounded * (3 - (2 * bounded));
+}
+function labelPerspectiveReadability(cameraDistance, labelWorldHeight, projection, viewportHeight) {
+    const halfFovRadians = (projection.fovDegrees * Math.PI) / 360;
+    const projectedHeight = (Math.max(1, labelWorldHeight) * Math.max(1, viewportHeight))
+        / (2 * Math.tan(halfFovRadians) * Math.max(1, cameraDistance));
+    const progress = Math.max(0, Math.min(1, (projectedHeight - LABEL_PROJECTED_READABILITY.startsAtPixels)
+        / (LABEL_PROJECTED_READABILITY.fullyReadableAtPixels - LABEL_PROJECTED_READABILITY.startsAtPixels)));
+    return LABEL_PROJECTED_READABILITY.minimum
+        + ((1 - LABEL_PROJECTED_READABILITY.minimum) * smoothstep(progress));
 }
 function themePalette(theme) {
     return theme === "light" ? THEME_PALETTES.light : THEME_PALETTES.dark;
@@ -610,6 +619,11 @@ function isCameraInteractionControls(controls) {
         && "removeEventListener" in controls
         && typeof controls.removeEventListener === "function";
 }
+function isCursorZoomControls(controls) {
+    return isCameraInteractionControls(controls)
+        && "zoomToCursor" in controls
+        && typeof controls.zoomToCursor === "boolean";
+}
 function cameraFrameScheduler(container) {
     const view = container.ownerDocument?.defaultView;
     const requestAnimationFrame = view?.requestAnimationFrame ?? globalThis.requestAnimationFrame;
@@ -853,13 +867,6 @@ function setObjectMaterialOpacity(object, opacity) {
         return;
     updateObjectMaterials(object, { opacity });
 }
-function isMalformedVendorDragRelease(event, ownerDocument) {
-    // 3d-force-graph 1.80.0 emits this coordinate-less event after node drag.
-    return event.target === ownerDocument
-        && event.isTrusted === false
-        && event.pointerType === "touch"
-        && event.pointerId === 0;
-}
 export function createThreeForceGraphRenderer({ callbacks, container, nodeObjectFactory = createDefaultGraphNodeObject, linkObjectFactory = createDefaultGraphLinkObject, }) {
     const TypedForceGraph3D = ForceGraph3D;
     const graph = new TypedForceGraph3D(container, {
@@ -945,13 +952,10 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     const ownerDocument = graph.renderer().domElement.ownerDocument;
     const controls = graph.controls();
     const cameraInteractionControls = isCameraInteractionControls(controls) ? controls : null;
+    const cursorZoomControls = isCursorZoomControls(controls) ? controls : null;
+    if (cursorZoomControls)
+        cursorZoomControls.zoomToCursor = true;
     let cameraControlInteractionActive = false;
-    const suppressMalformedVendorDragRelease = (event) => {
-        if (isMalformedVendorDragRelease(event, ownerDocument)) {
-            event.stopImmediatePropagation();
-        }
-    };
-    ownerDocument.addEventListener("pointerup", suppressMalformedVendorDragRelease, true);
     const nodeDescriptor = (node) => descriptorForNode(node, currentPresentation.nodeDescriptors?.[node.id]);
     const linkDescriptor = (link) => descriptorForLink(link, currentPresentation.linkDescriptors?.[link.id]);
     const defaultVisualInputForNode = (node) => (currentDefaultNodeVisualInputs.get(node.id)
@@ -963,6 +967,10 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     graph
         .backgroundColor("#08111f")
         .showNavInfo(false)
+        // Explore mode reserves a left-button drag for the live OrbitControls.
+        // A layout edit has no persistence contract here, so enabling vendor
+        // DragControls would only compete with selection and camera navigation.
+        .enableNodeDrag(false)
         .nodeId("id")
         .linkSource("source")
         .linkTarget("target")
@@ -1013,12 +1021,6 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         applyAmbientVisuals();
         ensureMotionFrame();
         callbacks.onNodeHover(hoverNodeId);
-    })
-        // 3d-force-graph uses separate DragControls for nodes, so OrbitControls'
-        // events do not cover this path.
-        .onNodeDrag(() => {
-        pendingSceneTransition = null;
-        cancelCameraTransition();
     })
         .onBackgroundClick(() => callbacks.onBackgroundClick());
     function setNodePosition(node, position, lock) {
@@ -1451,7 +1453,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         }
         const depthSpan = maximumDepth - minimumDepth;
         const depthRange = Math.max(1, depthSpan);
-        const hasMeaningfulDepthRange = Number.isFinite(depthSpan) && depthSpan > 1;
+        const projection = boundedPerspectiveProjection(graph.camera(), data.selection.viewport);
         const selectedNodeId = data.selection.nodeId;
         const focusNodeId = ambientFocusNodeId();
         const lightSelectedContext = data.presentation.theme === "light" && selectedNodeId !== null;
@@ -1481,9 +1483,6 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 ? LIGHT_SELECTED_CONTEXT_FLOOR.bodyOpacity
                 : 0, state.baseOpacity * bodyFactor);
             const labelAlwaysVisible = selected || neighbor || focused || hovered || master;
-            const labelDistanceVisibility = labelAlwaysVisible || !hasMeaningfulDepthRange
-                ? 1
-                : distantLabelVisibility(near);
             const baseLabelOpacity = selected
                 ? 1
                 : neighbor || focused || hovered
@@ -1496,8 +1495,6 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const contextLabelOpacity = lightSelectedContext && !selected && !neighbor && !focused && !hovered
                 ? Math.max(baseLabelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity)
                 : baseLabelOpacity;
-            const readableLabelOpacity = contextLabelOpacity * labelDistanceVisibility;
-            const labelVisible = labelAlwaysVisible || labelDistanceVisibility > 0;
             const viewportScale = Math.max(0.82, Math.min(1.15, 480 / Math.max(1, Math.min(data.selection.viewport.width, data.selection.viewport.height))));
             let scale = selectedNodeId
                 ? 0.64 + (near * 0.33)
@@ -1508,9 +1505,15 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             else if (neighbor || focused) {
                 scale = 0.82 + (near * 0.24);
             }
-            applyAmbientDefaultNodeVisual(state, opacity, scale, labelVisible, readableLabelOpacity, viewportScale * (selectedNodeId
+            const labelScale = viewportScale * (selectedNodeId
                 ? 0.62 + (near * 0.38)
-                : IDLE_LABEL_SCALE.far + (near * IDLE_LABEL_SCALE.nearRange)));
+                : IDLE_LABEL_SCALE.far + (near * IDLE_LABEL_SCALE.nearRange));
+            const labelDistance = Math.hypot(state.renderedX - camera.position.x, state.renderedY - camera.position.y, state.renderedZ - camera.position.z);
+            const labelPerspectiveVisibility = labelAlwaysVisible
+                ? 1
+                : labelPerspectiveReadability(labelDistance, (state.defaultVisual?.baseLabelScale.y ?? 8) * scale * labelScale, projection, data.selection.viewport.height);
+            const readableLabelOpacity = contextLabelOpacity * labelPerspectiveVisibility;
+            applyAmbientDefaultNodeVisual(state, opacity, scale, true, readableLabelOpacity, labelScale);
         }
     }
     function renderedState(id) {
@@ -2485,7 +2488,6 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             destroyed = true;
             deferredDataDuringTransition = null;
             cancelCameraTransition();
-            ownerDocument.removeEventListener("pointerup", suppressMalformedVendorDragRelease, true);
             ownerDocument.removeEventListener("visibilitychange", onVisibilityChange);
             cameraInteractionControls?.removeEventListener("start", beginCameraControlInteraction);
             cameraInteractionControls?.removeEventListener("change", updateCameraControlInteraction);

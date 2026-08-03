@@ -37,15 +37,11 @@ interface Coordinates {
   z: number;
 }
 
-interface PointerUpRegistration {
-  readonly capture: boolean;
-  readonly listener: (event: PointerEvent) => void;
-}
-
 type CameraControlEvent = "change" | "end" | "start";
 
 class FakeCameraControls {
   readonly listeners = new Map<CameraControlEvent, Set<() => void>>();
+  zoomToCursor = false;
 
   addEventListener(event: CameraControlEvent, listener: () => void): void {
     const eventListeners = this.listeners.get(event) ?? new Set<() => void>();
@@ -67,7 +63,6 @@ class FakeCameraControls {
 }
 
 class FakeOwnerDocument {
-  readonly pointerUpListeners: PointerUpRegistration[] = [];
   readonly visibilityListeners = new Set<() => void>();
   visibilityState: DocumentVisibilityState = "visible";
 
@@ -78,13 +73,7 @@ class FakeOwnerDocument {
   ): void {
     if (type === "visibilitychange" && typeof listener === "function") {
       this.visibilityListeners.add(listener as () => void);
-      return;
     }
-    if (type !== "pointerup" || typeof listener !== "function") return;
-    this.pointerUpListeners.push({
-      capture: typeof options === "boolean" ? options : options?.capture ?? false,
-      listener: listener as (event: PointerEvent) => void,
-    });
   }
 
   removeEventListener(
@@ -94,14 +83,7 @@ class FakeOwnerDocument {
   ): void {
     if (type === "visibilitychange" && typeof listener === "function") {
       this.visibilityListeners.delete(listener as () => void);
-      return;
     }
-    if (type !== "pointerup" || typeof listener !== "function") return;
-    const capture = typeof options === "boolean" ? options : options?.capture ?? false;
-    const index = this.pointerUpListeners.findIndex((registration) => (
-      registration.listener === listener && registration.capture === capture
-    ));
-    if (index >= 0) this.pointerUpListeners.splice(index, 1);
   }
 
   setVisibility(next: DocumentVisibilityState): void {
@@ -123,7 +105,7 @@ class FakeForceGraph {
     coordinates: { end: Coordinates; start: Coordinates },
     link: { id: string; source: unknown; target: unknown },
   ) => boolean) | undefined;
-  nodeDragCallback: (() => void) | undefined;
+  nodeDragEnabled = true;
   nodeHoverCallback: ((node: (Coordinates & { id: string }) | null) => void) | undefined;
   nodeObjectFactory: ((node: Coordinates & { id: string }) => Object3D) | undefined;
   nodePositionUpdater: ((object: Object3D, coordinates: Coordinates, node: Coordinates & { id: string }) => boolean) | undefined;
@@ -141,6 +123,10 @@ class FakeForceGraph {
   backgroundColor(): this { return this; }
   camera(): typeof this.cameraProjection { return this.cameraProjection; }
   controls(): FakeCameraControls { return this.cameraControls; }
+  enableNodeDrag(enabled: boolean): this {
+    this.nodeDragEnabled = enabled;
+    return this;
+  }
   graph2ScreenCoords(x: number, y: number, z: number): Coordinates {
     this.projectionCalls.push({ x, y, z });
     return { x: x + 100, y: y + 200, z };
@@ -182,10 +168,6 @@ class FakeForceGraph {
   nodeLabel(): this { return this; }
   nodePositionUpdate(callback: (object: Object3D, coordinates: Coordinates, node: Coordinates & { id: string }) => boolean): this {
     this.nodePositionUpdater = callback;
-    return this;
-  }
-  onNodeDrag(callback: () => void): this {
-    this.nodeDragCallback = callback;
     return this;
   }
   nodeThreeObject(factory: (node: Coordinates & { id: string }) => Object3D): this {
@@ -431,7 +413,7 @@ describe("Three.js camera transitions", () => {
     expect(graph.cameraSetters.every(({ duration }) => duration === 0)).toBe(true);
   });
 
-  it("cancels active transitions for OrbitControls interaction and built-in node drag", () => {
+  it("uses cursor-centered OrbitControls while reserving node drags for camera navigation", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -440,6 +422,8 @@ describe("Three.js camera transitions", () => {
       },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
     });
+    expect(graph.nodeDragEnabled).toBe(false);
+    expect(graph.cameraControls.zoomToCursor).toBe(true);
     renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] }));
 
     renderer.transitionToNode!("component:api", { reducedMotion: false });
@@ -450,55 +434,10 @@ describe("Three.js camera transitions", () => {
     expect(graph.cameraSetters).toHaveLength(0);
 
     graph.cameraControls.dispatch("end");
-    renderer.transitionToNode!("component:api", { reducedMotion: false });
-    graph.cameraControls.dispatch("change");
-    expect(frames.has(2)).toBe(true);
-
-    graph.cameraControls.dispatch("start");
-    renderer.transitionToNode!("component:api", { reducedMotion: false });
-    graph.nodeDragCallback?.();
-    expect(cancelledFrames).toEqual([1, 2, 3]);
-
     renderer.destroy();
     expect(graph.cameraControls.listenerCount("start")).toBe(0);
     expect(graph.cameraControls.listenerCount("change")).toBe(0);
     expect(graph.cameraControls.listenerCount("end")).toBe(0);
-  });
-
-  it("suppresses only the malformed vendor drag release and removes the guard on destroy", () => {
-    const renderer = createThreeForceGraphRenderer({
-      callbacks: {
-        onBackgroundClick() {},
-        onNodeClick() {},
-        onNodeHover() {},
-      },
-      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
-    });
-    expect(graph.ownerDocument.pointerUpListeners).toHaveLength(1);
-    expect(graph.ownerDocument.pointerUpListeners[0]?.capture).toBe(true);
-
-    const stopMalformedRelease = vi.fn();
-    graph.ownerDocument.pointerUpListeners[0]?.listener({
-      isTrusted: false,
-      pointerId: 0,
-      pointerType: "touch",
-      stopImmediatePropagation: stopMalformedRelease,
-      target: graph.ownerDocument,
-    } as unknown as PointerEvent);
-    expect(stopMalformedRelease).toHaveBeenCalledOnce();
-
-    const stopNativeMouseRelease = vi.fn();
-    graph.ownerDocument.pointerUpListeners[0]?.listener({
-      isTrusted: true,
-      pointerId: 1,
-      pointerType: "mouse",
-      stopImmediatePropagation: stopNativeMouseRelease,
-      target: {},
-    } as unknown as PointerEvent);
-    expect(stopNativeMouseRelease).not.toHaveBeenCalled();
-
-    renderer.destroy();
-    expect(graph.ownerDocument.pointerUpListeners).toHaveLength(0);
   });
 
   it("projects the current renderer node coordinates into canvas-local screen coordinates", () => {
@@ -1129,7 +1068,7 @@ describe("Three.js camera transitions", () => {
     expect(idleNear.bodyMaterialColor).toBe("#60a5fa");
     expect(idleFar.bodyMaterialColor).toBe("#f59e0b");
     expect(idleNear.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.5);
-    expect(idleFar.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.22);
+    expect(idleFar.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(idleNear.minimumVisibleMaterialOpacity).toBeGreaterThan(idleFar.minimumVisibleMaterialOpacity!);
     expect(idleNear.worldScale!.x).toBeGreaterThan(idleFar.worldScale!.x);
     expect(idleLink.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.22);
@@ -1256,7 +1195,7 @@ describe("Three.js camera transitions", () => {
     expect("roughness" in selectedMaterial).toBe(false);
   });
 
-  it("keeps quiet light-mode bodies and links readable while hiding distant labels", () => {
+  it("keeps quiet light-mode bodies and links readable with continuously faded labels", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
@@ -1284,12 +1223,11 @@ describe("Three.js camera transitions", () => {
     const quietLink = observation.links.find((link) => link.id === "docs-archive")!;
     const quietNode = observation.nodes.find((node) => node.id === "concept:docs")!;
 
-    expect(quietNode.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.2);
+    expect(quietNode.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(quietNode.label).toMatchObject({
-      minimumVisibleMaterialOpacity: null,
-      objectVisible: false,
-      visibleMaterialOpacities: [],
+      objectVisible: true,
     });
+    expect(quietNode.label.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(quietLink).toMatchObject({
       minimumVisibleMaterialOpacity: 0.16,
       visibleMaterialLineWidths: [0.68],
@@ -1307,12 +1245,11 @@ describe("Three.js camera transitions", () => {
     const reduced = renderer.getRenderObservation!()!;
     const reducedQuietLink = reduced.links.find((link) => link.id === "docs-archive")!;
     const reducedQuietNode = reduced.nodes.find((node) => node.id === "concept:docs")!;
-    expect(reducedQuietNode.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.2);
+    expect(reducedQuietNode.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(reducedQuietNode.label).toMatchObject({
-      minimumVisibleMaterialOpacity: null,
-      objectVisible: false,
-      visibleMaterialOpacities: [],
+      objectVisible: true,
     });
+    expect(reducedQuietNode.label.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(reducedQuietLink).toMatchObject({
       minimumVisibleMaterialOpacity: 0.16,
       visibleMaterialLineWidths: [0.68],
@@ -1337,7 +1274,7 @@ describe("Three.js camera transitions", () => {
     });
   });
 
-  it("keeps only the camera-nearest ordinary labels while preserving node bodies", () => {
+  it("keeps ordinary labels continuously visible while perspective changes their readability", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
@@ -1366,22 +1303,39 @@ describe("Three.js camera transitions", () => {
     });
 
     const observation = renderer.getRenderObservation!();
-    const hidden = observation.nodes.find((node) => node.id === "component:api")!;
+    const farthest = observation.nodes.find((node) => node.id === "component:api")!;
     const fading = observation.nodes.find((node) => node.id === "component:web")!;
     const nearest = observation.nodes.find((node) => node.id === "component:docs")!;
 
-    expect(hidden.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
-    expect(hidden.label).toMatchObject({
-      minimumVisibleMaterialOpacity: null,
-      objectVisible: false,
-      visibleMaterialOpacities: [],
-    });
+    expect(farthest.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
+    expect(farthest.label.objectVisible).toBe(true);
+    expect(farthest.label.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(fading.label.objectVisible).toBe(true);
-    expect(fading.label.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
+    expect(fading.label.minimumVisibleMaterialOpacity).toBeGreaterThan(
+      farthest.label.minimumVisibleMaterialOpacity!,
+    );
     expect(nearest.label.objectVisible).toBe(true);
     expect(nearest.label.minimumVisibleMaterialOpacity).toBeGreaterThan(
       fading.label.minimumVisibleMaterialOpacity!,
     );
+
+    const farthestLabelOpacityAt = (cameraZ: number) => {
+      graph.pose = {
+        lookAt: { x: 0, y: 0, z: 0 },
+        position: { x: 0, y: 0, z: cameraZ },
+      };
+      graph.cameraControls.dispatch("change");
+      const label = renderer.getRenderObservation!()
+        .nodes.find((node) => node.id === "component:api")!.label;
+      expect(label.objectVisible).toBe(true);
+      expect(label.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
+      return label.minimumVisibleMaterialOpacity!;
+    };
+    const distantZoom = farthestLabelOpacityAt(480);
+    const mediumZoom = farthestLabelOpacityAt(260);
+    const closeZoom = farthestLabelOpacityAt(120);
+    expect(mediumZoom).toBeGreaterThan(distantZoom);
+    expect(closeZoom).toBeGreaterThan(mediumZoom);
   });
 
   it("moves live node coordinates, labels, links, and camera through one cancellable selection transaction", () => {
@@ -1445,7 +1399,7 @@ describe("Three.js camera transitions", () => {
     });
   });
 
-  it("hides distant labels after selection while preserving selected, neighbor, hover, and master labels", () => {
+  it("keeps distant labels continuous after selection while preserving semantic emphasis", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -1498,12 +1452,11 @@ describe("Three.js camera transitions", () => {
     expect(neighborLabel.objectVisible).toBe(true);
     expect(masterLabel.objectVisible).toBe(true);
     expect(farLabel).toMatchObject({
-      minimumVisibleMaterialOpacity: null,
       objectTracked: true,
-      objectVisible: false,
+      objectVisible: true,
       sceneAttached: true,
-      visibleMaterialOpacities: [],
     });
+    expect(farLabel.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(selectedLabelOpacity).toBeGreaterThan(neighborLabelOpacity!);
 
     graph.nodeHoverCallback?.(graph.data.nodes.find((node) => node.id === "component:docs")!);
@@ -1513,11 +1466,16 @@ describe("Three.js camera transitions", () => {
     expect(hoveredFarLabel.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.68);
 
     graph.nodeHoverCallback?.(null);
-    expect(renderer.getRenderObservation!().nodes.find((node) => node.id === "component:docs")!.label)
-      .toMatchObject({ minimumVisibleMaterialOpacity: null, objectVisible: false });
+    const unhoveredFarLabel = renderer.getRenderObservation!()
+      .nodes.find((node) => node.id === "component:docs")!.label;
+    expect(unhoveredFarLabel.objectVisible).toBe(true);
+    expect(unhoveredFarLabel.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
+    expect(unhoveredFarLabel.minimumVisibleMaterialOpacity).toBeLessThan(
+      hoveredFarLabel.minimumVisibleMaterialOpacity!,
+    );
   });
 
-  it("settles selection choreography before Orbit, node-drag, fit, zoom, or reduced-motion cancellation", () => {
+  it("settles selection choreography before Orbit, fit, zoom, or reduced-motion cancellation", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -1545,11 +1503,6 @@ describe("Three.js camera transitions", () => {
     orbitStaleFrame(420);
     expect(JSON.stringify(graph.data.nodes)).toBe(orbitSettled);
     graph.cameraControls.dispatch("end");
-
-    moveSelectionHalfway(renderer, selectedWeb, "component:web");
-    graph.nodeDragCallback?.();
-    expectLiveNodesAt(selectedWeb);
-    expect(graph.nodeObjects.get("component:web")?.scale.toArray()).toEqual([1.22, 1.22, 1.22]);
 
     moveSelectionHalfway(renderer, selectedApi, "component:api");
     renderer.fit(250);
