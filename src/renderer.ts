@@ -23,8 +23,14 @@ import {
 
 import type { GraphNode } from "./contract.js";
 import type { RenderGraphData, RenderLink, RenderNode } from "./layout.js";
-import type { GraphLinkDescriptor, GraphNodeDescriptor, GraphPresentation } from "./presentation.js";
 import type {
+  GraphLabelVisibility,
+  GraphLinkDescriptor,
+  GraphNodeDescriptor,
+  GraphPresentation,
+} from "./presentation.js";
+import type {
+  GraphActivityState,
   GraphCameraTransitionOptions,
   GraphAmbientMotionLinkEndpointObservation,
   GraphAmbientMotionLinkEndpointBoundaryObservation,
@@ -43,6 +49,7 @@ import type {
   GraphRenderObjectObservation,
   GraphRenderObservation,
   GraphRenderTransformObservation,
+  GraphRecoveryCapsule,
   GraphNodeObjectFactory,
   GraphRenderer,
   GraphRendererFactoryOptions,
@@ -52,6 +59,7 @@ import type {
 } from "./renderer-contract.js";
 
 export type {
+  GraphActivityState,
   GraphLinkObjectFactory,
   GraphAmbientMotionLinkEndpointObservation,
   GraphAmbientMotionLinkEndpointBoundaryObservation,
@@ -69,6 +77,7 @@ export type {
   GraphRenderObjectObservation,
   GraphRenderObservation,
   GraphRenderTransformObservation,
+  GraphRecoveryCapsule,
   GraphNodeObjectFactory,
   GraphRenderer,
   GraphRendererFactoryOptions,
@@ -311,6 +320,17 @@ function descriptorForLink(link: RenderLink, supplied: GraphLinkDescriptor | und
     opacity: supplied?.opacity ?? link.visual.opacity,
     width: supplied?.width ?? link.visual.width,
   };
+}
+
+function labelVisibilityForNode(
+  node: RenderNode,
+  presentation: GraphPresentation,
+): GraphLabelVisibility {
+  const policy = presentation.labelVisibility;
+  return policy?.byNodeId?.[node.id]
+    ?? policy?.byType?.[node.type]
+    ?? policy?.default
+    ?? "auto";
 }
 
 function nodeEmissiveIntensity(node: RenderNode): number {
@@ -902,6 +922,16 @@ function interpolate(start: number, end: number, progress: number): number {
   return start + ((end - start) * progress);
 }
 
+function cameraTransitionDuration(
+  options: GraphCameraTransitionOptions,
+  fallback: number,
+): number {
+  if (options.reducedMotion) return 0;
+  return Number.isFinite(options.durationMs)
+    ? Math.max(0, options.durationMs!)
+    : fallback;
+}
+
 function easeInOutCubic(progress: number): number {
   const bounded = Math.min(1, Math.max(0, progress));
   return bounded < 0.5
@@ -1200,6 +1230,29 @@ function renderDataRevision(data: RenderGraphData): string {
   });
 }
 
+function hostRecoveryKeyForData(data: RenderGraphData | null): string | null {
+  return data?.presentation.recoveryKey ?? null;
+}
+
+function isCameraPose(value: GraphTransitionObservation["camera"]): value is NonNullable<GraphTransitionObservation["camera"]> {
+  if (!value) return false;
+  return [
+    value.position.x,
+    value.position.y,
+    value.position.z,
+    value.lookAt.x,
+    value.lookAt.y,
+    value.lookAt.z,
+  ].every((coordinate) => Number.isFinite(coordinate));
+}
+
+function cloneCameraPose(pose: CameraPose): CameraPose {
+  return {
+    lookAt: { ...pose.lookAt },
+    position: { ...pose.position },
+  };
+}
+
 function firstMaterialOpacity(object: Object3D | undefined, fallback: number): number {
   if (!object) return fallback;
   const opacities = visibleMaterialOpacities(object);
@@ -1236,6 +1289,12 @@ function sceneVisualForNode(
   const baseOpacity = boundedOpacity(descriptor.opacity, node.visual.opacity);
   const isSelected = data.selection.nodeId === node.id;
   const isNeighbor = data.selection.neighborNodeIds.includes(node.id);
+  const labelVisibility = labelVisibilityForNode(node, data.presentation);
+  const interactionVisible = isSelected
+    || isNeighbor
+    || data.presentation.focusNodeId === node.id;
+  const labelVisible = labelVisibility !== "hidden"
+    && (labelVisibility !== "interaction" || interactionVisible);
   // The initial camera faces the positive Z direction. A stable world-space
   // depth cue therefore gives receding nodes smaller, quieter silhouettes even
   // before the user starts orbiting; selection keeps the active node crisp.
@@ -1259,9 +1318,11 @@ function sceneVisualForNode(
     // Bodies can recede with depth, while node names retain a high-contrast
     // floor. Counteracting the group depth scale and boosting narrow viewports
     // makes distant labels readable without reviving outlines or focus rings.
-    labelVisible: true,
-    labelOpacity,
-    labelScale: (isSelected ? 1 : 1 / depthScale) * viewportScale,
+    labelVisible,
+    labelOpacity: labelVisible ? labelOpacity : 0,
+    // A zero scale keeps a hidden default Sprite out of label bounds and
+    // raycasting while its immutable base scale remains available for reuse.
+    labelScale: labelVisible ? (isSelected ? 1 : 1 / depthScale) * viewportScale : 0,
     opacity: Math.max(node.visual.opacityFloor, isSelected ? baseOpacity : baseOpacity * depthOpacity),
     scale: isSelected ? 1.22 : depthScale,
   };
@@ -1336,6 +1397,13 @@ export function createThreeForceGraphRenderer({
   let ambientCameraAnchor: CameraPose | null = null;
   let ambientCameraAnchorElapsedMs = 0;
   let ambientCameraLastPose: CameraPose | null = null;
+  let focusCameraBaseline: CameraPose | null = null;
+  let activityState: GraphActivityState = {};
+  let explicitlySuspended = false;
+  let zeroSized = container.clientWidth <= 0 || container.clientHeight <= 0;
+  let webglContextLost = false;
+  let webglRecoveryCapsule: GraphRecoveryCapsule | null = null;
+  const privateRecoveryRevisions = new WeakMap<GraphRecoveryCapsule, string>();
   const ambientNodes = new Map<string, AmbientNodeState>();
   const ambientLinks = new Map<string, AmbientLinkState>();
   const defaultLinkBoundaryEvidenceByObject = new WeakMap<Line, CachedDefaultLinkBoundaryEvidence>();
@@ -1388,7 +1456,8 @@ export function createThreeForceGraphRenderer({
     progress: 1,
     reducedMotion: false,
   };
-  const ownerDocument = graph.renderer().domElement.ownerDocument;
+  const renderElement = graph.renderer().domElement;
+  const ownerDocument = renderElement.ownerDocument;
   const controls = graph.controls();
   const cameraInteractionControls = isCameraInteractionControls(controls) ? controls : null;
   const cursorZoomControls = isCursorZoomControls(controls) ? controls : null;
@@ -1750,9 +1819,30 @@ export function createThreeForceGraphRenderer({
     return currentData?.selection.nodeId ?? hoverNodeId ?? currentPresentation.focusNodeId ?? null;
   }
 
+  function reducedMotionEnabled(): boolean {
+    return activityState.reducedMotion
+      ?? currentData?.presentation.reducedMotion
+      ?? currentPresentation.reducedMotion
+      ?? false;
+  }
+
+  function hostActivityAllowsMotion(): boolean {
+    return activityState.expanded !== false
+      && activityState.foreground !== false
+      && activityState.intersecting !== false;
+  }
+
+  function rendererMotionPaused(): boolean {
+    return explicitlySuspended
+      || zeroSized
+      || webglContextLost
+      || ownerDocument.visibilityState === "hidden"
+      || !hostActivityAllowsMotion();
+  }
+
   function ambientMotionEnabled(): boolean {
     return currentData?.presentation.ambientMotion !== false
-      && currentData?.presentation.reducedMotion !== true
+      && !reducedMotionEnabled()
       && !ambientPaused
       && ambientNodes.size > 0;
   }
@@ -1955,6 +2045,10 @@ export function createThreeForceGraphRenderer({
       const neighbor = data.selection.neighborNodeIds.includes(node.id);
       const focused = node.id === focusNodeId;
       const hovered = node.id === hoverNodeId;
+      const labelVisibility = labelVisibilityForNode(node, data.presentation);
+      const interactionVisible = selected || neighbor || focused || hovered;
+      const labelVisible = labelVisibility !== "hidden"
+        && (labelVisibility !== "interaction" || interactionVisible);
       // Keep semantic readability floors in the renderer-owned state built
       // from the canonical visual contract, not a vendor live node's fields.
       const master = state.isMaster;
@@ -1973,7 +2067,9 @@ export function createThreeForceGraphRenderer({
           : 0,
         state.baseOpacity * bodyFactor,
       );
-      const labelAlwaysVisible = selected || neighbor || focused || hovered || master;
+      const labelAlwaysReadable = labelVisibility === "always"
+        || interactionVisible
+        || (labelVisibility === "auto" && master);
       const baseLabelOpacity = selected
         ? 1
         : neighbor || focused || hovered
@@ -2006,7 +2102,7 @@ export function createThreeForceGraphRenderer({
         state.renderedY - camera.position.y,
         state.renderedZ - camera.position.z,
       );
-      const labelPerspectiveVisibility = labelAlwaysVisible
+      const labelPerspectiveVisibility = labelAlwaysReadable
         ? 1
         : labelPerspectiveReadability(
           labelDistance,
@@ -2014,14 +2110,16 @@ export function createThreeForceGraphRenderer({
           projection,
           data.selection.viewport.height,
         );
-      const readableLabelOpacity = contextLabelOpacity * labelPerspectiveVisibility;
+      const readableLabelOpacity = labelVisible
+        ? contextLabelOpacity * labelPerspectiveVisibility
+        : 0;
       applyAmbientDefaultNodeVisual(
         state,
         opacity,
         scale,
-        true,
+        labelVisible,
         readableLabelOpacity,
-        labelScale,
+        labelVisible ? labelScale : 0,
       );
     }
   }
@@ -2592,7 +2690,9 @@ export function createThreeForceGraphRenderer({
         visual.scale,
         data.selection.nodeId === node.id ? visual.opacity : 0,
         visual.labelVisible,
-        lightQuietContext ? Math.max(visual.labelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity) : visual.labelOpacity,
+        lightQuietContext && visual.labelVisible
+          ? Math.max(visual.labelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity)
+          : visual.labelOpacity,
         visual.labelScale,
       );
     });
@@ -2903,8 +3003,36 @@ export function createThreeForceGraphRenderer({
     }
   }
 
+  function refreshMotionPauseState(): void {
+    const nextPaused = rendererMotionPaused();
+    const pauseChanged = ambientPaused !== nextPaused;
+    ambientPaused = nextPaused;
+    ambientLastTimestamp = null;
+    if (nextPaused) {
+      // Settle scene state but preserve the exact live camera pose. A resumed
+      // host must not replay a transition from an old start pose.
+      if (activeTransition) cancelCameraTransition();
+      if (motionFrame !== null) frameScheduler.cancel(motionFrame);
+      motionFrame = null;
+      ambientVisualsDirty = false;
+      if (pauseChanged) applyAmbientVisuals();
+      return;
+    }
+    if (!transitionTick && !ambientMotionEnabled() && motionFrame !== null) {
+      frameScheduler.cancel(motionFrame);
+      motionFrame = null;
+    }
+    if (pauseChanged) applyAmbientVisuals();
+    ensureMotionFrame();
+  }
+
   function ensureMotionFrame(): void {
-    if (destroyed || motionFrame !== null || (!transitionTick && !ambientMotionEnabled())) return;
+    if (
+      destroyed
+      || ambientPaused
+      || motionFrame !== null
+      || (!transitionTick && !ambientMotionEnabled())
+    ) return;
     let frameId = 0;
     frameId = frameScheduler.request((timestamp) => {
       if (motionFrame !== frameId) return;
@@ -2934,19 +3062,7 @@ export function createThreeForceGraphRenderer({
   }
 
   const onVisibilityChange = () => {
-    const hidden = ownerDocument.visibilityState === "hidden";
-    ambientPaused = hidden;
-    ambientLastTimestamp = null;
-    if (hidden) {
-      if (activeTransition) activeTransition.startedAt = null;
-      if (motionFrame !== null) frameScheduler.cancel(motionFrame);
-      motionFrame = null;
-      ambientVisualsDirty = false;
-      applyAmbientVisuals();
-      return;
-    }
-    applyAmbientVisuals();
-    ensureMotionFrame();
+    refreshMotionPauseState();
   };
   ownerDocument.addEventListener("visibilitychange", onVisibilityChange);
 
@@ -2994,6 +3110,68 @@ export function createThreeForceGraphRenderer({
   function setCameraPose(pose: CameraPose): void {
     graph.cameraPosition(pose.position, pose.lookAt, 0);
   }
+
+  function captureRecoveryCapsule(): GraphRecoveryCapsule | null {
+    if (destroyed) return null;
+    const capsule: GraphRecoveryCapsule = {
+      camera: cloneCameraPose(cameraPose()),
+      recoveryKey: hostRecoveryKeyForData(currentData),
+      restoreBaseline: focusCameraBaseline ? cloneCameraPose(focusCameraBaseline) : null,
+      schemaVersion: 1,
+    };
+    if (capsule.recoveryKey === null && currentDataRevision !== null) {
+      // Keyless recovery is intentionally same-renderer only. The exact
+      // compatibility revision remains private and is lost on clone/serialize.
+      privateRecoveryRevisions.set(capsule, currentDataRevision);
+    }
+    return capsule;
+  }
+
+  function restoreRecoveryCapsule(capsule: GraphRecoveryCapsule): boolean {
+    const currentHostRecoveryKey = hostRecoveryKeyForData(currentData);
+    const identityMatches = capsule.recoveryKey !== null
+      ? capsule.recoveryKey === currentHostRecoveryKey
+      : currentHostRecoveryKey === null
+        && currentDataRevision !== null
+        && privateRecoveryRevisions.get(capsule) === currentDataRevision;
+    if (
+      destroyed
+      || capsule.schemaVersion !== 1
+      || !identityMatches
+      || !isCameraPose(capsule.camera)
+      || (capsule.restoreBaseline !== null && !isCameraPose(capsule.restoreBaseline))
+    ) {
+      return false;
+    }
+    pendingSceneTransition = null;
+    cancelCameraTransition();
+    setCameraPose(cloneCameraPose(capsule.camera));
+    focusCameraBaseline = capsule.restoreBaseline
+      ? cloneCameraPose(capsule.restoreBaseline)
+      : null;
+    ambientCameraAnchor = null;
+    ambientCameraLastPose = null;
+    applyAmbientVisuals();
+    ensureMotionFrame();
+    return true;
+  }
+
+  const onWebGLContextLost = (event: Event) => {
+    event.preventDefault();
+    webglRecoveryCapsule = captureRecoveryCapsule();
+    webglContextLost = true;
+    refreshMotionPauseState();
+  };
+  const onWebGLContextRestored = () => {
+    const capsule = webglRecoveryCapsule;
+    webglRecoveryCapsule = null;
+    webglContextLost = false;
+    if (capsule) restoreRecoveryCapsule(capsule);
+    refreshMotionPauseState();
+  };
+  renderElement.addEventListener("webglcontextlost", onWebGLContextLost);
+  renderElement.addEventListener("webglcontextrestored", onWebGLContextRestored);
+  refreshMotionPauseState();
 
   function startTransition({
     durationMs,
@@ -3131,15 +3309,28 @@ export function createThreeForceGraphRenderer({
     if (activeTransition) cancelCameraTransition();
     const targetCamera = nodeCameraTarget(nodeId);
     if (!targetCamera) return;
+    focusCameraBaseline ??= cloneCameraPose(cameraPose());
     const scene = pendingSceneTransition?.targetFocusNodeId === nodeId
       ? pendingSceneTransition
       : null;
     pendingSceneTransition = null;
     startTransition({
-      durationMs: options.reducedMotion ? 0 : scene?.durationMs ?? 420,
+      durationMs: cameraTransitionDuration(options, scene?.durationMs ?? 420),
       reducedMotion: options.reducedMotion,
       scene,
       targetCamera,
+    });
+  }
+
+  function restoreFocusCamera(options: GraphCameraTransitionOptions): void {
+    pendingSceneTransition = null;
+    const baseline = focusCameraBaseline;
+    if (!baseline) return;
+    focusCameraBaseline = null;
+    startTransition({
+      durationMs: cameraTransitionDuration(options, 250),
+      reducedMotion: options.reducedMotion,
+      targetCamera: baseline,
     });
   }
 
@@ -3191,6 +3382,7 @@ export function createThreeForceGraphRenderer({
 
   return {
     cancelCameraTransition,
+    captureRecoveryCapsule,
     destroy() {
       if (destroyed) return;
       if (motionFrame !== null) frameScheduler.cancel(motionFrame);
@@ -3201,6 +3393,8 @@ export function createThreeForceGraphRenderer({
       deferredDataDuringTransition = null;
       cancelCameraTransition();
       ownerDocument.removeEventListener("visibilitychange", onVisibilityChange);
+      renderElement.removeEventListener("webglcontextlost", onWebGLContextLost);
+      renderElement.removeEventListener("webglcontextrestored", onWebGLContextRestored);
       cameraInteractionControls?.removeEventListener("start", beginCameraControlInteraction);
       cameraInteractionControls?.removeEventListener("change", updateCameraControlInteraction);
       cameraInteractionControls?.removeEventListener("end", endCameraControlInteraction);
@@ -3208,6 +3402,7 @@ export function createThreeForceGraphRenderer({
       renderedLinkObjects.clear();
       ambientNodes.clear();
       ambientLinks.clear();
+      webglRecoveryCapsule = null;
       particleGroup.removeFromParent();
       if (!particleResourcesDisposed) {
         particleResourcesDisposed = true;
@@ -3218,6 +3413,7 @@ export function createThreeForceGraphRenderer({
     },
     fit(durationMs = 250) {
       pendingSceneTransition = null;
+      focusCameraBaseline = null;
       transitionToFit(durationMs);
     },
     focus(nodeId) {
@@ -3287,7 +3483,7 @@ export function createThreeForceGraphRenderer({
         particles,
         paused: ambientPaused,
         phase: (ambientElapsedMs / 1000) * AMBIENT_RADIANS_PER_SECOND,
-        reducedMotion: currentData.presentation.reducedMotion === true,
+        reducedMotion: reducedMotionEnabled(),
         renderedNodePositions,
         renderedScreenPositions,
       };
@@ -3306,16 +3502,33 @@ export function createThreeForceGraphRenderer({
       };
     },
     resize(width, height) {
+      const requestedWidth = width ?? container.clientWidth;
+      const requestedHeight = height ?? container.clientHeight;
+      zeroSized = requestedWidth <= 0 || requestedHeight <= 0;
       const next = dimensions(container, width, height);
       graph.width(next.width).height(next.height);
-      if (initialFitPending && currentData) {
+      if (!zeroSized && initialFitPending && currentData) {
         graph.zoomToFit(0, 28);
         initialFitPending = false;
       }
+      refreshMotionPauseState();
+    },
+    resume() {
+      if (destroyed) return;
+      explicitlySuspended = false;
+      refreshMotionPauseState();
     },
     restoreCamera() {
       pendingSceneTransition = null;
+      focusCameraBaseline = null;
       transitionToFit(250);
+    },
+    restoreFocusCamera,
+    restoreRecoveryCapsule,
+    setActivityState(state) {
+      if (destroyed) return;
+      activityState = { ...state };
+      refreshMotionPauseState();
     },
     setData(data) {
       applyData(data);
@@ -3333,10 +3546,16 @@ export function createThreeForceGraphRenderer({
         if (!activeTransition && !pendingSceneTransition) applyFinalVisuals(currentData);
         rebuildAmbientState();
         applyAmbientVisuals();
+        refreshMotionPauseState();
         ensureMotionFrame();
         return;
       }
       applyData(nextData);
+    },
+    suspend() {
+      if (destroyed) return;
+      explicitlySuspended = true;
+      refreshMotionPauseState();
     },
     transitionToNode,
     zoom(scale) {

@@ -52,7 +52,8 @@ export interface RenderGraphData {
 }
 /**
  * Creates renderer-local, deterministic positions and visual cues without mutating GraphInput.
- * A selection locks only the selected node and its one-hop neighborhood to settled targets.
+ * A selection locks only the selected node and its one-hop neighborhood to settled targets
+ * unless the host asks to preserve the existing deterministic layout.
  */
 export declare function createRenderGraphData(input: GraphInput, presentation: GraphPresentation, options?: GraphLayoutOptions): RenderGraphData;
 //# sourceMappingURL=layout.d.ts.map

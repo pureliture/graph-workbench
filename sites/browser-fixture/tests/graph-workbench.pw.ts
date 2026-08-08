@@ -1598,6 +1598,37 @@ test("keeps every scene label continuously visible while preserving semantic emp
   ))).toBe(true);
 });
 
+test("applies host type label visibility policy to live Sprite observations", async ({ page }) => {
+  await openFixture(page);
+  const defaultObservation = (await waitForRenderObservation(page)).observation;
+  expect(defaultObservation.nodes.every((node) => node.label.objectVisible === true)).toBe(true);
+
+  await page.getByTestId("host-label-visibility-policy").click();
+  await expect.poll(async () => {
+    const telemetry = await readTelemetry<ObservedRenderTelemetry>(page, "host-label-visibility-observation");
+    if (telemetry.availability !== "observed") return false;
+    const component = telemetry.observation.nodes.find(({ id }) => id === "component:api");
+    const relation = telemetry.observation.nodes.find(({ id }) => id === "relation:release");
+    return component?.label.objectVisible === false && relation?.label.objectVisible === true;
+  }).toBe(true);
+
+  const { observation } = await readTelemetry<ObservedRenderTelemetry>(page, "host-label-visibility-observation");
+  const component = observation.nodes.find(({ id }) => id === "component:api");
+  const relation = observation.nodes.find(({ id }) => id === "relation:release");
+  if (!component || !relation) throw new Error("Required label observations were absent from the live scene.");
+
+  expect(component.label).toMatchObject({
+    objectTracked: true,
+    objectVisible: false,
+    sceneAttached: true,
+  });
+  expect(relation.label).toMatchObject({
+    objectTracked: true,
+    objectVisible: true,
+    sceneAttached: true,
+  });
+});
+
 test("reproduces selected target positions from the same seed and viewport", async ({ page }) => {
   await openFixture(page);
 

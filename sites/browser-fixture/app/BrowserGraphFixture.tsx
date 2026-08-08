@@ -587,6 +587,11 @@ interface ObservedRenderTelemetry {
 
 type RenderTelemetry = ObservedRenderTelemetry | UnavailableTelemetry | UnknownTelemetry;
 
+type LabelVisibilityTelemetry = RenderTelemetry | {
+  readonly availability: "pending";
+  readonly reason: string;
+};
+
 interface MotionTelemetryFrame {
   readonly positions: readonly {
     readonly id: string;
@@ -648,6 +653,15 @@ const graphPresentationByMode = {
     readonly linkColor: string;
   }
 >;
+
+const typeLabelVisibilityPolicy = {
+  labelVisibility: {
+    byType: {
+      component: "hidden",
+      relation: "always",
+    },
+  },
+} as const;
 
 function testIdForNode(prefix: string, nodeId: string): string {
   return `${prefix}-${nodeId.replace(/:/g, "-")}`;
@@ -823,6 +837,10 @@ export function BrowserGraphFixture() {
     availability: "pending",
     reason: null,
   });
+  const [labelVisibilityTelemetry, setLabelVisibilityTelemetry] = useState<LabelVisibilityTelemetry>({
+    availability: "pending",
+    reason: "Waiting for a host label-visibility policy interaction.",
+  });
   const [motionTelemetry, setMotionTelemetry] = useState<MotionTelemetry>({
     availability: "pending",
     reason: null,
@@ -839,7 +857,11 @@ export function BrowserGraphFixture() {
   const [collapsed, setCollapsed] = useState(false);
   const [matrixOpen, setMatrixOpen] = useState(false);
   const [matrixQuery, setMatrixQuery] = useState("");
-  const [hostUpdate, setHostUpdate] = useState({ setInputSafe: false, collapseSafe: false });
+  const [hostUpdate, setHostUpdate] = useState({
+    setInputSafe: false,
+    collapseSafe: false,
+    labelVisibilitySafe: false,
+  });
   const rendererAvailable = renderer.status === "mounted" && webglState === "mounted";
   const observedSelection = selectionTelemetry.availability === "observed" ? selectionTelemetry : null;
   const filteredNodes = graphInput.nodes.filter((node) => {
@@ -864,6 +886,43 @@ export function BrowserGraphFixture() {
     setCollapsed(nextCollapsed);
     setHostUpdate((current) => ({ ...current, collapseSafe: true }));
   }, []);
+
+  const applyTypeLabelVisibilityPolicy = useCallback(() => {
+    const workbench = workbenchRef.current;
+    if (!rendererReadyRef.current || !workbench) return;
+
+    const selection = workbench.getSelectionState();
+    const mode = resolvedMode ?? "dark";
+    const palette = graphPresentationByMode[mode];
+    workbench.setPresentation({
+      ...typeLabelVisibilityPolicy,
+      focusNodeId: selection.nodeId,
+      linkDescriptors: Object.fromEntries(
+        graphInput.links.map((link) => [link.id, { color: palette.linkColor }]),
+      ),
+      reducedMotion,
+      selectedNodeIds: selection.nodeId ? [selection.nodeId] : [],
+      theme: mode,
+    });
+    setSelectionState(workbench.getSelectionState());
+    setRenderTelemetry({
+      availability: "pending",
+      reason: "Waiting for the host label-visibility renderer scene observation.",
+    });
+    const observation = workbench.getRenderObservation();
+    setLabelVisibilityTelemetry(observation
+      ? {
+          availability: "observed",
+          observation,
+          observationScope: "renderer-live-data-and-scene-object-material",
+        }
+      : {
+          availability: "unknown",
+          reason: "The host label-visibility policy did not expose a live renderer observation.",
+        });
+    setRenderObservationRevision((revision) => revision + 1);
+    setHostUpdate((current) => ({ ...current, labelVisibilitySafe: true }));
+  }, [reducedMotion, resolvedMode]);
 
   const openMatrixPalette = useCallback(() => {
     matrixReturnFocusRef.current = document.activeElement instanceof HTMLElement
@@ -1573,6 +1632,19 @@ export function BrowserGraphFixture() {
               <path d="M4.75 9A8 8 0 1 1 4 13.45M4.75 9V4.5m0 4.5h4.5" />
             </svg>
           </button>
+          <button
+            aria-label="Hide component labels and keep relation labels visible"
+            className="icon-control"
+            data-testid="host-label-visibility-policy"
+            disabled={!rendererAvailable}
+            onClick={applyTypeLabelVisibilityPolicy}
+            title="Apply type label visibility policy"
+            type="button"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M4 6h16M4 12h10m-10 6h16M17 9v6m-3-3h6" />
+            </svg>
+          </button>
           <label className="motion-toggle" title={reducedMotion ? "Enable motion" : "Reduce motion"}>
             <input
               aria-label={reducedMotion ? "Enable motion" : "Reduce motion"}
@@ -1811,6 +1883,7 @@ export function BrowserGraphFixture() {
           <Telemetry testId="graph-rendered-node-ids" value={renderedNodeIdsTelemetry} />
           <Telemetry testId="graph-rendered-link-ids" value={renderedLinkIdsTelemetry} />
           <Telemetry testId="graph-render-observation" value={renderTelemetry} />
+          <Telemetry testId="host-label-visibility-observation" value={labelVisibilityTelemetry} />
           <Telemetry testId="graph-selection" value={selectionTelemetry} />
           <Telemetry testId="graph-selection-transition" value={selectionTransitionTelemetry} />
           <Telemetry testId="graph-node-hover" value={nodeHoverTelemetry} />
