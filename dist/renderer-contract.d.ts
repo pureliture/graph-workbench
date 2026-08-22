@@ -154,6 +154,11 @@ export interface GraphRenderNodeObservation extends GraphRenderObjectObservation
     /** Default node body's current material color, or null for custom objects. */
     readonly bodyMaterialColor: string | null;
     /**
+     * Built-in body Object3D observation. This stays scene-attached when density
+     * culling hides it, so callers can distinguish visual culling from removal.
+     */
+    readonly body?: GraphRenderObjectObservation | null;
+    /**
      * Default flat body identity, or null when a host supplied the node object.
      * Optional so existing custom renderer observations remain source-compatible.
      */

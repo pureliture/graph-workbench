@@ -15,6 +15,7 @@ export interface GraphNodeVisualCue {
 
 export interface GraphLinkVisualCue {
   readonly opacity: number;
+  readonly visible: boolean;
   readonly width: number;
 }
 
@@ -269,17 +270,15 @@ function visualCue(node: GraphNode, selectedNodeId: string | null, neighborNodeI
   };
 }
 
-function linkVisualCue(link: GraphLink, selectedNodeId: string | null, neighborNodeIds: ReadonlySet<string>): GraphLinkVisualCue {
-  // Edges establish a field, not a wireframe cage. The selected relationship
-  // rises just enough to explain the focused node while the rest recedes.
-  if (!selectedNodeId) return { opacity: 0.14, width: 0.8 };
+function linkVisualCue(link: GraphLink, selectedNodeId: string | null): GraphLinkVisualCue {
+  // Without a selection, edges establish the full relationship field. Once a
+  // node is selected, only its incident edges remain so the local structure is
+  // immediately legible.
+  if (!selectedNodeId) return { opacity: 0.14, visible: true, width: 0.8 };
   const selectedLink = link.source === selectedNodeId || link.target === selectedNodeId;
-  const neighborhoodLink = neighborNodeIds.has(link.source) && neighborNodeIds.has(link.target);
   return selectedLink
-    ? { opacity: 0.62, width: 1.25 }
-    : neighborhoodLink
-      ? { opacity: 0.32, width: 0.95 }
-      : { opacity: 0.1, width: 0.6 };
+    ? { opacity: 0.62, visible: true, width: 1.25 }
+    : { opacity: 0.1, visible: false, width: 0.6 };
 }
 
 function selectedLayoutPositions(
@@ -403,7 +402,7 @@ export function createRenderGraphData(
   });
   const links = input.links.map((link) => ({
     ...link,
-    visual: linkVisualCue(link, selectedNodeId, neighborNodeIdSet),
+    visual: linkVisualCue(link, selectedNodeId),
   }));
   const targetNodePositions = nodes
     .map(({ id, x, y, z }) => ({ id, x, y, z }))

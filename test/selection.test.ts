@@ -104,6 +104,31 @@ describe("selection-driven layout", () => {
     expect(first.links.map((link) => link.relationKind)).toEqual(["workflow-step", "serves"]);
   });
 
+  it("keeps only selected-node incident links visible and restores the full field when cleared", () => {
+    const input = {
+      ...graphFixture,
+      nodes: [
+        ...graphFixture.nodes,
+        { id: "concept:docs", type: "concept" as const, kind: "reference", label: "Docs" },
+        { id: "concept:archive", type: "concept" as const, kind: "reference", label: "Archive" },
+      ],
+      links: [
+        ...graphFixture.links,
+        { id: "docs-archive", source: "concept:docs", target: "concept:archive", relationKind: "references" },
+      ],
+    };
+
+    const idle = createRenderGraphData(input, {});
+    const selected = createRenderGraphData(input, { selectedNodeIds: ["component:api"] });
+
+    expect(idle.links.every((link) => link.visual.visible)).toBe(true);
+    expect(new Map(selected.links.map((link) => [link.id, link.visual.visible]))).toEqual(new Map([
+      ["release-api", true],
+      ["api-web", true],
+      ["docs-archive", false],
+    ]));
+  });
+
   it("uses a deterministic vertically clustered depth field and re-stages every non-pinned node on selection", () => {
     const input = {
       ...graphFixture,

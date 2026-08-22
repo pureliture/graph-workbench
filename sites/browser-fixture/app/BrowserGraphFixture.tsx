@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type GraphAmbientMotionObservation,
   type GraphInput,
+  type GraphNode,
   type GraphRenderLinkObservation,
   type GraphRenderNodeObservation,
   type GraphRenderObservation,
@@ -625,6 +626,15 @@ interface RendererState {
   readonly status: RendererStatus;
 }
 
+interface DetailRelationship {
+  readonly direction: "incoming" | "outgoing";
+  readonly linkId: string;
+  readonly nodeId: string;
+  readonly nodeLabel: string;
+  readonly ordinal: number;
+  readonly relationKind: string;
+}
+
 const projectionSampleLimit = 180;
 const renderObservationSampleLimit = 180;
 // This is fixture-only evidence, never a renderer hot path. Keep it below the
@@ -632,8 +642,9 @@ const renderObservationSampleLimit = 180;
 const ambientTelemetrySampleIntervalMs = 50;
 const nodeIds = graphInput.nodes.map((node) => node.id);
 const linkIds = graphInput.links.map((link) => link.id);
-const nodesById = new Map(graphInput.nodes.map((node) => [node.id, node]));
+const nodesById = new Map<string, GraphNode>(graphInput.nodes.map((node) => [node.id, node]));
 const masterNodeId = graphInput.nodes.find((node) => node.roles?.includes("master"))?.id ?? null;
+const termSearchParameter = "term";
 
 const graphPresentationByMode = {
   light: {
@@ -651,6 +662,74 @@ const graphPresentationByMode = {
 
 function testIdForNode(prefix: string, nodeId: string): string {
   return `${prefix}-${nodeId.replace(/:/g, "-")}`;
+}
+
+function detailSummary(node: GraphNode): string {
+  const explicitSummary = node.metadata?.summary;
+  if (typeof explicitSummary === "string" && explicitSummary.trim().length > 0) return explicitSummary;
+
+  const domain = node.metadata?.domain;
+  const domainSuffix = typeof domain === "string" && domain.trim().length > 0
+    ? ` in the ${domain} domain`
+    : "";
+  return `${node.label} is a ${node.kind} ${node.type}${domainSuffix}.`;
+}
+
+function detailRelationships(nodeId: string): readonly DetailRelationship[] {
+  return graphInput.links
+    .map((link, inputIndex) => {
+      if (link.source !== nodeId && link.target !== nodeId) return null;
+      const direction = link.source === nodeId ? "outgoing" as const : "incoming" as const;
+      const relatedNodeId = direction === "outgoing" ? link.target : link.source;
+      const relatedNode = nodesById.get(relatedNodeId);
+      return {
+        direction,
+        linkId: link.id,
+        nodeId: relatedNodeId,
+        nodeLabel: relatedNode?.label ?? relatedNodeId,
+        ordinal: link.ordinal ?? inputIndex,
+        relationKind: link.relationKind,
+      };
+    })
+    .filter((relationship): relationship is DetailRelationship => relationship !== null)
+    .sort((left, right) => (
+      left.ordinal - right.ordinal
+      || left.nodeLabel.localeCompare(right.nodeLabel)
+      || left.linkId.localeCompare(right.linkId)
+    ));
+}
+
+function navigationTarget(nodeId: string, direction: -1 | 1): GraphNode | null {
+  const currentIndex = graphInput.nodes.findIndex((node) => node.id === nodeId);
+  if (currentIndex < 0 || graphInput.nodes.length === 0) return null;
+  const nextIndex = (currentIndex + direction + graphInput.nodes.length) % graphInput.nodes.length;
+  return graphInput.nodes[nextIndex] ?? null;
+}
+
+function termPath(nodeId: string | null): string {
+  const location = new URL(window.location.href);
+  if (nodeId) location.searchParams.set(termSearchParameter, nodeId);
+  else location.searchParams.delete(termSearchParameter);
+  return `${location.pathname}${location.search}${location.hash}`;
+}
+
+function selectedNodeMarkdown(node: GraphNode, relationships: readonly DetailRelationship[]): string {
+  const relationshipLines = relationships.length > 0
+    ? relationships.map((relationship) => (
+      `- ${relationship.direction === "outgoing" ? "→" : "←"} ${relationship.nodeLabel} (${relationship.relationKind})`
+    )).join("\n")
+    : "- No direct graph connections.";
+  return [
+    `# ${node.label}`,
+    "",
+    detailSummary(node),
+    "",
+    `- Identity: \`${node.id}\``,
+    `- Kind: ${node.kind}`,
+    "",
+    "## Connects to",
+    relationshipLines,
+  ].join("\n");
 }
 
 function applySystemPresentation(
@@ -777,6 +856,7 @@ export function BrowserGraphFixture() {
   const detailPanelRef = useRef<HTMLElement | null>(null);
   const detailWasOpenRef = useRef(false);
   const graphHostRef = useRef<HTMLDivElement | null>(null);
+  const initialTermAppliedRef = useRef(false);
   const matrixPaletteRef = useRef<HTMLElement | null>(null);
   const matrixReturnFocusRef = useRef<HTMLElement | null>(null);
   const matrixSearchInputRef = useRef<HTMLInputElement | null>(null);
@@ -837,6 +917,7 @@ export function BrowserGraphFixture() {
   const [resolvedMode, setResolvedMode] = useState<ResolvedMode | null>(null);
   const [reducedMotion, setReducedMotion] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
+  const [detailActionStatus, setDetailActionStatus] = useState<string | null>(null);
   const [matrixOpen, setMatrixOpen] = useState(false);
   const [matrixQuery, setMatrixQuery] = useState("");
   const [hostUpdate, setHostUpdate] = useState({ setInputSafe: false, collapseSafe: false });
@@ -853,16 +934,29 @@ export function BrowserGraphFixture() {
     workbenchRef.current?.selectNode(nodeId, source);
   }, []);
 
+  const selectTermFromLocation = useCallback((source: GraphSelectionSource) => {
+    if (!rendererReadyRef.current || !workbenchRef.current) return;
+    const rawTerm = new URL(window.location.href).searchParams.get(termSearchParameter);
+    if (rawTerm === null && source === "deep-link") return;
+    const nodeId = rawTerm && nodesById.has(rawTerm) ? rawTerm : null;
+    if (rawTerm !== null && nodeId === null) {
+      window.history.replaceState(window.history.state, "", termPath(null));
+      if (source === "deep-link") return;
+    }
+    workbenchRef.current.selectNode(nodeId, source);
+  }, []);
+
+  const clearSelection = useCallback((source: GraphSelectionSource) => {
+    setCollapsed(false);
+    setHostUpdate((current) => ({ ...current, collapseSafe: true }));
+    selectNode(null, source);
+  }, [selectNode]);
+
   const updateReducedMotion = useCallback((nextReducedMotion: boolean) => {
     if (!rendererReadyRef.current) return;
     reducedMotionRef.current = nextReducedMotion;
     setReducedMotion(nextReducedMotion);
     workbenchRef.current?.setReducedMotion(nextReducedMotion);
-  }, []);
-
-  const updateCollapsed = useCallback((nextCollapsed: boolean) => {
-    setCollapsed(nextCollapsed);
-    setHostUpdate((current) => ({ ...current, collapseSafe: true }));
   }, []);
 
   const openMatrixPalette = useCallback(() => {
@@ -877,6 +971,12 @@ export function BrowserGraphFixture() {
     matrixSearchInputRef.current = input;
     if (input && matrixOpen) input.focus();
   }, [matrixOpen]);
+
+  useEffect(() => {
+    const restoreSelectionFromHistory = () => selectTermFromLocation("history");
+    window.addEventListener("popstate", restoreSelectionFromHistory);
+    return () => window.removeEventListener("popstate", restoreSelectionFromHistory);
+  }, [selectTermFromLocation]);
 
   useEffect(() => {
     const openMatrix = (event: KeyboardEvent) => {
@@ -940,6 +1040,7 @@ export function BrowserGraphFixture() {
     let zoomFrame: number | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let syncColorScheme: ((event: MediaQueryListEvent) => void) | null = null;
+    initialTermAppliedRef.current = false;
 
     const markRendererUnavailable = (reason: string, destroy = false) => {
       if (disposed) return;
@@ -992,7 +1093,15 @@ export function BrowserGraphFixture() {
             if (!rendererReadyRef.current) return;
             const next = workbenchRef.current?.getSelectionState();
             if (next) setSelectionState(next);
-            if (event.nodeId) setCollapsed(false);
+            setCollapsed(false);
+            setDetailActionStatus(null);
+            if (event.source !== "deep-link" && event.source !== "history") {
+              const nextPath = termPath(event.nodeId);
+              const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+              if (nextPath !== currentPath) {
+                window.history.pushState({ graphWorkbenchTerm: event.nodeId }, "", nextPath);
+              }
+            }
             setSelectedScreenPosition({
               availability: "pending",
               reason: event.nodeId
@@ -1131,8 +1240,15 @@ export function BrowserGraphFixture() {
       window.cancelAnimationFrame(animationFrame);
       workbenchRef.current?.destroy();
       workbenchRef.current = null;
+      initialTermAppliedRef.current = false;
     };
-  }, []);
+  }, [selectTermFromLocation]);
+
+  useEffect(() => {
+    if (initialViewportTelemetry.availability !== "observed" || initialTermAppliedRef.current) return;
+    initialTermAppliedRef.current = true;
+    selectTermFromLocation("deep-link");
+  }, [initialViewportTelemetry, selectTermFromLocation]);
 
   useEffect(() => {
     const nodeId = observedSelection?.nodeId ?? null;
@@ -1387,6 +1503,46 @@ export function BrowserGraphFixture() {
   }, [renderer.status, rendererAvailable]);
 
   const selectedNode = observedSelection?.nodeId ? nodesById.get(observedSelection.nodeId) ?? null : null;
+  const selectedRelationships = useMemo(
+    () => selectedNode ? detailRelationships(selectedNode.id) : [],
+    [selectedNode],
+  );
+  const previousNode = selectedNode ? navigationTarget(selectedNode.id, -1) : null;
+  const nextNode = selectedNode ? navigationTarget(selectedNode.id, 1) : null;
+
+  const copySelectedNodeMarkdown = useCallback(async () => {
+    if (!selectedNode) return;
+    try {
+      await navigator.clipboard.writeText(selectedNodeMarkdown(selectedNode, selectedRelationships));
+      setDetailActionStatus("Markdown copied.");
+    } catch {
+      setDetailActionStatus("Clipboard access is unavailable.");
+    }
+  }, [selectedNode, selectedRelationships]);
+
+  const shareSelectedNode = useCallback(async () => {
+    if (!selectedNode) return;
+    const url = new URL(termPath(selectedNode.id), window.location.origin).toString();
+    const shareNavigator = navigator as Navigator & {
+      readonly share?: (data: { readonly text: string; readonly title: string; readonly url: string }) => Promise<void>;
+    };
+    try {
+      if (shareNavigator.share) {
+        await shareNavigator.share({ title: selectedNode.label, text: detailSummary(selectedNode), url });
+        setDetailActionStatus("Share sheet opened.");
+      } else {
+        await navigator.clipboard.writeText(url);
+        setDetailActionStatus("Share link copied.");
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        setDetailActionStatus("Share cancelled.");
+      } else {
+        setDetailActionStatus("Sharing is unavailable.");
+      }
+    }
+  }, [selectedNode]);
+
   const layoutTelemetry = rendererAvailable && selectionState
     ? {
         availability: "observed" as const,
@@ -1587,13 +1743,12 @@ export function BrowserGraphFixture() {
             </svg>
           </label>
           <button
-            aria-expanded={detailOpen}
-            aria-label={detailOpen ? "Close selected node details" : "Open selected node details"}
+            aria-label="Clear selected node and return to the full graph"
             className="icon-control"
             data-testid="host-toggle-collapse"
             disabled={!selectedNode}
-            onClick={() => updateCollapsed(detailOpen)}
-            title={detailOpen ? "Close details" : "Open details"}
+            onClick={() => clearSelection("close")}
+            title="Clear selected node"
             type="button"
           >
             <svg aria-hidden="true" viewBox="0 0 24 24">
@@ -1655,7 +1810,7 @@ export function BrowserGraphFixture() {
             className="drawer-close"
             data-testid="detail-drawer-close"
             disabled={!selectedNode}
-            onClick={() => updateCollapsed(true)}
+            onClick={() => clearSelection("close")}
             type="button"
           >
             ×
@@ -1663,12 +1818,77 @@ export function BrowserGraphFixture() {
         </div>
 
         <div className="detail-content">
+          <p className="detail-summary">{selectedNode ? detailSummary(selectedNode) : ""}</p>
           <dl>
             <div><dt>Identity</dt><dd>{selectedNode?.id ?? "—"}</dd></div>
             <div><dt>Kind</dt><dd>{selectedNode?.kind ?? "—"}</dd></div>
             <div><dt>Neighbors</dt><dd>{observedSelection?.neighborNodeIds.length ?? "—"}</dd></div>
             <div><dt>Source</dt><dd>{observedSelection?.source ?? "—"}</dd></div>
           </dl>
+          <section aria-label="Connected graph nodes" className="detail-relationships">
+            <p className="panel-kicker">Connects to</p>
+            {selectedRelationships.length > 0 ? (
+              <div className="relationship-list">
+                {selectedRelationships.map((relationship) => (
+                  <button
+                    aria-label={`${relationship.direction === "outgoing" ? "Open" : "Return to"} ${relationship.nodeLabel}`}
+                    className="relationship-chip"
+                    data-testid={testIdForNode("detail-relationship", relationship.nodeId)}
+                    key={relationship.linkId}
+                    onClick={() => selectNode(relationship.nodeId, "relationship")}
+                    type="button"
+                  >
+                    <span aria-hidden="true">{relationship.direction === "outgoing" ? "→" : "←"}</span>
+                    <strong>{relationship.nodeLabel}</strong>
+                    <small>{relationship.relationKind}</small>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="detail-empty">No direct graph connections.</p>
+            )}
+          </section>
+          <div className="detail-actions" aria-label="Selected node actions">
+            <button
+              data-testid="detail-share"
+              disabled={!selectedNode}
+              onClick={() => void shareSelectedNode()}
+              type="button"
+            >
+              Share
+            </button>
+            <button
+              data-testid="detail-copy-markdown"
+              disabled={!selectedNode}
+              onClick={() => void copySelectedNodeMarkdown()}
+              type="button"
+            >
+              Copy markdown
+            </button>
+          </div>
+          {detailActionStatus && (
+            <p className="detail-action-status" role="status">{detailActionStatus}</p>
+          )}
+          <nav aria-label="Selected node navigation" className="detail-navigation">
+            <button
+              data-testid="detail-previous"
+              disabled={!previousNode}
+              onClick={() => previousNode && selectNode(previousNode.id, "navigation")}
+              type="button"
+            >
+              <span>Previous</span>
+              <strong>{previousNode?.label ?? "—"}</strong>
+            </button>
+            <button
+              data-testid="detail-next"
+              disabled={!nextNode}
+              onClick={() => nextNode && selectNode(nextNode.id, "navigation")}
+              type="button"
+            >
+              <span>Next</span>
+              <strong>{nextNode?.label ?? "—"}</strong>
+            </button>
+          </nav>
           <button
             className="host-update"
             data-testid="host-set-input"
@@ -1725,6 +1945,7 @@ export function BrowserGraphFixture() {
             </svg>
             <input
               autoComplete="off"
+              data-testid="matrix-input"
               onChange={(event) => setMatrixQuery(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "ArrowDown") {

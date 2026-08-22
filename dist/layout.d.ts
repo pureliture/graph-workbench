@@ -12,6 +12,7 @@ export interface GraphNodeVisualCue {
 }
 export interface GraphLinkVisualCue {
     readonly opacity: number;
+    readonly visible: boolean;
     readonly width: number;
 }
 export interface GraphTargetNodePosition {

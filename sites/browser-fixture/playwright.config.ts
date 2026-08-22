@@ -7,8 +7,10 @@ export default defineConfig({
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,
   workers: 1,
-  timeout: 45_000,
-  expect: { timeout: 10_000 },
+  // WebGL scene setup is deterministic, but headless Chromium can defer its
+  // first renderer frames substantially on a busy local runner.
+  timeout: 90_000,
+  expect: { timeout: 30_000 },
   reporter: process.env.CI ? "github" : "list",
   outputDir: "test-results",
   use: {

@@ -510,6 +510,27 @@ describe("Three.js camera transitions", () => {
     expect(secondParticle.screenY).not.toBeNull();
   });
 
+  it("keeps default relationship curves shallow without adding a depth bow", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, {}));
+    runLatestFrame(0);
+
+    const link = graph.linkObjects.get("api-web") as Line;
+    const positions = link.geometry.getAttribute("position");
+    const start = new Vector3().fromBufferAttribute(positions, 0);
+    const middle = new Vector3().fromBufferAttribute(positions, Math.floor((positions.count - 1) / 2));
+    const end = new Vector3().fromBufferAttribute(positions, positions.count - 1);
+    const chordMiddle = start.clone().lerp(end, 0.5);
+    const planarChordLength = Math.hypot(end.x - start.x, end.y - start.y);
+    const planarDeviation = Math.hypot(middle.x - chordMiddle.x, middle.y - chordMiddle.y);
+
+    expect(planarDeviation / planarChordLength).toBeLessThanOrEqual(0.02);
+    expect(middle.z).toBeCloseTo(chordMiddle.z, 5);
+  });
+
   it("clips focused default curves at the live camera-facing node boundaries", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
@@ -1138,7 +1159,7 @@ describe("Three.js camera transitions", () => {
     expect(graph.ownerDocument.visibilityListeners.size).toBe(0);
   });
 
-  it("refreshes reused node, label, and restrained edge materials from the current selection visual cues", () => {
+  it("refreshes reused node, label, and selected-edge visibility from the current selection visual cues", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -1175,9 +1196,18 @@ describe("Three.js camera transitions", () => {
       visibleMaterialLineWidths: [1.25],
     });
     expect(distantLink).toMatchObject({
-      visibleMaterialLineWidths: [0.5],
+      minimumVisibleMaterialOpacity: null,
+      objectVisible: false,
+      visibleMaterialLineWidths: [],
     });
-    expect(distantLink?.minimumVisibleMaterialOpacity).toBeLessThanOrEqual(0.055);
+
+    renderer.setData(createRenderGraphData(graphFixture, {}));
+    const restoredLink = renderer.getRenderObservation!()!.links.find((link) => link.id === "release-api")!;
+    expect(restoredLink).toMatchObject({
+      objectVisible: true,
+      sceneAttached: true,
+    });
+    expect(restoredLink.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(selected?.label).toMatchObject({
       objectTracked: true,
       objectVisible: true,
@@ -1195,7 +1225,7 @@ describe("Three.js camera transitions", () => {
     expect("roughness" in selectedMaterial).toBe(false);
   });
 
-  it("keeps quiet light-mode bodies and links readable with continuously faded labels", () => {
+  it("keeps quiet light-mode bodies readable while hiding nonincident links", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
@@ -1229,13 +1259,12 @@ describe("Three.js camera transitions", () => {
     });
     expect(quietNode.label.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(quietLink).toMatchObject({
-      minimumVisibleMaterialOpacity: 0.16,
-      visibleMaterialLineWidths: [0.68],
+      minimumVisibleMaterialOpacity: null,
+      objectVisible: false,
+      visibleMaterialLineWidths: [],
     });
     expect(selectedLink.minimumVisibleMaterialOpacity).toBe(0.62);
     expect(selectedLink.visibleMaterialLineWidths).toEqual([1.25]);
-    expect(selectedLink.minimumVisibleMaterialOpacity).toBeGreaterThan(quietLink.minimumVisibleMaterialOpacity!);
-    expect(selectedLink.visibleMaterialLineWidths[0]).toBeGreaterThan(quietLink.visibleMaterialLineWidths[0]!);
 
     renderer.setData(createRenderGraphData(input, {
       reducedMotion: true,
@@ -1251,8 +1280,9 @@ describe("Three.js camera transitions", () => {
     });
     expect(reducedQuietNode.label.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(reducedQuietLink).toMatchObject({
-      minimumVisibleMaterialOpacity: 0.16,
-      visibleMaterialLineWidths: [0.68],
+      minimumVisibleMaterialOpacity: null,
+      objectVisible: false,
+      visibleMaterialLineWidths: [],
     });
   });
 
@@ -1687,7 +1717,7 @@ describe("Three.js camera transitions", () => {
     ))).toBe(true);
   });
 
-  it("keeps the full cloud in frame while biasing the camera toward the selected node", () => {
+  it("frames the selected one-hop constellation instead of shrinking it to the full cloud", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -1707,7 +1737,11 @@ describe("Three.js camera transitions", () => {
     renderer.setData(selected);
     renderer.transitionToNode!("component:web", { reducedMotion: true });
 
-    const extents = selected.nodes.map((node) => {
+    const constellationNodeIds = new Set([
+      "component:web",
+      ...selected.selection.neighborNodeIds,
+    ]);
+    const extents = selected.nodes.filter((node) => constellationNodeIds.has(node.id)).map((node) => {
       const degree = selected.links.reduce((count, link) => (
         count + Number(link.source === node.id) + Number(link.target === node.id)
       ), 0);
@@ -1749,11 +1783,13 @@ describe("Three.js camera transitions", () => {
       y: boundsCenter.y,
       z: boundsCenter.z,
     });
-    expect(Math.hypot(
+    const cameraDistance = Math.hypot(
       targetCamera.position.x - expectedCenter.x,
       targetCamera.position.y - expectedCenter.y,
       targetCamera.position.z - expectedCenter.z,
-    )).toBeGreaterThan(160);
+    );
+    expect(cameraDistance).toBeGreaterThan(60);
+    expect(cameraDistance).toBeLessThan(160);
   });
 
   it("applies semantic default colors across theme and input updates while preserving descriptor overrides", () => {
@@ -2111,7 +2147,7 @@ describe("Three.js camera transitions", () => {
   it.each([
     ["desktop", { height: 540, width: 720 }],
     ["mobile", { height: 844, width: 390 }],
-  ] as const)("keeps every node body within padded %s screen bounds after selection", (_device, viewport) => {
+  ] as const)("keeps the selected one-hop bodies within padded %s screen bounds", (_device, viewport) => {
     graph.cameraProjection = { aspect: viewport.width / viewport.height, fov: 50 };
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
@@ -2130,7 +2166,12 @@ describe("Three.js camera transitions", () => {
     renderer.setData(selected);
     renderer.transitionToNode!(selectedNodeId, { reducedMotion: true });
 
-    expectAllNodeBoundsWithinViewport(graph.cameraSetters.at(-1)!, selected.nodes, selectedNodeId, viewport);
+    expectAllNodeBoundsWithinViewport(
+      graph.cameraSetters.at(-1)!,
+      selected.nodes.filter((node) => node.id === selectedNodeId || selected.selection.neighborNodeIds.includes(node.id)),
+      selectedNodeId,
+      viewport,
+    );
     const observation = renderer.getRenderObservation!();
     observation.nodes.forEach((node) => {
       expect(node.label).toMatchObject({ objectVisible: true, sceneAttached: true, transparent: true });
@@ -2175,7 +2216,9 @@ describe("Three.js camera transitions", () => {
     expect(graph.cameraProjection.aspect).toBeCloseTo(desktopViewport.width / desktopViewport.height);
     expectAllNodeBoundsWithinViewport(
       graph.cameraSetters.at(-1)!,
-      mobileSelected.nodes,
+      mobileSelected.nodes.filter((node) => (
+        node.id === selectedNodeId || mobileSelected.selection.neighborNodeIds.includes(node.id)
+      )),
       selectedNodeId,
       mobileViewport,
     );

@@ -70,13 +70,24 @@ const STATIC_LABEL_OPACITY = Object.freeze({
     neighbor: 0.72,
     selected: 1,
 });
-// Labels must remain in the scene across the full zoom range. Their perceived
-// size already follows camera distance through SpriteMaterial size attenuation;
-// this soft band only adjusts readability from that projected size.
+// Projected size still helps the labels selected for display read naturally.
+// A separate screen-space density pass below decides when an unrelated label
+// should leave the scene entirely.
 const LABEL_PROJECTED_READABILITY = Object.freeze({
     fullyReadableAtPixels: 14,
     minimum: 0.18,
     startsAtPixels: 3,
+});
+// The reference graph keeps the complete topology available, but deliberately
+// limits the amount of concurrently readable text. These are renderer-local
+// presentation budgets: they never remove data, search targets, or keyboard
+// navigation targets from the graph model.
+const DENSITY_VISIBILITY = Object.freeze({
+    bodyBudget: Object.freeze({ compact: 24, regular: 48 }),
+    bodyCullAtNodeCount: 72,
+    labelBudget: Object.freeze({ compact: 12, regular: 24 }),
+    labelCell: Object.freeze({ compact: { height: 28, width: 112 }, regular: { height: 32, width: 134 } }),
+    labelCullAtNodeCount: 64,
 });
 const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 4.8, y: 3.6, z: 1.25 });
 const AMBIENT_NODE_BREATHING = Object.freeze({ x: 1.55, y: 1.85, z: 0.72 });
@@ -94,6 +105,10 @@ const IDLE_FLOW_PARTICLE_SCALE = 0.22;
 const INTERACTION_FLOW_PARTICLE_SCALE = 0.72;
 const MAX_FLOW_PARTICLES = 12;
 const DEFAULT_LINK_CURVE_SEGMENTS = 28;
+const DEFAULT_LINK_CURVE = Object.freeze({
+    maximumPlanarOffset: 4,
+    planarDistanceRatio: 0.035,
+});
 const DEFAULT_LINK_BOUNDARY_SCAN_STEPS = 28;
 const DEFAULT_LINK_BOUNDARY_BISECTION_STEPS = 12;
 const DEFAULT_LINK_BOUNDARY_PROBE_PROGRESS = 2 / (DEFAULT_LINK_BOUNDARY_SCAN_STEPS * (2 ** DEFAULT_LINK_BOUNDARY_BISECTION_STEPS));
@@ -566,12 +581,15 @@ function pointOnQuadraticCurve(start, end, bendDirection, progress, output) {
     const deltaX = end.x - start.x;
     const deltaY = end.y - start.y;
     const planarDistance = Math.hypot(deltaX, deltaY);
-    const curve = Math.max(3, Math.min(18, planarDistance * 0.12));
+    // The reference interaction reads relationships as near-straight threads.
+    // Keep a small deterministic planar bow for direction, but do not impose a
+    // minimum bend on short links or an artificial depth arc.
+    const curve = Math.min(DEFAULT_LINK_CURVE.maximumPlanarOffset, planarDistance * DEFAULT_LINK_CURVE.planarDistanceRatio);
     const directionX = planarDistance > 0 ? deltaX / planarDistance : 1;
     const directionY = planarDistance > 0 ? deltaY / planarDistance : 0;
     const controlX = ((start.x + end.x) / 2) + (-directionY * curve * bendDirection);
     const controlY = ((start.y + end.y) / 2) + (directionX * curve * bendDirection);
-    const controlZ = ((start.z + end.z) / 2) + (curve * 0.32 * bendDirection);
+    const controlZ = (start.z + end.z) / 2;
     const t = Math.max(0, Math.min(1, progress));
     const inverse = 1 - t;
     output.x = (inverse * inverse * start.x) + (2 * inverse * t * controlX) + (t * t * end.x);
@@ -802,7 +820,11 @@ function graphChildWithRole(object, role) {
     });
     return found;
 }
-function sceneVisualForNode(node, data, descriptor) {
+const FULL_NODE_DENSITY_VISIBILITY = Object.freeze({
+    bodyVisible: true,
+    labelVisible: true,
+});
+function sceneVisualForNode(node, data, descriptor, density = FULL_NODE_DENSITY_VISIBILITY) {
     const baseOpacity = boundedOpacity(descriptor.opacity, node.visual.opacity);
     const isSelected = data.selection.nodeId === node.id;
     const isNeighbor = data.selection.neighborNodeIds.includes(node.id);
@@ -826,10 +848,13 @@ function sceneVisualForNode(node, data, descriptor) {
         // Bodies can recede with depth, while node names retain a high-contrast
         // floor. Counteracting the group depth scale and boosting narrow viewports
         // makes distant labels readable without reviving outlines or focus rings.
-        labelVisible: true,
-        labelOpacity,
+        bodyVisible: density.bodyVisible,
+        labelVisible: density.labelVisible,
+        labelOpacity: density.labelVisible ? labelOpacity : 0,
         labelScale: (isSelected ? 1 : 1 / depthScale) * viewportScale,
-        opacity: Math.max(node.visual.opacityFloor, isSelected ? baseOpacity : baseOpacity * depthOpacity),
+        opacity: density.bodyVisible
+            ? Math.max(node.visual.opacityFloor, isSelected ? baseOpacity : baseOpacity * depthOpacity)
+            : 0,
         scale: isSelected ? 1.22 : depthScale,
     };
 }
@@ -899,6 +924,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     let ambientCameraLastPose = null;
     const ambientNodes = new Map();
     const ambientLinks = new Map();
+    let densityVisibilityByNodeId = new Map();
     const defaultLinkBoundaryEvidenceByObject = new WeakMap();
     const particleGroup = new Group();
     particleGroup.name = "graph-workbench-flow-particles";
@@ -964,6 +990,117 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             silhouette: defaultNodeSilhouette(node),
             visualKind: resolvedNodeVisualKind(node),
         });
+    function densityVisibilityForNode(nodeId) {
+        return densityVisibilityByNodeId.get(nodeId) ?? FULL_NODE_DENSITY_VISIBILITY;
+    }
+    function refreshDensityVisibility() {
+        const data = currentData;
+        densityVisibilityByNodeId = new Map();
+        if (!data)
+            return;
+        const nodeCount = data.nodes.length;
+        const labelsNeedCulling = nodeCount >= DENSITY_VISIBILITY.labelCullAtNodeCount;
+        const bodiesNeedCulling = nodeCount >= DENSITY_VISIBILITY.bodyCullAtNodeCount;
+        if (!labelsNeedCulling && !bodiesNeedCulling) {
+            data.nodes.forEach((node) => densityVisibilityByNodeId.set(node.id, FULL_NODE_DENSITY_VISIBILITY));
+            return;
+        }
+        const viewport = data.selection.viewport;
+        const compact = Math.min(viewport.width, viewport.height) < 600;
+        const selectedNodeId = data.selection.nodeId;
+        const selectedState = selectedNodeId ? ambientNodes.get(selectedNodeId) : null;
+        const protectedNodeIds = new Set([
+            ...(selectedNodeId ? [selectedNodeId] : []),
+            ...data.selection.neighborNodeIds,
+            ...(hoverNodeId ? [hoverNodeId] : []),
+            ...(currentPresentation.focusNodeId ? [currentPresentation.focusNodeId] : []),
+            ...[...ambientNodes.values()].filter((state) => state.isMaster).map((state) => state.id),
+        ]);
+        const camera = cameraPose();
+        const margin = compact ? 18 : 28;
+        const candidates = data.nodes.map((node) => {
+            const state = ambientNodes.get(node.id);
+            const position = state
+                ? { x: state.renderedX, y: state.renderedY, z: state.renderedZ }
+                : nodePosition(node);
+            const projection = position
+                ? graph.graph2ScreenCoords(position.x, position.y, position.z)
+                : { x: Number.NaN, y: Number.NaN };
+            const projected = Number.isFinite(projection.x) && Number.isFinite(projection.y);
+            const inViewport = projected
+                && projection.x >= -margin
+                && projection.x <= viewport.width + margin
+                && projection.y >= -margin
+                && projection.y <= viewport.height + margin;
+            const screenCenterDistance = projected
+                ? Math.hypot(projection.x - (viewport.width / 2), projection.y - (viewport.height / 2))
+                : Infinity;
+            const cameraDistance = position
+                ? Math.hypot(position.x - camera.position.x, position.y - camera.position.y, position.z - camera.position.z)
+                : Infinity;
+            const selectedDistance = position && selectedState
+                ? Math.hypot(position.x - selectedState.renderedX, position.y - selectedState.renderedY, position.z - selectedState.renderedZ)
+                : 0;
+            return {
+                cameraDistance,
+                id: node.id,
+                inViewport,
+                projected,
+                screenCenterDistance,
+                selectedDistance,
+                x: projection.x,
+                y: projection.y,
+            };
+        });
+        const backgroundCandidates = candidates
+            .filter((candidate) => !protectedNodeIds.has(candidate.id))
+            .sort((left, right) => {
+            const viewportDifference = Number(right.inViewport) - Number(left.inViewport);
+            if (viewportDifference !== 0)
+                return viewportDifference;
+            if (selectedNodeId !== null) {
+                const selectedDifference = left.selectedDistance - right.selectedDistance;
+                if (Math.abs(selectedDifference) > AMBIENT_VISUAL_EPSILON)
+                    return selectedDifference;
+            }
+            const centerDifference = left.screenCenterDistance - right.screenCenterDistance;
+            if (Math.abs(centerDifference) > AMBIENT_VISUAL_EPSILON)
+                return centerDifference;
+            const cameraDifference = left.cameraDistance - right.cameraDistance;
+            if (Math.abs(cameraDifference) > AMBIENT_VISUAL_EPSILON)
+                return cameraDifference;
+            return left.id.localeCompare(right.id);
+        });
+        const selectBackground = (budget, cell) => {
+            const selected = new Set();
+            const occupiedCells = new Set();
+            for (const candidate of backgroundCandidates) {
+                if (selected.size >= budget || !candidate.inViewport || !candidate.projected)
+                    continue;
+                const cellKey = `${Math.floor(candidate.x / cell.width)}:${Math.floor(candidate.y / cell.height)}`;
+                if (occupiedCells.has(cellKey))
+                    continue;
+                occupiedCells.add(cellKey);
+                selected.add(candidate.id);
+            }
+            return selected;
+        };
+        const labelBackground = labelsNeedCulling
+            ? selectBackground(Math.max(0, (compact ? DENSITY_VISIBILITY.labelBudget.compact : DENSITY_VISIBILITY.labelBudget.regular)
+                - protectedNodeIds.size), compact ? DENSITY_VISIBILITY.labelCell.compact : DENSITY_VISIBILITY.labelCell.regular)
+            : new Set(backgroundCandidates.map((candidate) => candidate.id));
+        const bodyBackground = bodiesNeedCulling
+            ? selectBackground(Math.max(0, (compact ? DENSITY_VISIBILITY.bodyBudget.compact : DENSITY_VISIBILITY.bodyBudget.regular)
+                - protectedNodeIds.size), compact ? { height: 38, width: 38 } : { height: 50, width: 50 })
+            : new Set(backgroundCandidates.map((candidate) => candidate.id));
+        data.nodes.forEach((node) => {
+            const protectedNode = protectedNodeIds.has(node.id);
+            densityVisibilityByNodeId.set(node.id, {
+                bodyVisible: protectedNode || bodyBackground.has(node.id),
+                labelVisible: protectedNode || labelBackground.has(node.id),
+            });
+        });
+    }
     graph
         .backgroundColor("#08111f")
         .showNavInfo(false)
@@ -1002,10 +1139,17 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const ambientState = ambientNodes.get(node.id);
         if (ambientState)
             refreshAmbientNodeObject(ambientState, object);
+        // A vendor may instantiate Object3D children after the synchronous
+        // setData pass. Apply the current density state here as well so a large
+        // settled graph never flashes all labels while ambient motion is paused.
+        if (currentData && !pendingSceneTransition && !activeTransition?.scene) {
+            applyFinalVisuals(currentData);
+        }
         return object;
     })
         .linkThreeObject((link) => {
         const object = linkObjectFactory(link, linkDescriptor(link));
+        object.visible = link.visual.visible;
         renderedLinkObjects.set(link.id, object);
         const ambientState = ambientLinks.get(link.id);
         if (ambientState)
@@ -1132,6 +1276,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             label,
             labelMaterial: label.material,
             lastBodyOpacity: Number.NaN,
+            lastBodyVisible: null,
             lastLabelOpacity: Number.NaN,
             lastLabelScale: Number.NaN,
             lastLabelVisible: null,
@@ -1162,6 +1307,8 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         state.material = null;
         state.lastOpacity = Number.NaN;
         state.lastWidth = Number.NaN;
+        if (state.object)
+            state.object.visible = state.link.visual.visible;
         cacheAmbientDefaultLinkMaterial(state);
     }
     function invalidateAmbientDefaultNodeVisual(id) {
@@ -1169,6 +1316,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         if (!visual)
             return;
         visual.lastBodyOpacity = Number.NaN;
+        visual.lastBodyVisible = null;
         visual.lastLabelOpacity = Number.NaN;
         visual.lastLabelScale = Number.NaN;
         visual.lastLabelVisible = null;
@@ -1191,7 +1339,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         // This is a shader flag transition, never part of the stable RAF path.
         material.needsUpdate = true;
     }
-    function applyAmbientDefaultNodeVisual(state, opacity, scale, labelVisible, labelOpacity, labelScale) {
+    function applyAmbientDefaultNodeVisual(state, opacity, scale, bodyVisible, labelVisible, labelOpacity, labelScale) {
         cacheAmbientDefaultNodeVisual(state);
         const visual = state.defaultVisual;
         const object = state.object;
@@ -1202,6 +1350,10 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             visual.lastBodyOpacity = opacity;
         }
         ensureAmbientTransparency(visual.bodyMaterial, true);
+        if (visual.lastBodyVisible !== bodyVisible) {
+            visual.body.visible = bodyVisible;
+            visual.lastBodyVisible = bodyVisible;
+        }
         if (changedAmbientVisualValue(visual.lastScale, scale)) {
             object.scale.setScalar(scale);
             visual.lastScale = scale;
@@ -1234,7 +1386,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             state.lastWidth = width;
         }
     }
-    function applyNodeVisual(node, opacity, scale, rimOpacity, labelVisible, labelOpacity, labelScale) {
+    function applyNodeVisual(node, opacity, scale, rimOpacity, bodyVisible, labelVisible, labelOpacity, labelScale) {
         const object = renderedNodeObjects.get(node.id);
         if (!object)
             return;
@@ -1243,6 +1395,9 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             : { emissiveIntensity: nodeEmissiveIntensity(node), opacity });
         if (object.userData.graphDefaultNodeObject === true) {
             object.scale.setScalar(scale);
+            const body = graphChildWithRole(object, "body");
+            if (body)
+                body.visible = bodyVisible;
         }
         const rim = graphChildWithRole(object, "focus-rim");
         if (rim) {
@@ -1262,6 +1417,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const object = renderedLinkObjects.get(link.id);
         if (!object)
             return;
+        object.visible = link.visual.visible;
         updateObjectMaterials(object, { opacity, width });
         invalidateAmbientDefaultLinkVisual(link.id);
     }
@@ -1437,6 +1593,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const data = currentData;
         if (!data)
             return;
+        refreshDensityVisibility();
         const camera = cameraPose();
         const directionLength = Math.hypot(camera.position.x - camera.lookAt.x, camera.position.y - camera.lookAt.y, camera.position.z - camera.lookAt.z) || 1;
         const directionX = (camera.position.x - camera.lookAt.x) / directionLength;
@@ -1513,7 +1670,8 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 ? 1
                 : labelPerspectiveReadability(labelDistance, (state.defaultVisual?.baseLabelScale.y ?? 8) * scale * labelScale, projection, data.selection.viewport.height);
             const readableLabelOpacity = contextLabelOpacity * labelPerspectiveVisibility;
-            applyAmbientDefaultNodeVisual(state, opacity, scale, true, readableLabelOpacity, labelScale);
+            const density = densityVisibilityForNode(node.id);
+            applyAmbientDefaultNodeVisual(state, density.bodyVisible ? opacity : 0, scale, density.bodyVisible, density.labelVisible, density.labelVisible ? readableLabelOpacity : 0, labelScale);
         }
     }
     function renderedState(id) {
@@ -1789,6 +1947,12 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     function updateLinkObjectForRenderedNodes(object, link, fallbackStart, fallbackEnd) {
         const linkId = typeof object.userData.graphLinkId === "string" ? object.userData.graphLinkId : link.id;
         const canonicalLink = ambientLinks.get(linkId)?.link;
+        // ThreeForceGraph invokes this update path after visual application. Do
+        // not let a geometry refresh resurrect a nonincident relationship edge.
+        if (canonicalLink && !canonicalLink.visual.visible) {
+            object.visible = false;
+            return true;
+        }
         const source = canonicalLink ? renderedState(canonicalLink.source) : null;
         const target = canonicalLink ? renderedState(canonicalLink.target) : null;
         if (!source || !target)
@@ -1837,9 +2001,9 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const selectedFocus = focusNodeId !== null && currentData?.selection.nodeId === focusNodeId;
             const liveObject = renderedLinkObjects.get(state.id);
             refreshAmbientLinkObject(state, liveObject ?? null);
-            state.active = Boolean((incident || idleFlow) && state.object && ambientMotionEnabled());
+            state.active = Boolean(state.link.visual.visible && (incident || idleFlow) && state.object && ambientMotionEnabled());
             state.particleCount = 0;
-            if (!source || !target || !state.object)
+            if (!state.link.visual.visible || !source || !target || !state.object)
                 continue;
             updateLinkObjectFromWorldEndpoints(state.object, actualNodeWorldPosition(source), actualNodeWorldPosition(target), source, target);
             if (state.object.userData.graphDefaultLinkHasVisibleCurve !== true) {
@@ -1914,13 +2078,18 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     function applyAmbientVisuals() {
         updateAmbientNodePositions();
         applyAmbientCameraDrift();
-        applyCameraRelativeDepth();
+        // Scene transitions own the opacity interpolation for density-cull targets.
+        // The ambient pass resumes only after the final frame, when it can safely
+        // toggle the fully faded child objects off without a visual snap.
+        if (!pendingSceneTransition && !activeTransition?.scene)
+            applyCameraRelativeDepth();
         applyFocusedLinkFlow();
     }
     function applyFinalVisuals(data) {
+        refreshDensityVisibility();
         data.nodes.forEach((node) => {
             const descriptor = nodeDescriptor(node);
-            const visual = sceneVisualForNode(node, data, descriptor);
+            const visual = sceneVisualForNode(node, data, descriptor, densityVisibilityForNode(node.id));
             const object = renderedNodeObjects.get(node.id);
             const lightQuietContext = data.presentation.theme === "light"
                 && data.selection.nodeId !== null
@@ -1928,7 +2097,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 && !data.selection.neighborNodeIds.includes(node.id)
                 && object?.userData.graphDefaultNodeObject === true;
             applyNodePalette(node);
-            applyNodeVisual(node, lightQuietContext ? Math.max(visual.opacity, LIGHT_SELECTED_CONTEXT_FLOOR.bodyOpacity) : visual.opacity, visual.scale, data.selection.nodeId === node.id ? visual.opacity : 0, visual.labelVisible, lightQuietContext ? Math.max(visual.labelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity) : visual.labelOpacity, visual.labelScale);
+            applyNodeVisual(node, lightQuietContext ? Math.max(visual.opacity, LIGHT_SELECTED_CONTEXT_FLOOR.bodyOpacity) : visual.opacity, visual.scale, data.selection.nodeId === node.id ? visual.opacity : 0, visual.bodyVisible, visual.labelVisible, lightQuietContext ? Math.max(visual.labelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity) : visual.labelOpacity, visual.labelScale);
         });
         data.links.forEach((link) => {
             const descriptor = linkDescriptor(link);
@@ -1987,7 +2156,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const previousFocusNodeId = previousData.selection.nodeId;
         const nodes = data.nodes.map((node) => {
             const descriptor = nodeDescriptor(node);
-            const targetVisual = sceneVisualForNode(node, data, descriptor);
+            const targetVisual = sceneVisualForNode(node, data, descriptor, densityVisibilityForNode(node.id));
             const previousNode = previousNodeById.get(node.id);
             const previousObject = renderedNodeObjects.get(node.id);
             const previousVisual = previousNode
@@ -2000,6 +2169,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 id: node.id,
                 start,
                 target: nodePosition(node),
+                targetBodyVisible: targetVisual.bodyVisible,
                 startLabelOpacity: firstMaterialOpacity(label ?? undefined, previousVisual.labelOpacity),
                 startLabelScale: staticLabelScaleMultiplier(label),
                 targetLabelVisible: targetVisual.labelVisible,
@@ -2083,7 +2253,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             else if (transition.id === scene.targetFocusNodeId) {
                 rimOpacity = transition.targetOpacity;
             }
-            applyNodeVisual(targetNode, final ? transition.targetOpacity : interpolate(transition.startOpacity, transition.targetOpacity, eased), final ? transition.targetScale : scale, final && transition.id === scene.targetFocusNodeId ? transition.targetOpacity : rimOpacity, transition.targetLabelVisible, final
+            applyNodeVisual(targetNode, final ? transition.targetOpacity : interpolate(transition.startOpacity, transition.targetOpacity, eased), final ? transition.targetScale : scale, final && transition.id === scene.targetFocusNodeId ? transition.targetOpacity : rimOpacity, final ? transition.targetBodyVisible : true, final ? transition.targetLabelVisible : true, final
                 ? transition.targetLabelOpacity
                 : interpolate(transition.startLabelOpacity, transition.targetLabelOpacity, eased), final
                 ? transition.targetLabelScale
@@ -2142,6 +2312,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 renderedLinkObjects.delete(id);
         });
         rebuildAmbientState();
+        refreshDensityVisibility();
         if (!previousData || !selectionChanged || !starts) {
             pendingSceneTransition = null;
             applyFinalVisuals(data);
@@ -2392,8 +2563,9 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const data = currentData;
         const focalPoint = nodePosition(focused);
         const constellationNodeIds = new Set([nodeId, ...data.selection.neighborNodeIds]);
-        const peripheralContextCount = data.nodes.reduce((count, node) => count + Number(!constellationNodeIds.has(node.id)), 0);
         const points = data.nodes.flatMap((node) => {
+            if (!constellationNodeIds.has(node.id))
+                return [];
             const position = nodePosition(node);
             if (!position)
                 return [];
@@ -2406,10 +2578,10 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             return [{ ...position, radius: (bodyRadius * 1.16 * focusScale) + AMBIENT_MAX_OFFSET }];
         });
         const viewport = data.selection.viewport;
-        // A small graph already reads as one constellation. With several
-        // peripheral nodes, pull the look target closer to the selected subject
-        // while the fit calculation still keeps every context point in frame.
-        const focalBias = peripheralContextCount >= 3 ? 0.32 : 0.18;
+        // A selection is a local reading mode. Keep the active one-hop
+        // constellation comfortably framed instead of shrinking it to fit every
+        // unrelated background dot in a large graph.
+        const focalBias = 0.18;
         return contextCameraPose(points, cameraPose(), boundedPerspectiveProjection(graph.camera(), viewport), viewport, focalPoint, focalBias);
     }
     function transitionToNode(nodeId, options) {
@@ -2447,10 +2619,12 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const object = renderedNodeObjects.get(id);
             const liveNode = data.nodes.find((candidate) => candidate.id === id);
             const livePosition = nodePosition(liveNode) ?? nodePosition(node);
+            const body = object ? graphChildWithRole(object, "body") : null;
             nodes.push({
                 ...observeGraphObject(id, object, scene),
+                body: body ? observeGraphObject(id, body, scene) : null,
                 bodyMaterialColor: object?.userData.graphDefaultNodeObject === true
-                    ? objectMaterialColor(graphChildWithRole(object, "body"))
+                    ? objectMaterialColor(body)
                     : null,
                 defaultBody: defaultNodeBodyObservation(object),
                 label: nodeLabelObservation(id, object ? graphChildWithRole(object, "node-label") : null, scene),
