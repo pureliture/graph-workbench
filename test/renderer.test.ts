@@ -510,6 +510,25 @@ describe("Three.js camera transitions", () => {
     expect(secondParticle.screenY).not.toBeNull();
   });
 
+  it("does not resurrect idle relationship lines for an unselected hover", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, {}));
+    graph.nodeHoverCallback?.(graph.data.nodes.find((node) => node.id === "component:api")!);
+    runLatestFrame(0);
+
+    const observation = renderer.getRenderObservation!()!;
+    expect(observation.links.every(({ objectVisible, visual }) => (
+      objectVisible === false && !visual.visible
+    ))).toBe(true);
+    const ambient = renderer.getAmbientMotionObservation!()!;
+    expect(ambient.focusNodeId).toBe("component:api");
+    expect(ambient.linkFlow.every(({ active, particleCount }) => !active && particleCount === 0)).toBe(true);
+    expect(ambient.particles).toHaveLength(0);
+  });
+
   it("keeps default relationship curves shallow without adding a depth bow", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
@@ -841,7 +860,7 @@ describe("Three.js camera transitions", () => {
       source: api,
       target: web,
     })).toBe(false);
-    expect(hostLink.visible).toBe(true);
+    expect(hostLink.visible).toBe(false);
   });
 
   it("freezes drift and flow for reduced motion, then clears and resumes safely across visibility changes", () => {
@@ -970,12 +989,12 @@ describe("Three.js camera transitions", () => {
     const body = nodeObject.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
     const label = nodeObject.children.find((child) => child.userData.graphVisualRole === "node-label") as Sprite;
     expect(linkObject).toBeInstanceOf(Line);
-    expect(body.material).toBeInstanceOf(MeshBasicMaterial);
+    expect(body.material).toBeInstanceOf(MeshStandardMaterial);
     expect(label.material).toBeInstanceOf(SpriteMaterial);
     const link = linkObject as Line;
     expect(link.material).toBeInstanceOf(LineBasicMaterial);
 
-    const bodyMaterial = body.material as MeshBasicMaterial;
+    const bodyMaterial = body.material as MeshStandardMaterial;
     const labelMaterial = label.material as SpriteMaterial;
     const linkMaterial = link.material as LineBasicMaterial;
     const particleGroup = graph.sceneRoot.children.find((child) => child.name === "graph-workbench-flow-particles")!;
@@ -1052,7 +1071,7 @@ describe("Three.js camera transitions", () => {
     expect(master.minimumVisibleMaterialOpacity).toBeGreaterThan(far.minimumVisibleMaterialOpacity!);
   });
 
-  it("keeps the idle dark field visible while preserving its quiet depth and edge hierarchy", () => {
+  it("keeps the idle dark node field visible while hiding its relationship lines", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
@@ -1092,15 +1111,19 @@ describe("Three.js camera transitions", () => {
     expect(idleFar.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(idleNear.minimumVisibleMaterialOpacity).toBeGreaterThan(idleFar.minimumVisibleMaterialOpacity!);
     expect(idleNear.worldScale!.x).toBeGreaterThan(idleFar.worldScale!.x);
-    expect(idleLink.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.22);
-    expect(idleLink.visibleMaterialLineWidths).toEqual([0.85]);
+    expect(idleLink).toMatchObject({
+      objectVisible: false,
+      sceneAttached: true,
+      visual: { visible: false },
+      visibleMaterialLineWidths: [],
+    });
+    expect(idleLink.minimumVisibleMaterialOpacity).toBeNull();
 
-    // Reduced motion skips the ambient RAF. The static default-link path must
-    // retain the same readable baseline instead of falling back to layout's
-    // intentionally quieter raw cue.
+    // Reduced motion keeps the same quiet, link-free idle state.
     renderer.setData(createRenderGraphData(input, { reducedMotion: true, theme: "dark" }));
     const reducedIdleLink = renderer.getRenderObservation!()!.links.find((link) => link.id === "api-web")!;
-    expect(reducedIdleLink.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.22);
+    expect(reducedIdleLink).toMatchObject({ objectVisible: false, visual: { visible: false } });
+    expect(reducedIdleLink.minimumVisibleMaterialOpacity).toBeNull();
 
     renderer.setData(createRenderGraphData(input, {
       reducedMotion: true,
@@ -1111,7 +1134,7 @@ describe("Three.js camera transitions", () => {
     const selectedLink = renderer.getRenderObservation!()!.links.find((link) => link.id === "api-web")!;
     expect(selectedLink.minimumVisibleMaterialOpacity).toBe(0.62);
     expect(selectedLink.visibleMaterialLineWidths).toEqual([1.25]);
-    expect(idleLink.minimumVisibleMaterialOpacity).toBeLessThan(selectedLink.minimumVisibleMaterialOpacity! * 0.4);
+    expect(selectedLink.minimumVisibleMaterialOpacity).toBeGreaterThan(0.5);
   });
 
   it("refreshes ambient default references when the vendor replaces an attached node object", () => {
@@ -1204,10 +1227,12 @@ describe("Three.js camera transitions", () => {
     renderer.setData(createRenderGraphData(graphFixture, {}));
     const restoredLink = renderer.getRenderObservation!()!.links.find((link) => link.id === "release-api")!;
     expect(restoredLink).toMatchObject({
-      objectVisible: true,
+      objectVisible: false,
       sceneAttached: true,
+      visual: { visible: false },
+      visibleMaterialLineWidths: [],
     });
-    expect(restoredLink.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
+    expect(restoredLink.minimumVisibleMaterialOpacity).toBeNull();
     expect(selected?.label).toMatchObject({
       objectTracked: true,
       objectVisible: true,
@@ -1218,11 +1243,11 @@ describe("Three.js camera transitions", () => {
     expect(selected?.label.scale?.x).toBeGreaterThan(0);
 
     const selectedBody = initialWebObject?.children.find((child) => child instanceof Mesh) as Mesh | undefined;
-    const selectedMaterial = selectedBody?.material as MeshBasicMaterial;
-    expect(selectedMaterial).toBeInstanceOf(MeshBasicMaterial);
-    expect("emissive" in selectedMaterial).toBe(false);
-    expect("metalness" in selectedMaterial).toBe(false);
-    expect("roughness" in selectedMaterial).toBe(false);
+    const selectedMaterial = selectedBody?.material as MeshStandardMaterial;
+    expect(selectedMaterial).toBeInstanceOf(MeshStandardMaterial);
+    expect("emissive" in selectedMaterial).toBe(true);
+    expect(selectedMaterial.metalness).toBeCloseTo(0.02);
+    expect(selectedMaterial.roughness).toBeCloseTo(0.78);
   });
 
   it("keeps quiet light-mode bodies readable while hiding nonincident links", () => {
@@ -1382,7 +1407,9 @@ describe("Three.js camera transitions", () => {
     renderer.setData(initial);
     const startById = new Map(graph.data.nodes.map((node) => [node.id, { x: node.x, y: node.y, z: node.z }]));
     const targetById = new Map(selected.nodes.map((node) => [node.id, { x: node.x, y: node.y, z: node.z }]));
-    expect(startById.get("component:api")).not.toEqual(targetById.get("component:api"));
+    expect(startById.get("component:api")).toEqual(targetById.get("component:api"));
+    expect(startById.get("component:web")).not.toEqual(targetById.get("component:web"));
+    expect(startById.get("component:docs")).toEqual(targetById.get("component:docs"));
 
     renderer.setData(selected);
     renderer.transitionToNode!("component:api", { reducedMotion: false });
@@ -1398,11 +1425,12 @@ describe("Three.js camera transitions", () => {
       y: halfway.y,
       z: halfway.z,
     });
-    expect(graph.data.nodes.every((node) => {
-      const current = { x: node.x, y: node.y, z: node.z };
-      return JSON.stringify(current) !== JSON.stringify(startById.get(node.id))
-        && JSON.stringify(current) !== JSON.stringify(targetById.get(node.id));
-    })).toBe(true);
+    const halfwaySelected = graph.data.nodes.find((node) => node.id === "component:api")!;
+    const halfwayNeighbor = graph.data.nodes.find((node) => node.id === "component:web")!;
+    expect({ x: halfwaySelected.x, y: halfwaySelected.y, z: halfwaySelected.z })
+      .toEqual(startById.get("component:api"));
+    expect({ x: halfwayNeighbor.x, y: halfwayNeighbor.y, z: halfwayNeighbor.z })
+      .not.toEqual(startById.get("component:web"));
     expect(graph.cameraSetters.at(-1)?.duration).toBe(0);
     const selectedObject = graph.nodeObjects.get("component:api")!;
     const selectedLabel = selectedObject.children.find((child) => child.userData.graphVisualRole === "node-label")!;
@@ -1455,11 +1483,15 @@ describe("Three.js camera transitions", () => {
     runLatestFrame(0);
     runLatestFrame(210);
 
-    ["component:api", "component:web", "component:docs"].forEach((id) => {
+    ["component:web"].forEach((id) => {
       const live = graph.data.nodes.find((node) => node.id === id)!;
       const current = { x: live.x, y: live.y, z: live.z };
       expect(current).not.toEqual(startById.get(id));
       expect(current).not.toEqual(targetById.get(id));
+    });
+    ["component:api", "component:docs"].forEach((id) => {
+      const live = graph.data.nodes.find((node) => node.id === id)!;
+      expect({ x: live.x, y: live.y, z: live.z }).toEqual(startById.get(id));
     });
     const observation = renderer.getRenderObservation!();
     const distant = observation.nodes.find((node) => node.id === "component:docs")!;
@@ -1717,7 +1749,7 @@ describe("Three.js camera transitions", () => {
     ))).toBe(true);
   });
 
-  it("frames the selected one-hop constellation instead of shrinking it to the full cloud", () => {
+  it("frames the selected node while retaining the full cloud context", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -1737,11 +1769,7 @@ describe("Three.js camera transitions", () => {
     renderer.setData(selected);
     renderer.transitionToNode!("component:web", { reducedMotion: true });
 
-    const constellationNodeIds = new Set([
-      "component:web",
-      ...selected.selection.neighborNodeIds,
-    ]);
-    const extents = selected.nodes.filter((node) => constellationNodeIds.has(node.id)).map((node) => {
+    const extents = selected.nodes.map((node) => {
       const degree = selected.links.reduce((count, link) => (
         count + Number(link.source === node.id) + Number(link.target === node.id)
       ), 0);
@@ -1760,36 +1788,39 @@ describe("Three.js camera transitions", () => {
         minimum: { x: node.x - radius, y: node.y - radius, z: node.z - radius },
       };
     });
-    const boundsCenter = {
-      x: (Math.min(...extents.map(({ minimum }) => minimum.x))
-        + Math.max(...extents.map(({ maximum }) => maximum.x))) / 2,
-      y: (Math.min(...extents.map(({ minimum }) => minimum.y))
-        + Math.max(...extents.map(({ maximum }) => maximum.y))) / 2,
-      z: (Math.min(...extents.map(({ minimum }) => minimum.z))
-        + Math.max(...extents.map(({ maximum }) => maximum.z))) / 2,
-    };
     const selectedPosition = selected.nodes.find((node) => node.id === "component:web")!;
+    const cloudMinimum = extents.reduce((minimum, extent) => ({
+      x: Math.min(minimum.x, extent.minimum.x),
+      y: Math.min(minimum.y, extent.minimum.y),
+      z: Math.min(minimum.z, extent.minimum.z),
+    }), { x: Infinity, y: Infinity, z: Infinity });
+    const cloudMaximum = extents.reduce((maximum, extent) => ({
+      x: Math.max(maximum.x, extent.maximum.x),
+      y: Math.max(maximum.y, extent.maximum.y),
+      z: Math.max(maximum.z, extent.maximum.z),
+    }), { x: -Infinity, y: -Infinity, z: -Infinity });
+    const cloudCenter = {
+      x: (cloudMinimum.x + cloudMaximum.x) / 2,
+      y: (cloudMinimum.y + cloudMaximum.y) / 2,
+      z: (cloudMinimum.z + cloudMaximum.z) / 2,
+    };
+    const focalBias = 0.5;
     const expectedCenter = {
-      x: selectedPosition.x + ((boundsCenter.x - selectedPosition.x) * 0.18),
-      y: selectedPosition.y + ((boundsCenter.y - selectedPosition.y) * 0.18),
-      z: selectedPosition.z + ((boundsCenter.z - selectedPosition.z) * 0.18),
+      x: selectedPosition.x + ((cloudCenter.x - selectedPosition.x) * focalBias),
+      y: selectedPosition.y + ((cloudCenter.y - selectedPosition.y) * focalBias),
+      z: selectedPosition.z + ((cloudCenter.z - selectedPosition.z) * focalBias),
     };
     const targetCamera = graph.cameraSetters.at(-1)!;
     expect(targetCamera.lookAt?.x).toBeCloseTo(expectedCenter.x);
     expect(targetCamera.lookAt?.y).toBeCloseTo(expectedCenter.y);
     expect(targetCamera.lookAt?.z).toBeCloseTo(expectedCenter.z);
-    expect(targetCamera.lookAt).not.toEqual({
-      x: boundsCenter.x,
-      y: boundsCenter.y,
-      z: boundsCenter.z,
-    });
     const cameraDistance = Math.hypot(
       targetCamera.position.x - expectedCenter.x,
       targetCamera.position.y - expectedCenter.y,
       targetCamera.position.z - expectedCenter.z,
     );
-    expect(cameraDistance).toBeGreaterThan(60);
-    expect(cameraDistance).toBeLessThan(160);
+    expect(cameraDistance).toBeGreaterThan(160);
+    expect(cameraDistance).toBeLessThan(520);
   });
 
   it("applies semantic default colors across theme and input updates while preserving descriptor overrides", () => {
@@ -1992,7 +2023,7 @@ describe("Three.js camera transitions", () => {
     });
   });
 
-  it("uses routine-harness flat light materials without an outline shell or selection ring", () => {
+  it("uses routine-harness lit node materials without an outline shell or selection ring", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -2006,15 +2037,15 @@ describe("Three.js camera transitions", () => {
     const object = graph.nodeObjects.get("component:api")!;
     const body = object.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
     const label = object.children.find((child) => child.userData.graphVisualRole === "node-label") as Mesh;
-    expect(body.material).toBeInstanceOf(MeshBasicMaterial);
-    expect((body.material as MeshBasicMaterial).color.getHexString()).toBe("334155");
+    expect(body.material).toBeInstanceOf(MeshStandardMaterial);
+    expect((body.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
     expect((label.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
     expect((label.material as MeshStandardMaterial).transparent).toBe(true);
     expect(object.children.some((child) => child.userData.graphVisualRole === "outline")).toBe(false);
     expect(object.children.some((child) => child.userData.graphVisualRole === "focus-rim")).toBe(false);
   });
 
-  it("keeps renderer-owned flat bodies camera-facing through nested transforms", () => {
+  it("keeps renderer-owned volumetric bodies depth-capable through nested transforms", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
@@ -2051,6 +2082,7 @@ describe("Three.js camera transitions", () => {
     };
 
     expectCallbackWorldMatrixToFaceCamera(body);
+    expect(body.geometry.type).toBe("SphereGeometry");
     const particleGroup = graph.sceneRoot.children.find((child) => child.name === "graph-workbench-flow-particles")!;
     particleGroup.rotation.set(-0.19, 0.24, -0.11);
     expectCallbackWorldMatrixToFaceCamera(particleGroup.children[0] as Mesh);
@@ -2058,7 +2090,7 @@ describe("Three.js camera transitions", () => {
       .toEqual({ kind: "flat-2.5d", silhouette: "circle" });
   });
 
-  it("keeps flat body colors synchronized across palette updates", () => {
+  it("keeps lit body colors synchronized across palette updates", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -2067,41 +2099,41 @@ describe("Three.js camera transitions", () => {
       },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
     });
-    const bodyMaterial = (nodeId: string): MeshBasicMaterial => {
+    const bodyMaterial = (nodeId: string): MeshStandardMaterial => {
       const object = graph.nodeObjects.get(nodeId)!;
       const body = object.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
-      expect(body.material).toBeInstanceOf(MeshBasicMaterial);
-      return body.material as MeshBasicMaterial;
+      expect(body.material).toBeInstanceOf(MeshStandardMaterial);
+      return body.material as MeshStandardMaterial;
     };
-    const expectFlatColor = (material: MeshBasicMaterial, color: string) => {
+    const expectLitColor = (material: MeshStandardMaterial, color: string) => {
       expect(material.color.getHexString()).toBe(new Color(color).getHexString());
       expect("clearcoat" in material).toBe(false);
-      expect("emissive" in material).toBe(false);
-      expect("metalness" in material).toBe(false);
-      expect("roughness" in material).toBe(false);
+      expect("emissive" in material).toBe(true);
+      expect(material.metalness).toBeCloseTo(0.02);
+      expect(material.roughness).toBeCloseTo(0.78);
     };
 
     renderer.setData(createRenderGraphData(graphFixture, { theme: "dark" }));
     const darkWeb = bodyMaterial("component:web");
-    expectFlatColor(darkWeb, "#f59e0b");
-    expectFlatColor(bodyMaterial("relation:release"), "#fb7185");
+    expectLitColor(darkWeb, "#f59e0b");
+    expectLitColor(bodyMaterial("relation:release"), "#fb7185");
 
     renderer.setPresentation({ theme: "light" });
     expect(bodyMaterial("component:web")).toBe(darkWeb);
-    expectFlatColor(darkWeb, "#92400e");
+    expectLitColor(darkWeb, "#92400e");
 
     renderer.setData(createRenderGraphData(graphFixture, {
       theme: "light",
       nodeDescriptors: { "component:web": { color: "#f0abfc" } },
     }));
     expect(bodyMaterial("component:web")).toBe(darkWeb);
-    expectFlatColor(darkWeb, "#f0abfc");
+    expectLitColor(darkWeb, "#f0abfc");
 
     renderer.setData(createRenderGraphData(graphFixture, {
       theme: "light",
       nodeDescriptors: { "component:web": { color: "#60a5fa" } },
     }));
-    expectFlatColor(darkWeb, "#60a5fa");
+    expectLitColor(darkWeb, "#60a5fa");
   });
 
   it("disposes each CanvasTexture glyph mask once with its SpriteMaterial", () => {

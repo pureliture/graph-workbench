@@ -32,7 +32,7 @@ export interface GraphAmbientMotionLinkFlowObservation {
 }
 /**
  * Read-only proof that one default Line end was trimmed against a live,
- * camera-facing flat default body. The probes are sampled immediately inside
+ * the body's projected silhouette boundary. The probes are sampled immediately inside
  * and outside the bisection-resolved curve boundary. Custom node objects use
  * `null`, while legacy observations may omit this optional evidence entirely.
  */
@@ -45,8 +45,8 @@ export interface GraphAmbientMotionLinkEndpointBoundaryObservation {
 /**
  * World-space endpoints read from a default Line geometry after its local
  * positions have been transformed through the Line's current world matrix.
- * When either end uses a renderer-owned flat body, the corresponding endpoint
- * is clipped at that body's camera-facing silhouette boundary; custom-node
+ * When either end uses a renderer-owned default body, the corresponding
+ * endpoint is clipped at that body's projected silhouette boundary; custom-node
  * ends retain their factory-owned world center.
  */
 export interface GraphAmbientMotionLinkEndpointObservation {
@@ -143,9 +143,9 @@ export interface GraphRenderNodeLabelObservation extends GraphRenderObjectObserv
     readonly alphaMasked: boolean | null;
     readonly transparent: boolean | null;
 }
-/** Flat 2.5D silhouette used by a renderer-owned default node body. */
+/** Projected silhouette used by a renderer-owned default node body. */
 export type GraphDefaultNodeSilhouette = "capsule" | "circle" | "disk" | "dot";
-/** Read-only identity of the built-in flat default node body. */
+/** Read-only identity of the built-in default node body's projected silhouette. */
 export interface GraphRenderDefaultNodeBodyObservation {
     readonly kind: "flat-2.5d";
     readonly silhouette: GraphDefaultNodeSilhouette;
@@ -159,7 +159,7 @@ export interface GraphRenderNodeObservation extends GraphRenderObjectObservation
      */
     readonly body?: GraphRenderObjectObservation | null;
     /**
-     * Default flat body identity, or null when a host supplied the node object.
+     * Default body silhouette identity, or null when a host supplied the node object.
      * Optional so existing custom renderer observations remain source-compatible.
      */
     readonly defaultBody?: GraphRenderDefaultNodeBodyObservation | null;

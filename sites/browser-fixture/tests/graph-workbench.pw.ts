@@ -234,6 +234,17 @@ interface ObservedRenderTelemetry {
 }
 
 interface ObservedDensityRenderTelemetry extends ObservedRenderTelemetry {
+  readonly screenProjection: {
+    readonly bounds: {
+      readonly height: number;
+      readonly maxX: number;
+      readonly maxY: number;
+      readonly minX: number;
+      readonly minY: number;
+      readonly width: number;
+    } | null;
+    readonly positions: readonly { readonly id: string; readonly x: number; readonly y: number }[];
+  };
   readonly selectionNodeId: string | null;
 }
 
@@ -590,11 +601,12 @@ function ambientScreenPosition(frame: AmbientMotionFrame, nodeId: string) {
   return position;
 }
 
-function expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+function expectDefaultLinkEndpointsAtProjectedSilhouetteBoundaries(
   frame: AmbientMotionFrame,
   render: ObservedRenderTelemetry["observation"],
   linkIds: readonly string[],
   focusedNodeId?: string,
+  requireVisible = true,
 ): void {
   const endpointsById = new Map(frame.linkEndpoints.map((endpoint) => [endpoint.id, endpoint]));
   const linksById = new Map(render.links.map((link) => [link.id, link]));
@@ -608,7 +620,11 @@ function expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
       throw new Error(`${linkId} did not expose a live default Line curve.`);
     }
     expect(link.curvePointCount).toBeGreaterThanOrEqual(2);
-    expect(link).toMatchObject({ objectTracked: true, objectVisible: true, sceneAttached: true });
+    expect(link).toMatchObject({
+      objectTracked: true,
+      objectVisible: requireVisible ? true : expect.any(Boolean),
+      sceneAttached: true,
+    });
     const endpoint = endpointsById.get(linkId);
     if (!endpoint) throw new Error(`${linkId} did not expose live default Line endpoints.`);
     if (focusedNodeId) {
@@ -621,7 +637,7 @@ function expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
       const node = nodesById.get(nodeId);
       if (!node) throw new Error(`${nodeId} was absent from the live renderer observation.`);
       if (!node.defaultBody) {
-        throw new Error(`${nodeId} did not expose a renderer-owned default flat body in this fixture.`);
+        throw new Error(`${nodeId} did not expose a renderer-owned default body in this fixture.`);
       }
       if (!boundary) {
         throw new Error(`${linkId} did not expose ${end} silhouette boundary evidence.`);
@@ -879,6 +895,20 @@ function expectWorldMotionForNode(
   expect(spatialDistance(start, middle)).toBeGreaterThan(0.01);
   expect(spatialDistance(middle, end)).toBeGreaterThan(0.01);
   expectWorldPositionOnTargetPath(start, middle, end);
+}
+
+function expectWorldPositionStable(
+  before: MotionTelemetryFrame,
+  activeFrames: readonly MotionTelemetryFrame[],
+  after: MotionTelemetryFrame,
+  nodeId: string,
+): void {
+  const start = nodeWorldPosition(before, nodeId);
+  const end = nodeWorldPosition(after, nodeId);
+  expect(spatialDistance(start, end)).toBeLessThan(0.001);
+  activeFrames.forEach((frame) => {
+    expect(spatialDistance(start, nodeWorldPosition(frame, nodeId))).toBeLessThan(0.001);
+  });
 }
 
 function transitionCameraPose(frame: MotionTelemetryFrame): NonNullable<MotionTelemetryFrame["transition"]["camera"]> {
@@ -1198,8 +1228,11 @@ test("keeps a 150-node density graph quiet at idle and isolates its selected one
     adjacency.get(target)!.add(source);
   }
   expect([...adjacency.get("relation:query")!].sort()).toEqual([
+    "concept:context",
     "concept:evidence",
     "concept:index",
+    "concept:model",
+    "concept:provider",
     "concept:vector",
   ]);
   expect(inputNodeIds.filter((nodeId) => nodeId.startsWith("concept:density-")).every(
@@ -1220,37 +1253,72 @@ test("keeps a 150-node density graph quiet at idle and isolates its selected one
   expect(degrees.some((degree) => degree === 1)).toBe(true);
   expect(degrees.some((degree) => degree >= 3)).toBe(true);
 
-  const idle = (await waitForDensityRenderObservation(page, null)).observation;
+  const idleTelemetry = await waitForDensityRenderObservation(page, null);
+  const idle = idleTelemetry.observation;
   expect(idle.nodeIds).toEqual(inputNodeIds);
   expect(idle.nodes).toHaveLength(150);
   expect(idle.links).toHaveLength(149);
   expect(idle.nodes.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)).toBe(true);
-  expect(idle.links.every(({ objectTracked, sceneAttached, visual }) => (
-    objectTracked && sceneAttached && visual.visible
-  ))).toBe(true);
-  const idleRenderedLinks = idle.links.filter(({ objectVisible }) => objectVisible === true);
-  // Very short links can be fully covered by both endpoint silhouettes after
-  // boundary clipping. The remaining relationship field must still be dense,
-  // visible, and materially rendered rather than reverting to isolated dots.
-  expect(idleRenderedLinks.length).toBeGreaterThanOrEqual(Math.floor(densityLinkCount * 0.9));
-  expect(idleRenderedLinks.every(({ minimumVisibleMaterialOpacity }) => (
-    (minimumVisibleMaterialOpacity ?? 0) > 0
+  const idleDepths = idle.nodes.map(({ worldPosition }) => worldPosition.z);
+  expect(Math.max(...idleDepths) - Math.min(...idleDepths)).toBeGreaterThan(100);
+  expect(idle.links.every(({ minimumVisibleMaterialOpacity, objectTracked, objectVisible, sceneAttached, visual }) => (
+    objectTracked
+      && objectVisible === false
+      && sceneAttached
+      && !visual.visible
+      && visual.opacity === 0
+      && (minimumVisibleMaterialOpacity ?? null) === null
   ))).toBe(true);
   const idleReadableLabels = idle.nodes.filter(({ label }) => label.objectVisible === true);
   expect(idleReadableLabels.length).toBeLessThanOrEqual(24);
+  expect(idle.nodes.every((node) => (
+    node.label.objectVisible !== true || requiredNodeBody(node).objectVisible === true
+  ))).toBe(true);
   const idleVisibleBodies = idle.nodes.filter((node) => requiredNodeBody(node).objectVisible === true);
   expect(idleVisibleBodies.length).toBeLessThanOrEqual(48);
+  const canvas = await page.getByTestId("graph-canvas").boundingBox();
+  if (!canvas) throw new Error("density canvas does not have a measurable bounding box");
+  const idleScreenPositions = new Map(idleTelemetry.screenProjection.positions.map((position) => [position.id, position]));
+  const idleVisibleBodyPositions = idleVisibleBodies.flatMap((node) => {
+    const position = idleScreenPositions.get(node.id);
+    return position ? [position] : [];
+  });
+  expect(idleVisibleBodyPositions.length).toBe(idleVisibleBodies.length);
+  const idleMinX = Math.min(...idleVisibleBodyPositions.map(({ x }) => x));
+  const idleMaxX = Math.max(...idleVisibleBodyPositions.map(({ x }) => x));
+  const idleMinY = Math.min(...idleVisibleBodyPositions.map(({ y }) => y));
+  const idleMaxY = Math.max(...idleVisibleBodyPositions.map(({ y }) => y));
+  // The reference uses the full field for its visible body subset. A center-
+  // first budget would regress to the old small central cloud, so keep a
+  // viewport-relative floor on both axes rather than asserting fixed pixels.
+  expect(idleMaxX - idleMinX).toBeGreaterThan(canvas.width * 0.5);
+  expect(idleMaxY - idleMinY).toBeGreaterThan(canvas.height * 0.5);
 
   await page.getByTestId("graph-density-selection-relation-query").click();
   const selection = await waitForSelection(page, "density-control");
   expect(selection).toMatchObject({
     nodeId: "relation:query",
-    neighborNodeIds: ["concept:index", "concept:evidence", "concept:vector"],
+    neighborNodeIds: [
+      "concept:index",
+      "concept:evidence",
+      "concept:vector",
+      "concept:model",
+      "concept:provider",
+      "concept:context",
+    ],
   });
 
   const selected = (await waitForDensityRenderObservation(page, "relation:query")).observation;
   const nodesById = new Map(selected.nodes.map((node) => [node.id, node]));
-  for (const nodeId of ["relation:query", "concept:index", "concept:evidence", "concept:vector"]) {
+  for (const nodeId of [
+    "relation:query",
+    "concept:index",
+    "concept:evidence",
+    "concept:vector",
+    "concept:model",
+    "concept:provider",
+    "concept:context",
+  ]) {
     const node = nodesById.get(nodeId);
     if (!node) throw new Error(`${nodeId} was absent from the selected density observation.`);
     expect(node.label.objectVisible).toBe(true);
@@ -1261,6 +1329,9 @@ test("keeps a 150-node density graph quiet at idle and isolates its selected one
   const selectedVisibleBodies = selected.nodes.filter((node) => requiredNodeBody(node).objectVisible === true);
   expect(selectedReadableLabels.length).toBeLessThanOrEqual(24);
   expect(selectedVisibleBodies.length).toBeLessThanOrEqual(48);
+  expect(selected.nodes.every((node) => (
+    node.label.objectVisible !== true || requiredNodeBody(node).objectVisible === true
+  ))).toBe(true);
   expect(selected.nodes.some((node) => (
     node.id.startsWith("concept:density-") && node.label.objectVisible === false
   ))).toBe(true);
@@ -1269,31 +1340,119 @@ test("keeps a 150-node density graph quiet at idle and isolates its selected one
   ))).toBe(true);
 
   const visibleLinks = selected.links.filter(({ objectVisible }) => objectVisible === true);
-  expect(visibleLinks.map(({ id }) => id)).toEqual(["query-index", "query-evidence", "query-vector"]);
+  expect(visibleLinks.map(({ id }) => id)).toEqual([
+    "query-index",
+    "query-evidence",
+    "query-vector",
+    "query-model",
+    "query-provider",
+    "query-context",
+  ]);
   visibleLinks.forEach((link) => {
     expect(link).toMatchObject({ objectTracked: true, sceneAttached: true, visual: { visible: true } });
     expect(link.curvePointCount).toBeGreaterThanOrEqual(2);
     expect(link.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
   });
   const hiddenLinks = selected.links.filter(({ objectVisible }) => objectVisible === false);
-  expect(hiddenLinks).toHaveLength(146);
+  expect(hiddenLinks).toHaveLength(143);
   expect(hiddenLinks.every(({ objectTracked, sceneAttached, visual }) => (
     objectTracked && sceneAttached && !visual.visible
   ))).toBe(true);
 
-  const canvas = page.getByTestId("graph-canvas");
-  const canvasBox = await canvas.boundingBox();
-  if (!canvasBox) throw new Error("The density canvas had no clickable bounds.");
-  await canvas.click({ position: { x: 8, y: canvasBox.height - 8 } });
+  await page.getByTestId("graph-density-detail-close").click();
   const cleared = await waitForSelection(page, "background");
   expect(cleared).toMatchObject({ nodeId: null, neighborNodeIds: [] });
   const restored = (await waitForDensityRenderObservation(page, null)).observation;
   expect(restored.links).toHaveLength(149);
-  expect(restored.links.every(({ objectTracked, sceneAttached, visual }) => (
-    objectTracked && sceneAttached && visual.visible
+  expect(restored.links.every(({ objectTracked, objectVisible, sceneAttached, visual }) => (
+    objectTracked && objectVisible === false && sceneAttached && !visual.visible
   ))).toBe(true);
-  expect(restored.links.filter(({ objectVisible }) => objectVisible === true).length)
-    .toBeGreaterThanOrEqual(Math.floor(densityLinkCount * 0.9));
+});
+
+test("opens a density deep-link in the detail rail and clears it back to the full graph", async ({ page }) => {
+  await page.goto("/density?term=relation%3Aquery");
+  await expect(page.getByTestId("graph-shell")).toBeVisible();
+  await expect(page.getByTestId("graph-canvas")).toBeVisible();
+  await expect.poll(async () => readTelemetry<{
+    readonly availability: "observed" | "pending" | "unavailable";
+    readonly nodeCount?: number;
+  }>(page, "graph-density-ready")).toMatchObject({ availability: "observed", nodeCount: 150 });
+  const deepLinkRender = await waitForDensityRenderObservation(page, "relation:query");
+  expect(deepLinkRender.observation.nodes.find(({ id }) => id === "relation:query")?.body?.objectVisible).toBe(true);
+  expect(deepLinkRender.observation.links.filter(({ objectVisible }) => objectVisible).map(({ id }) => id)).toEqual([
+    "query-index",
+    "query-evidence",
+    "query-vector",
+    "query-model",
+    "query-provider",
+    "query-context",
+  ]);
+  await expect(page.getByTestId("graph-density-detail-panel")).toBeVisible();
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("Query");
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("Index");
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("Evidence");
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("Vector");
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("Definition");
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("model-provider request path");
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("Model");
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("Provider");
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("Context");
+  await page.getByTestId("graph-density-detail-relationship-concept-model").click();
+  await expect.poll(() => new URL(page.url()).searchParams.get("term")).toBe("concept:model");
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("The model identifies");
+  await page.getByTestId("graph-density-detail-copy-link").click();
+  await expect(page.getByTestId("graph-density-detail-copy-link")).toHaveText(/Link copied|Copy unavailable/);
+  await page.getByTestId("graph-density-detail-clear").click();
+  await waitForSelection(page, "background");
+
+  await expect(page.getByTestId("graph-density-detail-panel")).toBeHidden();
+  await expect(page).toHaveURL(/\/density$/);
+  await waitForDensityRenderObservation(page, null);
+});
+
+test("resolves reference term aliases and restores them through browser history", async ({ page }) => {
+  await page.goto("/density?term=model-provider-request");
+  await expect(page.getByTestId("graph-shell")).toBeVisible();
+  await expect(page.getByTestId("graph-canvas")).toBeVisible();
+  await expect.poll(async () => readTelemetry<{
+    readonly availability: "observed" | "pending" | "unavailable";
+    readonly nodeCount?: number;
+  }>(page, "graph-density-ready")).toMatchObject({ availability: "observed", nodeCount: 150 });
+
+  const deepLinkSelection = await waitForSelection(page, "deep-link");
+  expect(deepLinkSelection.nodeId).toBe("relation:query");
+  await waitForDensityRenderObservation(page, "relation:query");
+  await expect(page.getByTestId("graph-density-detail-panel")).toBeVisible();
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("Query");
+
+  await page.getByTestId("graph-density-detail-relationship-concept-model").click();
+  await expectTermUrl(page, "concept:model");
+  await waitForSelection(page, "relationship");
+
+  await page.goBack();
+  await expectTermUrl(page, "model-provider-request");
+  const historySelection = await waitForSelection(page, "history");
+  expect(historySelection.nodeId).toBe("relation:query");
+  await waitForDensityRenderObservation(page, "relation:query");
+  await expect(page.getByTestId("graph-density-detail-panel")).toBeVisible();
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText("Query");
+});
+
+test("keeps a selected noncentral density node near the canvas centre", async ({ page }) => {
+  await page.goto("/density?term=concept%3Adensity-101");
+  await expect(page.getByTestId("graph-shell")).toBeVisible();
+  await expect(page.getByTestId("graph-canvas")).toBeVisible();
+  await expect.poll(async () => readTelemetry<{
+    readonly availability: "observed" | "pending" | "unavailable";
+    readonly nodeCount?: number;
+  }>(page, "graph-density-ready")).toMatchObject({ availability: "observed", nodeCount: 150 });
+  const render = await waitForDensityRenderObservation(page, "concept:density-101");
+  const canvas = await page.getByTestId("graph-canvas").boundingBox();
+  if (!canvas) throw new Error("density canvas does not have a measurable bounding box");
+  const selected = render.screenProjection.positions.find(({ id }) => id === "concept:density-101");
+  if (!selected) throw new Error("The selected density node did not have a screen projection.");
+  expect(Math.abs(selected.x - (canvas.width / 2))).toBeLessThan(canvas.width * 0.08);
+  expect(Math.abs(selected.y - (canvas.height / 2))).toBeLessThan(canvas.height * 0.08);
 });
 
 test("actual WebGL scene exposes semantic default node colors across system themes", async ({ page }) => {
@@ -1313,7 +1472,7 @@ test("actual WebGL scene exposes semantic default node colors across system them
   const darkSelection = await waitForAmbientMotion(page, (motion) => (
     motion.focusNodeId === "relation:release" && motion.visibleLinkFlow.length > 0
   ));
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+  expectDefaultLinkEndpointsAtProjectedSilhouetteBoundaries(
     darkSelection,
     (await waitForRenderObservation(page)).observation,
     ["release-api", "release-profile"],
@@ -1335,7 +1494,7 @@ test("actual WebGL scene exposes semantic default node colors across system them
   const lightSelection = await waitForAmbientMotion(page, (motion) => (
     motion.focusNodeId === "relation:release" && motion.visibleLinkFlow.length > 0
   ));
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+  expectDefaultLinkEndpointsAtProjectedSilhouetteBoundaries(
     lightSelection,
     lightRender.observation,
     ["release-api", "release-profile"],
@@ -1343,7 +1502,7 @@ test("actual WebGL scene exposes semantic default node colors across system them
   );
 });
 
-test("actual WebGL scene attaches profile, workflow, leaf, and relation flat default bodies", async ({ page }) => {
+test("actual WebGL scene attaches depth-capable profile, workflow, leaf, and relation bodies", async ({ page }) => {
   await openFixture(page);
 
   const { observation } = await waitForRenderObservation(page);
@@ -1435,7 +1594,7 @@ test("keeps ambient motion live while deterministic anchors stay fixed", async (
     ambientScreenPosition(first, "concept:session"),
     ambientScreenPosition(later, "concept:session"),
   ) / await canvasShortEdge(page);
-  // Flat camera-facing bodies change the fitted screen scale slightly. Keep a
+  // Depth-capable bodies change the fitted screen scale slightly. Keep a
   // viewport-relative lower bound that still proves visible peripheral drift
   // without coupling this renderer observation to the former sphere framing.
   expect(peripheralDrift).toBeGreaterThan(0.0035);
@@ -1443,108 +1602,59 @@ test("keeps ambient motion live while deterministic anchors stay fixed", async (
   expect(later.frames.length).toBeGreaterThanOrEqual(2);
 });
 
-test("actual canvas hover differentiates bounded idle and focus flow particles without selecting", async ({ page }) => {
+test("keeps relationship lines hidden while hovering an unselected node", async ({ page }) => {
   await openFixture(page);
-  const minimumDiscernibleDistance = await screenDiscernibilityThreshold(page);
 
   const idleRender = (await waitForRenderObservation(page)).observation;
   expect(idleRender.links).toHaveLength(fixtureLinkCount);
-  expect(idleRender.links.every(({ minimumVisibleMaterialOpacity, objectVisible, sceneAttached }) => (
-    objectVisible && sceneAttached && (minimumVisibleMaterialOpacity ?? 0) > 0
+  expect(idleRender.links.every(({ minimumVisibleMaterialOpacity, objectVisible, sceneAttached, visual }) => (
+    objectVisible === false
+      && sceneAttached
+      && !visual.visible
+      && (minimumVisibleMaterialOpacity ?? null) === null
   ))).toBe(true);
-  const idleApiWeb = idleRender.links.find(({ id }) => id === "api-web");
-  if (!idleApiWeb) throw new Error("The default idle api-web edge was absent from the live renderer observation.");
-  expect(idleApiWeb.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThanOrEqual(0.22);
-  expect(idleApiWeb.minimumVisibleMaterialOpacity ?? 1).toBeLessThanOrEqual(0.28);
-  expect(idleApiWeb.visibleMaterialLineWidths[0] ?? 0).toBeGreaterThanOrEqual(0.7);
-  expect(idleApiWeb.visibleMaterialLineWidths[0] ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(0.82);
   const idle = await waitForAmbientMotion(page, (motion) => (
     motion.focusNodeId === null
-    && motion.visibleLinkFlow.length > 0
-    && motion.visibleParticles.length > 0
+    && motion.visibleLinkFlow.length === 0
+    && motion.visibleParticles.length === 0
   ));
-  expect(idle.visibleLinkFlow).toHaveLength(idle.visibleParticles.length);
-  expect(idle.visibleLinkFlow.length).toBeLessThanOrEqual(3);
-  expect(idle.visibleLinkFlow.every(({ active, particleCount }) => active && particleCount === 1)).toBe(true);
-  expect(idle.visibleParticles.every(({ linkId, phase }) => (
-    idle.visibleLinkFlow.some(({ id }) => id === linkId) && Number.isFinite(phase)
-  ))).toBe(true);
+  expect(idle.visibleLinkFlow).toHaveLength(0);
+  expect(idle.visibleParticles).toHaveLength(0);
   expect(idle.linkEndpoints).toHaveLength(fixtureLinkCount);
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
-    idle,
-    idleRender,
-    idle.linkEndpoints.map(({ id }) => id),
-  );
   const laterIdle = await waitForAmbientMotionAfter(
     page,
     idle.frame,
     12,
-    (motion) => motion.focusNodeId === null && motion.visibleParticles.length > 0,
+    (motion) => motion.focusNodeId === null && motion.visibleParticles.length === 0,
   );
-  const firstIdleParticle = idle.visibleParticles[0];
-  const laterIdleParticle = laterIdle.visibleParticles.find(({ id }) => id === firstIdleParticle?.id);
-  if (!firstIdleParticle || !laterIdleParticle) throw new Error("An idle flow particle did not persist across samples.");
-  expect(laterIdleParticle.phase).not.toBe(firstIdleParticle.phase);
+  expect(laterIdle.visibleLinkFlow).toHaveLength(0);
+  expect(laterIdle.visibleParticles).toHaveLength(0);
 
   await hoverProjectedCanvasNode(page, "relation:query");
   const hover = await waitForAmbientMotion(page, (motion) => (
     motion.focusNodeId === "relation:query"
-    && motion.visibleLinkFlow.length > 0
-    && motion.visibleParticles.length > 0
+    && motion.visibleLinkFlow.length === 0
+    && motion.visibleParticles.length === 0
   ));
-  // Every active token runs away from the focused query. The inbound relation
-  // is intentionally reversed at render time, so only its *incident* links
-  // participate and no unrelated edge can leak into hover flow.
-  const focusIncidentLinkIds = new Set(["index-query", "query-evidence", "query-vector"]);
-  expect(hover.visibleLinkFlow.map(({ id }) => id)).toEqual(expect.arrayContaining([...focusIncidentLinkIds]));
-  expect(hover.visibleLinkFlow.every(({ active, id, particleCount }) => (
-    active && focusIncidentLinkIds.has(id) && particleCount === 2
-  ))).toBe(true);
-  // Focus increases the link-level particle density above bounded idle flow,
-  // making the interaction hierarchy observable before any screenshot review.
-  expect(hover.visibleParticles.length).toBeGreaterThan(idle.visibleParticles.length);
-  expect(hover.visibleParticles.every(({ linkId, phase }) => (
-    focusIncidentLinkIds.has(linkId) && Number.isFinite(phase)
-  ))).toBe(true);
-  const hoverRender = (await waitForRenderObservation(page)).observation;
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
-    hover,
-    hoverRender,
-    [...focusIncidentLinkIds],
-    "relation:query",
-  );
   const laterHover = await waitForAmbientMotionAfterWhileHovering(
     page,
     "relation:query",
     hover.frame,
     12,
-    (motion) => motion.focusNodeId === "relation:query" && motion.visibleParticles.length > 0,
+    (motion) => (
+      motion.focusNodeId === "relation:query"
+      && motion.visibleLinkFlow.length === 0
+      && motion.visibleParticles.length === 0
+    ),
   );
-  expectFocusedParticleScreenMotion(
-    hover,
-    laterHover,
-    [...focusIncidentLinkIds],
-    minimumDiscernibleDistance,
-  );
-  expectFocusedFlowHasScreenHierarchy(
-    hover,
-    laterHover,
-    [...focusIncidentLinkIds],
-    await canvasShortEdge(page),
-  );
-  // Hover flow is intentionally a stronger interaction tier than the bounded
-  // idle field: every incident link carries more visible tokens. The focused
-  // screen-space advance is checked above and its pixel-per-second range below.
-  const idleLinkIds = idle.visibleLinkFlow.map(({ id }) => id);
-  expect(flowParticleDensity(hover, [...focusIncidentLinkIds]))
-    .toBeGreaterThan(flowParticleDensity(idle, idleLinkIds));
-  await expectFocusedParticlesInsideCanvas(page, hover, [...focusIncidentLinkIds]);
-  await expectFocusedParticlesInsideCanvas(page, laterHover, [...focusIncidentLinkIds]);
+  expect(laterHover.visibleLinkFlow).toHaveLength(0);
+  expect(laterHover.visibleParticles).toHaveLength(0);
+  expect(laterHover.linkEndpoints).toHaveLength(fixtureLinkCount);
   const selectionAfterHover = await readTelemetry<Partial<ObservedSelectionState>>(page, "graph-selection");
   expect(selectionAfterHover.nodeId ?? null).toBeNull();
 });
 
-test("keeps hovered active link curves attached to rendered node positions across frames", async ({ page }) => {
+test("keeps hidden hovered link curves attached to rendered node positions across frames", async ({ page }) => {
   await openFixture(page);
 
   await hoverProjectedCanvasNode(page, "relation:query");
@@ -1552,12 +1662,18 @@ test("keeps hovered active link curves attached to rendered node positions acros
     motion.active
     && !motion.reducedMotion
     && motion.focusNodeId === "relation:query"
-    && motion.visibleLinkFlow.some(({ active }) => active)
+    && motion.visibleLinkFlow.length === 0
+    && motion.visibleParticles.length === 0
   ));
-  const activeLinkIds = hover.visibleLinkFlow.filter(({ active }) => active).map(({ id }) => id);
-  expect(activeLinkIds).not.toHaveLength(0);
+  const focusLinkIds = ["index-query", "query-evidence", "query-vector"];
   const hoverRender = (await waitForRenderObservation(page)).observation;
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(hover, hoverRender, activeLinkIds, "relation:query");
+  expectDefaultLinkEndpointsAtProjectedSilhouetteBoundaries(
+    hover,
+    hoverRender,
+    focusLinkIds,
+    "relation:query",
+    false,
+  );
 
   // The endpoint observation is sampled again after a later renderer frame,
   // rather than comparing the curve to a static layout snapshot. This catches
@@ -1571,13 +1687,20 @@ test("keeps hovered active link curves attached to rendered node positions acros
       motion.active
       && !motion.reducedMotion
       && motion.focusNodeId === "relation:query"
-      && motion.visibleLinkFlow.some(({ active }) => active)
+      && motion.visibleLinkFlow.length === 0
+      && motion.visibleParticles.length === 0
     ),
   );
   expect(laterHover.frame).toBeGreaterThan(hover.frame);
-  const laterActiveLinkIds = laterHover.visibleLinkFlow.filter(({ active }) => active).map(({ id }) => id);
-  expect(laterActiveLinkIds).not.toHaveLength(0);
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(laterHover, hoverRender, laterActiveLinkIds, "relation:query");
+  expect(laterHover.visibleLinkFlow).toHaveLength(0);
+  expect(laterHover.visibleParticles).toHaveLength(0);
+  expectDefaultLinkEndpointsAtProjectedSilhouetteBoundaries(
+    laterHover,
+    hoverRender,
+    focusLinkIds,
+    "relation:query",
+    false,
+  );
 });
 
 test("observes the master floor and selection-distance opacity in attached scene objects", async ({ page }) => {
@@ -1585,10 +1708,13 @@ test("observes the master floor and selection-distance opacity in attached scene
   const idleRender = (await waitForRenderObservation(page)).observation;
   const idleEdge = idleRender.links.find((link) => link.id === "api-web");
   if (!idleEdge) throw new Error("The default idle api-web edge was absent from the live renderer observation.");
-  const idleOpacity = idleEdge.minimumVisibleMaterialOpacity;
-  const idleWidth = idleEdge.visibleMaterialLineWidths[0];
-  expect(idleOpacity).toBeGreaterThanOrEqual(0.22);
-  expect(idleOpacity).toBeLessThanOrEqual(0.28);
+  expect(idleEdge).toMatchObject({
+    objectVisible: false,
+    sceneAttached: true,
+    visual: { visible: false },
+    visibleMaterialLineWidths: [],
+  });
+  expect(idleEdge.minimumVisibleMaterialOpacity).toBeNull();
   const beforeMotion = await waitForMotionSettled(page);
   await selectMatrixNode(page, "component:web");
   expect(await waitForSelection(page, "matrix")).toMatchObject({
@@ -1664,11 +1790,10 @@ test("observes the master floor and selection-distance opacity in attached scene
   });
   expect(selectedEdge?.visual.opacity ?? 0).toBeGreaterThan(distantEdge?.visual.opacity ?? 0);
   expect(selectedEdge?.visual.width ?? 0).toBeGreaterThan(distantEdge?.visual.width ?? 0);
-  // `api-web` is the selected node's incident link. Its material tier has to
-  // rise above the independently readable idle default, not merely above a
-  // distant edge that was muted by the selection.
-  expect(selectedEdge?.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan((idleOpacity ?? 0) * 2);
-  expect((selectedEdge?.visibleMaterialLineWidths[0] ?? 0) - (idleWidth ?? 0)).toBeGreaterThan(0.35);
+  // `api-web` is the selected node's incident link. Its material tier is now
+  // the first visible relationship tier after the quiet idle state.
+  expect(selectedEdge?.minimumVisibleMaterialOpacity ?? 0).toBeGreaterThan(0.5);
+  expect(selectedEdge?.visibleMaterialLineWidths[0] ?? 0).toBeGreaterThanOrEqual(1.18);
 
   const canvas = page.getByTestId("graph-canvas");
   const box = await canvas.boundingBox();
@@ -1820,7 +1945,8 @@ test("moves a non-selected node through a real renderer-owned intermediate frame
   expectLiveTransitionTargets(after, layout, ["component:api", "relation:release", "component:web", "profile:platform"]);
 
   // Closing the drawer is an explicit selection reset: the graph returns to
-  // its complete link context and the query no longer names a selected term.
+  // its complete topology with relationship lines quiet and the query no
+  // longer names a selected term.
   const drawerClose = page.getByTestId("detail-drawer-close");
   await expect(drawerClose).toBeVisible();
   await expect(drawerClose).toBeEnabled();
@@ -1834,14 +1960,19 @@ test("moves a non-selected node through a real renderer-owned intermediate frame
     const render = await readTelemetry<ObservedRenderTelemetry>(page, "graph-render-observation");
     return render.availability === "observed"
       && render.observation.links.length === fixtureLinkCount
-      && render.observation.links.every(({ objectVisible, sceneAttached }) => objectVisible && sceneAttached);
+      && render.observation.links.every(({ minimumVisibleMaterialOpacity, objectVisible, sceneAttached, visual }) => (
+        objectVisible === false
+        && sceneAttached
+        && !visual.visible
+        && (minimumVisibleMaterialOpacity ?? null) === null
+      ));
   }).toBe(true);
   const graphShell = page.getByTestId("graph-shell");
   await expect(graphShell).toHaveAttribute("role", "application");
   await expect(graphShell).toBeFocused();
 });
 
-test("two actual canvas node clicks move selected, neighbor, and far graph positions", async ({ page }) => {
+test("two actual canvas node clicks move only direct neighbors and preserve context anchors", async ({ page }) => {
   test.slow();
   await openFixture(page);
 
@@ -1865,16 +1996,19 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
   const firstSettled = await waitForMotionSettled(page, firstGeneration);
   const allNodeIds = firstLayout.targetNodePositions.map(({ id }) => id);
 
-  // This is a real canvas hit path, not Matrix preselection: the selected
-  // relation and every attached or peripheral node expose real
-  // start/intermediate/final world coordinates. The same transaction carries
-  // a live camera pose; no screenshot or fixed canvas coordinate is used.
+  // This is a real canvas hit path, not Matrix preselection. The selected node
+  // and its direct relationship lane expose live intermediate coordinates,
+  // while unrelated anchors remain stable in the global scene. The same
+  // transaction carries a live camera pose; no screenshot or fixed canvas
+  // coordinate is used.
   for (const frame of firstActiveFrames) {
     expect([...frame.transition.nodePositions.map(({ id }) => id)].sort()).toEqual([...allNodeIds].sort());
   }
-  for (const nodeId of allNodeIds) {
+  for (const nodeId of ["concept:contract", "concept:owner"]) {
     expectWorldMotionForNode(initial, firstActiveFrames, firstSettled, nodeId);
   }
+  expectWorldPositionStable(initial, firstActiveFrames, firstSettled, "relation:review");
+  expectWorldPositionStable(initial, firstActiveFrames, firstSettled, "concept:session");
   expectLiveTransitionTargets(firstSettled, firstLayout, allNodeIds);
   expectCameraMotion(initial, firstActiveFrames, firstSettled);
   const reviewConstellation = await Promise.all([
@@ -1910,9 +2044,11 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
   // mouse event. The click helper captures the live frame between pointer-down
   // and the selecting pointer-up, giving this path proof its actual start even
   // when a throttled browser exposes only one later in-flight frame.
-  expectWorldMotionForNode(secondStart, secondActiveFrames, secondSettled, "relation:query");
-  expectWorldMotionForNode(secondStart, secondActiveFrames, secondSettled, "concept:index");
-  expectWorldMotionForNode(secondStart, secondActiveFrames, secondSettled, "concept:session");
+  for (const nodeId of ["concept:index", "concept:evidence", "concept:vector"]) {
+    expectWorldMotionForNode(secondStart, secondActiveFrames, secondSettled, nodeId);
+  }
+  expectWorldPositionStable(secondStart, secondActiveFrames, secondSettled, "relation:query");
+  expectWorldPositionStable(secondStart, secondActiveFrames, secondSettled, "concept:session");
   expectCameraMotion(secondStart, secondActiveFrames, secondSettled);
 
   const ambientAfterSelection = await waitForAmbientMotion(page, (motion) => (
@@ -1936,7 +2072,7 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
   const selectedFocusLinkIds = ["index-query", "query-evidence", "query-vector"];
   expect([...selectedActiveLinkIds].sort()).toEqual([...selectedFocusLinkIds].sort());
   const selectedRender = (await waitForRenderObservation(page)).observation;
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+  expectDefaultLinkEndpointsAtProjectedSilhouetteBoundaries(
     ambientAfterSelection,
     selectedRender,
     selectedActiveLinkIds,
@@ -1946,7 +2082,7 @@ test("two actual canvas node clicks move selected, neighbor, and far graph posit
     .filter(({ active }) => active)
     .map(({ id }) => id);
   expect(laterSelectedActiveLinkIds).toEqual(selectedActiveLinkIds);
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+  expectDefaultLinkEndpointsAtProjectedSilhouetteBoundaries(
     ambientLater,
     selectedRender,
     laterSelectedActiveLinkIds,
@@ -2258,13 +2394,13 @@ test("reduced motion reaches the same public selection target and deterministic 
   const reducedSelectedLinkIds = selectedLinkIds(reducedAmbient);
   expect(normalSelectedLinkIds).toEqual(["api-web"]);
   expect(reducedSelectedLinkIds).toEqual(normalSelectedLinkIds);
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+  expectDefaultLinkEndpointsAtProjectedSilhouetteBoundaries(
     normalAmbient,
     normalRender,
     normalSelectedLinkIds,
     "component:web",
   );
-  expectDefaultLinkEndpointsAtFlatSilhouetteBoundaries(
+  expectDefaultLinkEndpointsAtProjectedSilhouetteBoundaries(
     reducedAmbient,
     reducedRender,
     reducedSelectedLinkIds,

@@ -164,11 +164,11 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
 
   const transitionToSelection = (nodeId: string | null) => {
     if (!renderer || !nodeId) return;
-    renderer.cancelCameraTransition?.();
     if (renderer.transitionToNode) {
       renderer.transitionToNode(nodeId, { reducedMotion: presentation.reducedMotion === true });
       return;
     }
+    renderer.cancelCameraTransition?.();
     renderer.focus(nodeId);
   };
 
