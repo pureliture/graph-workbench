@@ -549,6 +549,23 @@ kbd {
 .density-detail-panel {
   top: 0;
   width: min(28rem, 34vw);
+  transition-duration: 420ms;
+  transition-timing-function: ease-in-out;
+}
+
+.density-fixture[data-detail-open="true"] .graph-stage {
+  /* AI Coding Dictionary keeps a full-width WebGL field behind its drawer.
+     Translating that field by half the drawer width puts the camera centre in
+     the centre of the exposed canvas without shrinking or refitting it. */
+  padding-inline-end: 0;
+}
+
+.density-fixture .graph-panel {
+  transition: transform 420ms ease-in-out;
+}
+
+.density-fixture[data-detail-open="true"] .graph-panel {
+  transform: translateX(max(-14rem, -17vw));
 }
 
 .detail-heading {
@@ -1145,6 +1162,10 @@ dd {
 
   .fixture-page[data-detail-open="true"] .graph-stage {
     padding: 0;
+  }
+
+  .density-fixture[data-detail-open="true"] .graph-panel {
+    transform: none;
   }
 
   .detail-panel {

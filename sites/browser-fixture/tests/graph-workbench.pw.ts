@@ -234,6 +234,11 @@ interface ObservedRenderTelemetry {
 }
 
 interface ObservedDensityRenderTelemetry extends ObservedRenderTelemetry {
+  readonly ambientMotion: {
+    readonly active: boolean;
+    readonly frame: number;
+    readonly reducedMotion: boolean;
+  } | null;
   readonly screenProjection: {
     readonly bounds: {
       readonly height: number;
@@ -242,6 +247,10 @@ interface ObservedDensityRenderTelemetry extends ObservedRenderTelemetry {
       readonly minX: number;
       readonly minY: number;
       readonly width: number;
+    } | null;
+    readonly camera: {
+      readonly lookAt: { readonly x: number; readonly y: number; readonly z: number };
+      readonly position: { readonly x: number; readonly y: number; readonly z: number };
     } | null;
     readonly positions: readonly { readonly id: string; readonly x: number; readonly y: number }[];
   };
@@ -1204,7 +1213,7 @@ test("mounts a real WebGL canvas and keeps input/render identities exact", async
   expect(observation.links.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)).toBe(true);
 });
 
-test("keeps a 150-node density graph quiet at idle and isolates its selected one-hop relationship", async ({ page }) => {
+test("keeps a 150-node density graph gently moving at idle and isolates its selected one-hop relationship", async ({ page }) => {
   await openDensityFixture(page);
 
   const inputNodeIds = await readTelemetry<string[]>(page, "graph-input-node-ids");
@@ -1255,6 +1264,8 @@ test("keeps a 150-node density graph quiet at idle and isolates its selected one
 
   const idleTelemetry = await waitForDensityRenderObservation(page, null);
   const idle = idleTelemetry.observation;
+  expect(idleTelemetry.ambientMotion).toMatchObject({ active: true, reducedMotion: false });
+  expect(idleTelemetry.ambientMotion?.frame).toBeGreaterThan(0);
   expect(idle.nodeIds).toEqual(inputNodeIds);
   expect(idle.nodes).toHaveLength(150);
   expect(idle.links).toHaveLength(149);
@@ -1278,7 +1289,33 @@ test("keeps a 150-node density graph quiet at idle and isolates its selected one
   expect(idleVisibleBodies.length).toBeLessThanOrEqual(48);
   const canvas = await page.getByTestId("graph-canvas").boundingBox();
   if (!canvas) throw new Error("density canvas does not have a measurable bounding box");
+  const focusNodeIds = [
+    "relation:query",
+    "concept:index",
+    "concept:evidence",
+    "concept:vector",
+    "concept:model",
+    "concept:provider",
+    "concept:context",
+  ];
+  const screenSpan = (positions: readonly { readonly id: string; readonly x: number; readonly y: number }[]) => {
+    const focusPositions = positions.filter(({ id }) => focusNodeIds.includes(id));
+    return Math.hypot(
+      Math.max(...focusPositions.map(({ x }) => x)) - Math.min(...focusPositions.map(({ x }) => x)),
+      Math.max(...focusPositions.map(({ y }) => y)) - Math.min(...focusPositions.map(({ y }) => y)),
+    );
+  };
+  const cameraDistance = (camera: NonNullable<ObservedDensityRenderTelemetry["screenProjection"]["camera"]>) => (
+    Math.hypot(
+      camera.position.x - camera.lookAt.x,
+      camera.position.y - camera.lookAt.y,
+      camera.position.z - camera.lookAt.z,
+    )
+  );
   const idleScreenPositions = new Map(idleTelemetry.screenProjection.positions.map((position) => [position.id, position]));
+  const idleFocusSpan = screenSpan(idleTelemetry.screenProjection.positions);
+  const idleCamera = idleTelemetry.screenProjection.camera;
+  if (!idleCamera) throw new Error("The idle density camera was not observable.");
   const idleVisibleBodyPositions = idleVisibleBodies.flatMap((node) => {
     const position = idleScreenPositions.get(node.id);
     return position ? [position] : [];
@@ -1308,17 +1345,21 @@ test("keeps a 150-node density graph quiet at idle and isolates its selected one
     ],
   });
 
-  const selected = (await waitForDensityRenderObservation(page, "relation:query")).observation;
+  const selectedTelemetry = await waitForDensityRenderObservation(page, "relation:query");
+  const selected = selectedTelemetry.observation;
+  const selectedCamera = selectedTelemetry.screenProjection.camera;
+  if (!selectedCamera) throw new Error("The selected density camera was not observable.");
+  expect(cameraDistance(selectedCamera)).toBeLessThanOrEqual(cameraDistance(idleCamera) + 1);
+  expect(screenSpan(selectedTelemetry.screenProjection.positions)).toBeGreaterThan(idleFocusSpan * 1.05);
+  expect(screenSpan(selectedTelemetry.screenProjection.positions)).toBeGreaterThan(canvas.width * 0.2);
+  await expect.poll(async () => (await page.getByTestId("graph-canvas").boundingBox())?.width)
+    .toBeCloseTo(canvas.width, 0);
+  const selectedCanvas = await page.getByTestId("graph-canvas").boundingBox();
+  if (!selectedCanvas) throw new Error("The selected density canvas does not have a measurable bounding box.");
+  expect(selectedCanvas.x).toBeLessThan(canvas.x - (canvas.width * 0.1));
+  expect(selectedCanvas.x).toBeGreaterThan(canvas.x - (canvas.width * 0.25));
   const nodesById = new Map(selected.nodes.map((node) => [node.id, node]));
-  for (const nodeId of [
-    "relation:query",
-    "concept:index",
-    "concept:evidence",
-    "concept:vector",
-    "concept:model",
-    "concept:provider",
-    "concept:context",
-  ]) {
+  for (const nodeId of focusNodeIds) {
     const node = nodesById.get(nodeId);
     if (!node) throw new Error(`${nodeId} was absent from the selected density observation.`);
     expect(node.label.objectVisible).toBe(true);

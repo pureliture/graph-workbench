@@ -455,6 +455,7 @@ type DensityScreenProjection = {
 type RenderTelemetry =
   | {
       readonly availability: "observed";
+      readonly ambientMotion: ReturnType<GraphWorkbench["getAmbientMotionObservation"]>;
       readonly observation: GraphRenderObservation;
       readonly observationScope: "renderer-live-data-and-scene-object-material";
       readonly screenProjection: DensityScreenProjection;
@@ -588,7 +589,7 @@ export function DenseGraphFixture() {
         });
         workbenchRef.current = workbench;
         workbench.mount(host);
-        workbench.setPresentation({ ambientMotion: false, theme: "dark" });
+        workbench.setPresentation({ ambientMotion: true, theme: "dark" });
         workbench.resize(host.clientWidth, host.clientHeight);
         resizeObserver = new ResizeObserver(([entry]) => {
           workbench.resize(entry.contentRect.width, entry.contentRect.height);
@@ -741,6 +742,7 @@ export function DenseGraphFixture() {
           finishObservation();
           setRenderTelemetry({
             availability: "observed",
+            ambientMotion: workbenchRef.current!.getAmbientMotionObservation(),
             observation,
             observationScope: "renderer-live-data-and-scene-object-material",
             screenProjection: densityScreenProjection(workbenchRef.current!),

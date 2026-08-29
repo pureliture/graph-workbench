@@ -95,6 +95,9 @@ const AMBIENT_CAMERA_DRIFT = Object.freeze({ x: 1.1, y: 0.82, z: 0.34 });
 // Covers the largest common-plus-individual planar displacement (6.35).
 const AMBIENT_MAX_OFFSET = 7;
 const AMBIENT_RADIANS_PER_SECOND = 0.24;
+const ORBIT_DAMPING_FACTOR = 0.08;
+const SELECTION_FOCAL_BOUNDS_BIAS = 0.24;
+const SELECTION_MIN_CAMERA_DISTANCE_RATIO = 0.5;
 const FLOW_SPEED_CYCLES_PER_SECOND = 0.11;
 // Idle flow is deliberately much slower and smaller than an interaction flow.
 // It lets a settled graph read as a living system without turning every edge
@@ -528,6 +531,11 @@ export function createDefaultGraphNodeObject(node, descriptor) {
     const silhouette = defaultNodeSilhouette(node);
     const bodyMaterial = new MeshStandardMaterial({
         color,
+        // Bodies are intentionally rendered as translucent depth cues. Writing
+        // each faded sphere into the depth buffer makes the draw order unstable
+        // while OrbitControls changes the camera, so overlapping nodes can flash
+        // as transparent fragments occlude one another from frame to frame.
+        depthWrite: false,
         opacity,
         roughness: 0.78,
         metalness: 0.02,
@@ -643,6 +651,26 @@ function isCursorZoomControls(controls) {
     return isCameraInteractionControls(controls)
         && "zoomToCursor" in controls
         && typeof controls.zoomToCursor === "boolean";
+}
+function isDampedCameraControls(controls) {
+    return isCameraInteractionControls(controls)
+        && "enableDamping" in controls
+        && typeof controls.enableDamping === "boolean"
+        && "dampingFactor" in controls
+        && typeof controls.dampingFactor === "number";
+}
+function isTargetCameraControls(controls) {
+    if (!isCameraInteractionControls(controls) || !("target" in controls))
+        return false;
+    const target = controls.target;
+    return typeof target === "object"
+        && target !== null
+        && "x" in target
+        && typeof target.x === "number"
+        && "y" in target
+        && typeof target.y === "number"
+        && "z" in target
+        && typeof target.z === "number";
 }
 function cameraFrameScheduler(container) {
     const view = container.ownerDocument?.defaultView;
@@ -781,6 +809,23 @@ function contextCameraPose(points, current, projection, viewport, focalPoint = n
             z: center.z + (direction.z * distance),
         },
         lookAt: center,
+    };
+}
+function cameraPoseDistance(pose) {
+    return Math.hypot(pose.position.x - pose.lookAt.x, pose.position.y - pose.lookAt.y, pose.position.z - pose.lookAt.z);
+}
+function cameraPoseAtDistance(pose, distance) {
+    const fittedDistance = cameraPoseDistance(pose);
+    if (fittedDistance <= 0 || !Number.isFinite(distance))
+        return pose;
+    const scale = Math.max(0, distance) / fittedDistance;
+    return {
+        lookAt: pose.lookAt,
+        position: {
+            x: pose.lookAt.x + ((pose.position.x - pose.lookAt.x) * scale),
+            y: pose.lookAt.y + ((pose.position.y - pose.lookAt.y) * scale),
+            z: pose.lookAt.z + ((pose.position.z - pose.lookAt.z) * scale),
+        },
     };
 }
 function isCoordinates(value) {
@@ -927,6 +972,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     let deferredDataDuringTransition = null;
     let initialFitPending = true;
     let pendingSceneTransition = null;
+    let selectionCameraDistanceCeiling = null;
     let transitionTick = null;
     let hoverNodeId = null;
     let ambientElapsedMs = 0;
@@ -994,8 +1040,17 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     const controls = graph.controls();
     const cameraInteractionControls = isCameraInteractionControls(controls) ? controls : null;
     const cursorZoomControls = isCursorZoomControls(controls) ? controls : null;
+    const dampedCameraControls = isDampedCameraControls(controls) ? controls : null;
+    const targetCameraControls = isTargetCameraControls(controls) ? controls : null;
     if (cursorZoomControls)
         cursorZoomControls.zoomToCursor = true;
+    if (dampedCameraControls) {
+        // The reference keeps a small amount of angular momentum after pointer-up
+        // instead of stopping the camera on one abrupt frame. Three.js only
+        // applies that continuation when OrbitControls damping is explicitly on.
+        dampedCameraControls.enableDamping = true;
+        dampedCameraControls.dampingFactor = ORBIT_DAMPING_FACTOR;
+    }
     let cameraControlInteractionActive = false;
     const nodeDescriptor = (node) => descriptorForNode(node, currentPresentation.nodeDescriptors?.[node.id]);
     const linkDescriptor = (link) => descriptorForLink(link, currentPresentation.linkDescriptors?.[link.id]);
@@ -1008,11 +1063,20 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     function densityVisibilityForNode(nodeId) {
         return densityVisibilityByNodeId.get(nodeId) ?? FULL_NODE_DENSITY_VISIBILITY;
     }
-    function refreshDensityVisibility() {
+    function refreshDensityVisibility(force = false) {
         const data = currentData;
-        densityVisibilityByNodeId = new Map();
         if (!data)
             return;
+        // Density sampling is a settled-state pass. OrbitControls and hover
+        // updates reuse the current membership; re-ranking on those high-frequency
+        // callbacks makes unrelated nodes pop in and out as projected cells cross
+        // the greedy sampler. Explicit data, selection, or viewport updates pass
+        // `force` so the map is rebuilt when the scene itself has changed.
+        const visibilityMapComplete = densityVisibilityByNodeId.size === data.nodes.length
+            && data.nodes.every((node) => densityVisibilityByNodeId.has(node.id));
+        if (!force && visibilityMapComplete)
+            return;
+        densityVisibilityByNodeId = new Map();
         const nodeCount = data.nodes.length;
         const labelsNeedCulling = nodeCount >= DENSITY_VISIBILITY.labelCullAtNodeCount;
         const bodiesNeedCulling = nodeCount >= DENSITY_VISIBILITY.bodyCullAtNodeCount;
@@ -2336,6 +2400,10 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         if (selectionChanged) {
             deferredDataDuringTransition = null;
             cancelCameraTransition();
+            const nextSelectionNodeId = data.selection.nodeId;
+            selectionCameraDistanceCeiling = nextSelectionNodeId
+                ? { distance: cameraPoseDistance(cameraPose()), nodeId: nextSelectionNodeId }
+                : null;
         }
         currentData = data;
         rendererViewport = { ...data.selection.viewport };
@@ -2360,7 +2428,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 renderedLinkObjects.delete(id);
         });
         rebuildAmbientState();
-        refreshDensityVisibility();
+        refreshDensityVisibility(true);
         if (!previousData || !selectionChanged || !starts) {
             pendingSceneTransition = null;
             applyFinalVisuals(data);
@@ -2506,11 +2574,19 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     cameraInteractionControls?.addEventListener("end", endCameraControlInteraction);
     function cameraPose() {
         const current = graph.cameraPosition();
+        // three-render-objects reports a synthetic point exactly 1000 units in
+        // front of the camera as `cameraPosition().lookAt`. That is not the live
+        // OrbitControls pivot whenever the fitted camera distance differs from
+        // 1000, and feeding it back into cameraPosition() makes the graph orbit a
+        // distant phantom centre. OrbitControls.target is the authoritative pivot.
+        const controlsTarget = targetCameraControls?.target;
         return {
             position: { x: current.x, y: current.y, z: current.z },
-            lookAt: current.lookAt
-                ? { x: current.lookAt.x, y: current.lookAt.y, z: current.lookAt.z }
-                : { x: 0, y: 0, z: 0 },
+            lookAt: controlsTarget
+                ? { x: controlsTarget.x, y: controlsTarget.y, z: controlsTarget.z }
+                : current.lookAt
+                    ? { x: current.lookAt.x, y: current.lookAt.y, z: current.lookAt.z }
+                    : { x: 0, y: 0, z: 0 },
         };
     }
     function setCameraPose(pose) {
@@ -2640,7 +2716,13 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             return null;
         const data = currentData;
         const focalPoint = nodePosition(focused);
+        const focusedDensityFraming = data.nodes.length >= DENSITY_VISIBILITY.labelCullAtNodeCount;
+        const focusNodeIds = focusedDensityFraming
+            ? new Set([nodeId, ...data.selection.neighborNodeIds])
+            : new Set(data.nodes.map((node) => node.id));
         const points = data.nodes.flatMap((node) => {
+            if (!focusNodeIds.has(node.id))
+                return [];
             const position = nodePosition(node);
             if (!position)
                 return [];
@@ -2653,14 +2735,29 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             return [{ ...position, radius: (bodyRadius * 1.16 * focusScale) + AMBIENT_MAX_OFFSET }];
         });
         const viewport = rendererViewport ?? data.selection.viewport;
-        // Selection keeps the global graph scale while pulling the selected node
-        // toward the remaining canvas center. Fitting only the one-hop
-        // constellation would make a dense scene feel like an isolated diagram.
-        // Keep the selected node close to the remaining canvas centre. The camera
-        // still fits the complete cloud below, so a balanced bounds pull preserves
-        // global context without leaving an off-centre selection at the edge.
-        const focalBias = 0.5;
-        return contextCameraPose(points, cameraPose(), boundedPerspectiveProjection(graph.camera(), viewport), viewport, focalPoint, focalBias);
+        const currentCamera = cameraPose();
+        const fittedCamera = contextCameraPose(points, currentCamera, boundedPerspectiveProjection(graph.camera(), viewport), viewport, focalPoint, focusedDensityFraming ? SELECTION_FOCAL_BOUNDS_BIAS : 0.5);
+        if (!fittedCamera)
+            return null;
+        // Smaller workbenches retain their established all-node framing contract,
+        // including durable master anchors and compact mobile resize behavior.
+        if (!focusedDensityFraming)
+            return fittedCamera;
+        // The reference keeps its full WebGL field behind the drawer, then brings
+        // the selected one-hop forward while the unrelated graph remains as faded
+        // context. Never move farther away than the camera visible at selection
+        // time (or the current Orbit pose), and cap the automatic zoom-in so a
+        // small-degree node does not become an isolated full-screen diagram.
+        const currentDistance = cameraPoseDistance(currentCamera);
+        const selectionCeiling = selectionCameraDistanceCeiling?.nodeId === nodeId
+            ? selectionCameraDistanceCeiling.distance
+            : currentDistance;
+        const maximumDistance = Math.min(currentDistance, selectionCeiling);
+        if (maximumDistance <= 0)
+            return fittedCamera;
+        const minimumDistance = Math.min(maximumDistance, selectionCeiling * SELECTION_MIN_CAMERA_DISTANCE_RATIO);
+        const targetDistance = Math.min(maximumDistance, Math.max(minimumDistance, cameraPoseDistance(fittedCamera)));
+        return cameraPoseAtDistance(fittedCamera, targetDistance);
     }
     function transitionToNode(nodeId, options) {
         const activeScene = activeTransition?.scene;
@@ -2872,7 +2969,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 // Density visibility is projected in screen space. Recompute it after
                 // the camera and viewport settle, otherwise the initial pass can keep
                 // only the old central cells visible after zoomToFit or drawer resize.
-                refreshDensityVisibility();
+                refreshDensityVisibility(true);
                 applyAmbientVisuals();
             }
         },
