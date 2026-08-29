@@ -95,11 +95,38 @@ class FakeOwnerDocument {
   }
 }
 
+type WebGLContextEventType = "webglcontextlost" | "webglcontextrestored";
+
+class FakeRenderElement {
+  readonly listeners = new Map<WebGLContextEventType, Set<EventListener>>();
+
+  constructor(readonly ownerDocument: FakeOwnerDocument) {}
+
+  addEventListener(type: WebGLContextEventType, listener: EventListener): void {
+    const listeners = this.listeners.get(type) ?? new Set<EventListener>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  dispatch(type: WebGLContextEventType, event = { preventDefault() {} } as Event): void {
+    this.listeners.get(type)?.forEach((listener) => listener(event));
+  }
+
+  listenerCount(type: WebGLContextEventType): number {
+    return this.listeners.get(type)?.size ?? 0;
+  }
+
+  removeEventListener(type: WebGLContextEventType, listener: EventListener): void {
+    this.listeners.get(type)?.delete(listener);
+  }
+}
+
 class FakeForceGraph {
   cameraSetters: Array<{ duration: number | undefined; lookAt: Coordinates | undefined; position: Coordinates }> = [];
   cameraControls = new FakeCameraControls();
   cameraProjection = { aspect: 4 / 3, fov: 50 };
   data: { links: Array<{ id: string }>; nodes: Array<Coordinates & { id: string }> } = { links: [], nodes: [] };
+  destructorCalls = 0;
   graphDataSetCalls = 0;
   linkObjectFactory: ((link: { id: string }) => Object3D) | undefined;
   linkObjects = new Map<string, Object3D>();
@@ -114,6 +141,7 @@ class FakeForceGraph {
   nodePositionUpdater: ((object: Object3D, coordinates: Coordinates, node: Coordinates & { id: string }) => boolean) | undefined;
   nodeObjects = new Map<string, Object3D>();
   ownerDocument = new FakeOwnerDocument();
+  renderElement = new FakeRenderElement(this.ownerDocument);
   private currentPose = {
     position: { x: 0, y: 0, z: 300 },
     lookAt: { x: 0, y: 0, z: 0 },
@@ -132,7 +160,7 @@ class FakeForceGraph {
     this.cameraControls.target = { ...next.lookAt };
   }
 
-  _destructor(): void {}
+  _destructor(): void { this.destructorCalls += 1; }
   backgroundColor(): this { return this; }
   camera(): typeof this.cameraProjection { return this.cameraProjection; }
   controls(): FakeCameraControls { return this.cameraControls; }
@@ -193,8 +221,8 @@ class FakeForceGraph {
     this.nodeHoverCallback = callback;
     return this;
   }
-  renderer(): { domElement: { ownerDocument: FakeOwnerDocument } } {
-    return { domElement: { ownerDocument: this.ownerDocument } };
+  renderer(): { domElement: FakeRenderElement } {
+    return { domElement: this.renderElement };
   }
   scene(): Group { return this.sceneRoot; }
   showNavInfo(): this { return this; }
@@ -424,6 +452,45 @@ describe("Three.js camera transitions", () => {
     expect(cancelledFrames).toEqual([1, 2, 3, 4]);
     expect(graph.zoomToFitDurations).toEqual([0, 0]);
     expect(graph.cameraSetters.every(({ duration }) => duration === 0)).toBe(true);
+  });
+
+  it("restores the first focus baseline after retargeting and honors public transition durations", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const baseline = {
+      lookAt: { x: -14, y: 8, z: 3 },
+      position: { x: 74, y: 51, z: 268 },
+    };
+    graph.pose = baseline;
+    renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] }));
+
+    renderer.transitionToNode!("component:api", { durationMs: 37, reducedMotion: false });
+    expect(renderer.getTransitionObservation!()).toMatchObject({ active: true, durationMs: 37 });
+    runLatestFrame(0);
+    runLatestFrame(37);
+
+    renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:web"] }));
+    renderer.transitionToNode!("component:web", { reducedMotion: true });
+    expect(graph.pose).not.toEqual(baseline);
+
+    renderer.restoreFocusCamera!({ reducedMotion: true });
+    expect(graph.pose).toEqual(baseline);
+  });
+
+  it("leaves the camera unchanged when no focus baseline exists", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, {}));
+    const before = structuredClone(graph.pose);
+
+    renderer.restoreFocusCamera!({ reducedMotion: true });
+
+    expect(graph.zoomToFitDurations).toEqual([]);
+    expect(graph.pose).toEqual(before);
   });
 
   it("uses cursor-centered OrbitControls while reserving node drags for camera navigation", () => {
@@ -1002,6 +1069,140 @@ describe("Three.js camera transitions", () => {
     });
   });
 
+  it("pauses RAF for host inactivity, suspension, and zero size without replacing camera state", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, {}));
+    renderer.resize(720, 540);
+    runLatestFrame(0);
+    const preservedPose = {
+      lookAt: { x: 5, y: -4, z: 2 },
+      position: { x: 81, y: 49, z: 259 },
+    };
+    graph.pose = preservedPose;
+
+    renderer.setActivityState!({ foreground: false });
+    expect(frames.size).toBe(0);
+    expect(renderer.getAmbientMotionObservation!()).toMatchObject({ active: false, paused: true });
+    renderer.resume!();
+    expect(frames.size).toBe(0);
+    expect(graph.pose).toEqual(preservedPose);
+
+    renderer.setActivityState!({});
+    expect(frames.size).toBe(1);
+    renderer.suspend!();
+    expect(frames.size).toBe(0);
+    renderer.resume!();
+    expect(frames.size).toBe(1);
+    expect(graph.pose).toEqual(preservedPose);
+
+    renderer.resize(0, 0);
+    expect(frames.size).toBe(0);
+    renderer.resume!();
+    expect(frames.size).toBe(0);
+    renderer.resize(720, 540);
+    expect(frames.size).toBe(1);
+
+    renderer.setActivityState!({ expanded: false, intersecting: false });
+    expect(frames.size).toBe(0);
+    renderer.setActivityState!({ reducedMotion: true });
+    expect(frames.size).toBe(0);
+    expect(renderer.getAmbientMotionObservation!()).toMatchObject({ active: false, paused: false, reducedMotion: true });
+    renderer.setActivityState!({});
+    expect(frames.size).toBe(1);
+    expect(graph.pose).toEqual(preservedPose);
+  });
+
+  it("round-trips matching camera capsules and rejects mismatched projection identity", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const baseline = {
+      lookAt: { x: -7, y: 4, z: 1 },
+      position: { x: 63, y: 42, z: 276 },
+    };
+    graph.pose = baseline;
+    renderer.setData(createRenderGraphData(graphFixture, {
+      recoveryKey: "fixture:projection-a",
+      selectedNodeIds: ["component:api"],
+    }));
+    renderer.transitionToNode!("component:api", { reducedMotion: true });
+    const focusedPose = structuredClone(graph.pose);
+    const capsule = renderer.captureRecoveryCapsule!()!;
+    expect(capsule).toMatchObject({
+      recoveryKey: "fixture:projection-a",
+      restoreBaseline: baseline,
+      schemaVersion: 1,
+    });
+
+    graph.pose = {
+      lookAt: { x: 90, y: 80, z: 70 },
+      position: { x: 60, y: 50, z: 40 },
+    };
+    expect(renderer.restoreRecoveryCapsule!({
+      ...capsule,
+      recoveryKey: "fixture:projection-b",
+    })).toBe(false);
+    expect(graph.pose).not.toEqual(focusedPose);
+
+    expect(renderer.restoreRecoveryCapsule!(capsule)).toBe(true);
+    expect(graph.pose).toEqual(focusedPose);
+    renderer.restoreFocusCamera!({ reducedMotion: true });
+    expect(graph.pose).toEqual(baseline);
+
+    renderer.setData(createRenderGraphData(graphFixture, { theme: "light" }));
+    const keylessPose = structuredClone(graph.pose);
+    const keyless = renderer.captureRecoveryCapsule!()!;
+    expect(keyless.recoveryKey).toBeNull();
+    graph.pose = {
+      lookAt: { x: -30, y: -20, z: -10 },
+      position: { x: 210, y: 190, z: 170 },
+    };
+    expect(renderer.restoreRecoveryCapsule!(structuredClone(keyless))).toBe(false);
+    expect(graph.pose).not.toEqual(keylessPose);
+    expect(renderer.restoreRecoveryCapsule!(keyless)).toBe(true);
+    expect(graph.pose).toEqual(keylessPose);
+
+    renderer.setPresentation({ theme: "dark" });
+    expect(renderer.restoreRecoveryCapsule!(keyless)).toBe(false);
+  });
+
+  it("routes WebGL context loss through a capsule and removes listeners on one disposal", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, { recoveryKey: "context:test" }));
+    runLatestFrame(0);
+    const beforeLoss = {
+      lookAt: { x: 3, y: 2, z: 1 },
+      position: { x: 87, y: 53, z: 251 },
+    };
+    graph.pose = beforeLoss;
+    const preventDefault = vi.fn();
+
+    graph.renderElement.dispatch("webglcontextlost", { preventDefault } as unknown as Event);
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+    expect(frames.size).toBe(0);
+    expect(renderer.getAmbientMotionObservation!()).toMatchObject({ active: false, paused: true });
+    graph.pose = {
+      lookAt: { x: 30, y: 20, z: 10 },
+      position: { x: 170, y: 160, z: 150 },
+    };
+    graph.renderElement.dispatch("webglcontextrestored");
+    expect(graph.pose).toEqual(beforeLoss);
+    expect(frames.size).toBe(1);
+
+    renderer.destroy();
+    renderer.destroy();
+    expect(graph.destructorCalls).toBe(1);
+    expect(graph.renderElement.listenerCount("webglcontextlost")).toBe(0);
+    expect(graph.renderElement.listenerCount("webglcontextrestored")).toBe(0);
+  });
+
   it("publishes the same selected anchors synchronously for reduced and normal selection transactions", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
@@ -1415,6 +1616,54 @@ describe("Three.js camera transitions", () => {
       expect(node.label.objectVisible).toBe(true);
       expect(node.label.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     });
+  });
+
+  it("resolves label policy by node id, node type, then default without hidden Sprite bounds", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, {
+      ambientMotion: false,
+      labelVisibility: {
+        byNodeId: { "component:api": "always" },
+        byType: { component: "interaction" },
+        default: "hidden",
+      },
+    }));
+
+    const observation = renderer.getRenderObservation!();
+    const always = observation.nodes.find((node) => node.id === "component:api")!.label;
+    const interaction = observation.nodes.find((node) => node.id === "component:web")!.label;
+    const hidden = observation.nodes.find((node) => node.id === "relation:release")!.label;
+    expect(always.objectVisible).toBe(true);
+    expect(always.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
+    [interaction, hidden].forEach((label) => {
+      expect(label).toMatchObject({ objectVisible: false, sceneAttached: true });
+      expect(label.visibleMaterialOpacities).toEqual([]);
+      expect(label.scale).toMatchObject({ x: 0, y: 0, z: 0 });
+    });
+    const hiddenSprite = graph.nodeObjects.get("relation:release")!
+      .children.find((child) => child.userData.graphVisualRole === "node-label") as Sprite;
+    expect(hiddenSprite.visible).toBe(false);
+    expect(hiddenSprite.material.opacity).toBe(0);
+    expect(hiddenSprite.scale.toArray()).toEqual([0, 0, 0]);
+
+    renderer.setData(createRenderGraphData(graphFixture, {
+      ambientMotion: false,
+      labelVisibility: {
+        byNodeId: { "component:api": "always" },
+        byType: { component: "interaction" },
+        default: "hidden",
+      },
+      reducedMotion: true,
+      selectedNodeIds: ["component:web"],
+    }));
+    renderer.transitionToNode!("component:web", { reducedMotion: true });
+    const selectedInteraction = renderer.getRenderObservation!()
+      .nodes.find((node) => node.id === "component:web")!.label;
+    expect(selectedInteraction.objectVisible).toBe(true);
+    expect(selectedInteraction.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
   });
 
   it("keeps ordinary labels continuously visible while perspective changes their readability", () => {

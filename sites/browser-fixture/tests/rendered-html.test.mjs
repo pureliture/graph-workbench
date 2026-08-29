@@ -35,6 +35,8 @@ test("server-renders the graph workbench browser-fixture shell", async () => {
   assert.match(html, /data-testid="graph-shell"/);
   assert.match(html, /data-testid="graph-detail-panel"/);
   assert.match(html, /data-testid="graph-render-observation"/);
+  assert.match(html, /data-testid="host-label-visibility-policy"/);
+  assert.match(html, /data-testid="host-label-visibility-observation"/);
   assert.match(html, /data-testid="graph-rendered-node-ids"/);
   assert.match(html, /data-testid="master-visibility"/);
   assert.match(html, /data-testid="selection-distance-visibility"/);
@@ -70,6 +72,7 @@ test("replaces the disposable starter surface with the graph fixture", async () 
   assert.match(layout, /Graph Workbench Browser Fixture/);
   assert.match(fixture, /createBrowserGraphWorkbench/);
   assert.match(fixture, /getRenderObservation/);
+  assert.match(fixture, /labelVisibility/);
   assert.match(fixture, /canvas\.dataset\.testid = "graph-canvas"/);
   assert.match(fixture, /data-testid="graph-detail-panel"/);
   assert.match(packageJson, /"@pureliture\/graph-workbench": "file:\.\.\/\.\."/);

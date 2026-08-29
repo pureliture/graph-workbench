@@ -8,7 +8,9 @@ import {
   type GraphRenderer,
   type GraphRendererFactory,
   type GraphRendererFactoryOptions,
+  type GraphActivityState,
   type GraphAmbientMotionObservation,
+  type GraphRecoveryCapsule,
   type GraphRenderObservation,
   type GraphScreenPosition,
   type GraphTransitionObservation,
@@ -43,6 +45,28 @@ export interface GraphSelectionEvent extends GraphEvent {
   readonly source: GraphSelectionSource;
 }
 
+/**
+ * The complete, immutable selection candidate offered to a host before the
+ * workbench changes its presentation, graph data, camera, or callbacks.
+ */
+export interface GraphSelectionIntent extends GraphEvent {
+  /** The original GraphInput node object, never a renderer-local copy. */
+  readonly node: GraphNode | null;
+  readonly neighborNodeIds: readonly string[];
+  readonly nodeId: string | null;
+  readonly source: GraphSelectionSource;
+}
+
+export type GraphSelectionCameraAcceptance =
+  | { readonly kind: "none" }
+  | { readonly durationMs?: number; readonly kind: "contextual" }
+  | { readonly durationMs?: number; readonly kind: "restore" };
+
+export interface GraphSelectionAcceptance {
+  readonly camera?: GraphSelectionCameraAcceptance;
+  readonly layout?: "constellation" | "preserve";
+}
+
 export interface GraphRendererState {
   readonly reason?: string;
   readonly status: "failed" | "mounted" | "unmounted";
@@ -56,10 +80,14 @@ export interface GraphWorkbenchOptions {
   readonly onNodeHover?: (event: GraphHoverEvent) => void;
   readonly onRendererStateChange?: (state: GraphRendererState) => void;
   readonly onSelectionChange?: (event: GraphSelectionEvent) => void;
+  /** Synchronously accepts, customizes, or rejects a candidate selection. */
+  readonly resolveSelection?: (intent: GraphSelectionIntent) => GraphSelectionAcceptance | false | void;
   readonly rendererFactory?: GraphRendererFactory;
 }
 
 export interface GraphWorkbench {
+  /** Captures optional renderer-local recovery state, or null for legacy renderers. */
+  captureRecoveryCapsule(): GraphRecoveryCapsule | null;
   destroy(): void;
   fit(durationMs?: number): void;
   focusNode(nodeId: string | null): void;
@@ -73,11 +101,19 @@ export interface GraphWorkbench {
   getSelectionState(): GraphSelectionState;
   mount(container: HTMLElement): void;
   resize(width?: number, height?: number): void;
+  /** Attempts to restore an optional renderer-local recovery capsule. */
+  restoreRecoveryCapsule(capsule: GraphRecoveryCapsule): boolean;
   restoreCamera(): void;
+  /** Resumes optional renderer-owned activity without remounting. */
+  resume(): void;
   selectNode(nodeId: string | null, source?: GraphSelectionSource): void;
   setInput(input: GraphInput): void;
+  /** Passes host visibility/activity hints to enhanced renderers. */
+  setActivityState(state: GraphActivityState): void;
   setPresentation(presentation: GraphPresentation): void;
   setReducedMotion(reducedMotion: boolean): void;
+  /** Suspends optional renderer-owned activity without disposing scene state. */
+  suspend(): void;
   unmount(): void;
   zoom(scale: number): void;
 }
@@ -102,8 +138,11 @@ function normalizedPresentation(input: GraphInput, supplied: GraphPresentation):
     focusNodeId,
     reducedMotion: supplied.reducedMotion === true,
     theme: supplied.theme === "light" ? "light" : "dark",
+    labelVisibility: supplied.labelVisibility,
     nodeDescriptors: supplied.nodeDescriptors ?? {},
     linkDescriptors: supplied.linkDescriptors ?? {},
+    recoveryKey: supplied.recoveryKey || undefined,
+    selectionLayout: supplied.selectionLayout === "preserve" ? "preserve" : "constellation",
   };
 }
 
@@ -162,15 +201,24 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
     renderer.setPresentation(presentation);
   };
 
-  const transitionToSelection = (nodeId: string | null) => {
+  const transitionToSelection = (nodeId: string | null, durationMs?: number) => {
     if (!renderer || !nodeId) return;
     if (renderer.transitionToNode) {
-      renderer.transitionToNode(nodeId, { reducedMotion: presentation.reducedMotion === true });
+      const transitionOptions = {
+        reducedMotion: presentation.reducedMotion === true,
+        ...(durationMs === undefined ? {} : { durationMs }),
+      };
+      renderer.transitionToNode(nodeId, transitionOptions);
       return;
     }
     renderer.cancelCameraTransition?.();
     renderer.focus(nodeId);
   };
+
+  const cameraTransitionOptions = (durationMs?: number) => ({
+    reducedMotion: presentation.reducedMotion === true,
+    ...(durationMs === undefined ? {} : { durationMs }),
+  });
 
   const emitSelection = (source: GraphSelectionSource) => {
     const nodeId = selectionState.nodeId;
@@ -186,28 +234,52 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
     });
   };
 
-  const selectNode = (nodeId: string | null, source: GraphSelectionSource) => {
+  const selectNode = (nodeId: string | null, source: GraphSelectionSource): boolean => {
     const nextNodeId = nodeId && knownNodeIds(input).has(nodeId) ? nodeId : null;
-    if (!nextNodeId) renderer?.cancelCameraTransition?.();
-    presentation = normalizedPresentation(input, {
+    const candidatePresentation = normalizedPresentation(input, {
       ...presentation,
       focusNodeId: nextNodeId,
       selectedNodeIds: nextNodeId ? [nextNodeId] : [],
     });
+    const candidateSelection = createRenderGraphData(input, candidatePresentation, { viewport }).selection;
+    const acceptance = options.resolveSelection?.({
+      input,
+      node: nextNodeId ? input.nodes.find((candidate) => candidate.id === nextNodeId) ?? null : null,
+      neighborNodeIds: candidateSelection.neighborNodeIds,
+      nodeId: nextNodeId,
+      source,
+    });
+    if (acceptance === false) return false;
+    const camera = acceptance?.camera;
+    presentation = normalizedPresentation(input, {
+      ...candidatePresentation,
+      selectionLayout: acceptance?.layout ?? "constellation",
+    });
+    // Clearing a selection has historically settled any active camera before
+    // renderer data changes. Keep that order unless the host explicitly asks
+    // to leave the camera alone or restore it after the accepted data update.
+    const cancelBeforeSync = !nextNodeId && camera?.kind !== "none" && camera?.kind !== "restore";
+    if (cancelBeforeSync) renderer?.cancelCameraTransition?.();
     sync();
-    if (nextNodeId) transitionToSelection(nextNodeId);
+    if (camera?.kind === "restore") {
+      if (renderer?.restoreFocusCamera) renderer.restoreFocusCamera(cameraTransitionOptions(camera.durationMs));
+      else renderer?.restoreCamera();
+    } else if (camera?.kind === "contextual") {
+      transitionToSelection(nextNodeId, camera.durationMs);
+    } else if (camera?.kind !== "none") {
+      if (nextNodeId) transitionToSelection(nextNodeId);
+    }
     emitSelection(source);
+    return true;
   };
 
   const callbacks: GraphRendererFactoryOptions["callbacks"] = {
     onBackgroundClick() {
-      selectNode(null, "background");
-      options.onBackgroundClick?.();
+      if (selectNode(null, "background")) options.onBackgroundClick?.();
     },
     onNodeClick(nodeId) {
       if (!knownNodeIds(input).has(nodeId)) return;
-      selectNode(nodeId, "mouse");
-      options.onNodeClick?.({ input, nodeId });
+      if (selectNode(nodeId, "mouse")) options.onNodeClick?.({ input, nodeId });
     },
     onNodeHover(nodeId) {
       options.onNodeHover?.({ input, nodeId });
@@ -239,6 +311,9 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
   };
 
   return {
+    captureRecoveryCapsule() {
+      return renderer?.captureRecoveryCapsule?.() ?? null;
+    },
     destroy() {
       if (destroyed) return;
       this.unmount();
@@ -308,8 +383,14 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
       // the same reduced-motion and cancellation policy as an initial select.
       transitionToSelection(selectionState.nodeId);
     },
+    restoreRecoveryCapsule(capsule) {
+      return renderer?.restoreRecoveryCapsule?.(capsule) ?? false;
+    },
     restoreCamera() {
       renderer?.restoreCamera();
+    },
+    resume() {
+      renderer?.resume?.();
     },
     selectNode(nodeId, source = "programmatic") {
       selectNode(nodeId, source);
@@ -338,6 +419,9 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
         emitSelection("programmatic");
       }
     },
+    setActivityState(state) {
+      renderer?.setActivityState?.(state);
+    },
     setPresentation(nextPresentation) {
       const previousNodeId = selectionState.nodeId;
       const normalized = normalizedPresentation(input, nextPresentation);
@@ -354,6 +438,9 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
       presentation = normalizedPresentation(input, { ...presentation, reducedMotion });
       sync();
       transitionToSelection(selectionState.nodeId);
+    },
+    suspend() {
+      renderer?.suspend?.();
     },
     unmount() {
       if (!container && !renderer) return;

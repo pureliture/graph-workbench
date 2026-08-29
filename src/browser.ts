@@ -25,6 +25,7 @@ export {
   createThreeForceGraphRenderer,
 } from "./renderer.js";
 export type {
+  GraphActivityState,
   GraphLinkObjectFactory,
   GraphNodeObjectFactory,
   GraphDefaultNodeSilhouette,
@@ -42,8 +43,15 @@ export type {
   GraphRenderObjectObservation,
   GraphRenderObservation,
   GraphRenderTransformObservation,
+  GraphRecoveryCapsule,
   GraphScreenPosition,
   GraphTransitionCameraPoseObservation,
   GraphTransitionNodePosition,
   GraphTransitionObservation,
 } from "./renderer-contract.js";
+export type { GraphLabelVisibility, GraphLabelVisibilityPolicy } from "./presentation.js";
+export type {
+  GraphSelectionAcceptance,
+  GraphSelectionCameraAcceptance,
+  GraphSelectionIntent,
+} from "./workbench.js";

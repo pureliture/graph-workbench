@@ -8,14 +8,30 @@ export interface GraphLinkDescriptor {
     readonly opacity?: number;
     readonly width?: number;
 }
+export type GraphLabelVisibility = "auto" | "always" | "interaction" | "hidden";
+/**
+ * Host-provided label policy. Renderer adapters may use the most specific
+ * matching entry for a node without changing graph topology or selection.
+ */
+export interface GraphLabelVisibilityPolicy {
+    readonly byNodeId?: Readonly<Record<string, GraphLabelVisibility>>;
+    readonly byType?: Readonly<Record<string, GraphLabelVisibility>>;
+    readonly default?: GraphLabelVisibility;
+}
 export interface GraphPresentation {
     /**
      * Enables renderer-owned micro motion for default Three.js objects. Omitted
      * values normalize to true; custom renderers may ignore this optional hint.
      */
     readonly ambientMotion?: boolean;
+    /** Optional host policy for renderer-owned node-label visibility. */
+    readonly labelVisibility?: GraphLabelVisibilityPolicy;
     readonly selectedNodeIds?: readonly string[];
+    /** Controls whether a selection may re-stage the deterministic graph layout. */
+    readonly selectionLayout?: "constellation" | "preserve";
     readonly focusNodeId?: string | null;
+    /** Immutable host projection/snapshot identity used by optional recovery seams. */
+    readonly recoveryKey?: string;
     /** Keeps selection targets unchanged while requesting an immediate camera move. */
     readonly reducedMotion?: boolean;
     readonly theme?: "dark" | "light";
