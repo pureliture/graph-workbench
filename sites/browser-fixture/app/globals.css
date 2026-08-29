@@ -411,7 +411,9 @@ kbd {
 }
 
 .fixture-page[data-detail-open="true"] .graph-stage {
-  padding-inline-end: 0;
+  /* The drawer owns a real slice of the viewport. Keep the canvas measured to
+     the remaining graph area so selection framing does not land underneath it. */
+  padding-inline-end: min(28rem, 34vw);
 }
 
 .graph-panel,
@@ -544,6 +546,28 @@ kbd {
   visibility: visible;
 }
 
+.density-detail-panel {
+  top: 0;
+  width: min(28rem, 34vw);
+  transition-duration: 420ms;
+  transition-timing-function: ease-in-out;
+}
+
+.density-fixture[data-detail-open="true"] .graph-stage {
+  /* AI Coding Dictionary keeps a full-width WebGL field behind its drawer.
+     Translating that field by half the drawer width puts the camera centre in
+     the centre of the exposed canvas without shrinking or refitting it. */
+  padding-inline-end: 0;
+}
+
+.density-fixture .graph-panel {
+  transition: transform 420ms ease-in-out;
+}
+
+.density-fixture[data-detail-open="true"] .graph-panel {
+  transform: translateX(max(-14rem, -17vw));
+}
+
 .detail-heading {
   display: flex;
   min-width: 0;
@@ -643,6 +667,40 @@ dd {
   font-weight: 520;
   letter-spacing: 0;
   line-height: var(--leading-body);
+}
+
+.detail-definition {
+  display: grid;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--divider-soft);
+}
+
+.detail-definition .panel-kicker {
+  margin-bottom: 0;
+}
+
+.detail-definition > p:not(.panel-kicker) {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-body);
+  line-height: var(--leading-body);
+}
+
+.detail-definition .detail-usage {
+  display: grid;
+  gap: 0.22rem;
+  color: var(--muted);
+  font-size: var(--text-meta);
+}
+
+.detail-usage strong {
+  color: var(--quiet);
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .detail-relationships {
@@ -1104,6 +1162,10 @@ dd {
 
   .fixture-page[data-detail-open="true"] .graph-stage {
     padding: 0;
+  }
+
+  .density-fixture[data-detail-open="true"] .graph-panel {
+    transform: none;
   }
 
   .detail-panel {

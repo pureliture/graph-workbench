@@ -76,11 +76,11 @@ export function createGraphWorkbench(options) {
     const transitionToSelection = (nodeId) => {
         if (!renderer || !nodeId)
             return;
-        renderer.cancelCameraTransition?.();
         if (renderer.transitionToNode) {
             renderer.transitionToNode(nodeId, { reducedMotion: presentation.reducedMotion === true });
             return;
         }
+        renderer.cancelCameraTransition?.();
         renderer.focus(nodeId);
     };
     const emitSelection = (source) => {

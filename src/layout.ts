@@ -271,10 +271,11 @@ function visualCue(node: GraphNode, selectedNodeId: string | null, neighborNodeI
 }
 
 function linkVisualCue(link: GraphLink, selectedNodeId: string | null): GraphLinkVisualCue {
-  // Without a selection, edges establish the full relationship field. Once a
-  // node is selected, only its incident edges remain so the local structure is
-  // immediately legible.
-  if (!selectedNodeId) return { opacity: 0.14, visible: true, width: 0.8 };
+  // The idle graph keeps its topology in the data model, but hides the full
+  // relationship field so a dense graph reads as a quiet set of nodes. The
+  // renderer may temporarily reveal incident edges for hover/focus; a real
+  // selection still owns the durable visible-link cue below.
+  if (!selectedNodeId) return { opacity: 0, visible: false, width: 0.8 };
   const selectedLink = link.source === selectedNodeId || link.target === selectedNodeId;
   return selectedLink
     ? { opacity: 0.62, visible: true, width: 1.25 }
@@ -295,47 +296,11 @@ function selectedLayoutPositions(
   const selected = nodesById.get(selectedNodeId);
   if (!selected) return positions;
   const selectedBase = basePositions.get(selected.id)!;
-  const selectedTarget = { x: 0, y: 6, z: 24 };
-  // A drag/pin is an explicit user placement. Use it as the constellation
-  // anchor rather than merely leaving the selected node behind while moving
-  // every relationship around the default selection origin.
-  const anchor = selected.layoutHint?.pinned ? selectedBase : selectedTarget;
-  if (!selected.layoutHint?.pinned) positions.set(selected.id, anchor);
-
-  // Selection re-centres the remaining deterministic cloud around the selected
-  // node's original position. It stays behind the foreground constellation so
-  // unrelated nodes remain useful depth context without competing with the
-  // active relationship.
-  const rotation = (unit(`${input.layout.seed}:${selected.id}:selection-rotation`) - 0.5) * 0.48;
+  // Keep the canonical scene position as the selection anchor. Selection is a
+  // visual reading mode, not a second layout: unrelated nodes must retain their
+  // global context while the direct relationship lane is brought forward.
+  const anchor = selectedBase;
   const shortestViewportAxis = Math.min(viewport.width, viewport.height);
-  const contextScale = Math.max(0.76, Math.min(0.88, 0.76 + (shortestViewportAxis / 5000)));
-  const contextDepth = Math.max(38, Math.min(64, shortestViewportAxis * 0.09));
-  const neighborNodeIdSet = new Set(neighborNodeIds);
-  input.nodes.forEach((node, index) => {
-    if (node.id === selectedNodeId || neighborNodeIdSet.has(node.id) || node.layoutHint?.pinned) return;
-    const base = basePositions.get(node.id)!;
-    const delta = {
-      x: base.x - selectedBase.x,
-      y: base.y - selectedBase.y,
-      z: base.z - selectedBase.z,
-    };
-    const rotated = {
-      x: ((delta.x * Math.cos(rotation)) - (delta.y * Math.sin(rotation))) * contextScale,
-      y: ((delta.x * Math.sin(rotation)) + (delta.y * Math.cos(rotation))) * contextScale,
-      z: delta.z * (contextScale * 0.52),
-    };
-    const jitter = {
-      x: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-x`) - 0.5) * 13,
-      y: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-y`) - 0.5) * 12,
-      z: (unit(`${input.layout.seed}:${selected.id}:${node.id}:selection-z`) - 0.5) * 8,
-    };
-    positions.set(node.id, {
-      x: anchor.x + rotated.x + jitter.x,
-      y: anchor.y + rotated.y + jitter.y
-        + (((index / Math.max(1, input.nodes.length - 1)) - 0.5) * 8),
-      z: anchor.z + rotated.z + jitter.z - contextDepth,
-    });
-  });
 
   const relationships = neighborRelationships(input, selectedNodeId, neighborNodeIds);
   const relationshipsByDirection = new Map<RelationshipDirection, NeighborRelationship[]>();

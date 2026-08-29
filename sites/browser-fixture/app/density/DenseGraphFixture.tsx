@@ -2,9 +2,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  type GraphNode,
   type GraphInput,
   type GraphRenderObservation,
   type GraphSelectionEvent,
+  type GraphSelectionSource,
   type GraphWorkbench,
 } from "@pureliture/graph-workbench";
 
@@ -12,14 +14,14 @@ const densityNodeCount = 150;
 const densityFocusNodeId = "relation:query";
 
 const densityClusterSpecs = [
-  { id: "source", size: 18, center: { x: -185, y: 90 } },
-  { id: "index", size: 19, center: { x: -65, y: 75 } },
-  { id: "evidence", size: 17, center: { x: 60, y: 120 } },
-  { id: "delivery", size: 20, center: { x: 185, y: 24 } },
-  { id: "runtime", size: 16, center: { x: -155, y: -70 } },
-  { id: "memory", size: 19, center: { x: -42, y: -125 } },
-  { id: "vector", size: 18, center: { x: 55, y: -40 } },
-  { id: "evaluation", size: 19, center: { x: 145, y: -100 } },
+  { id: "source", size: 17, center: { x: -185, y: 90, z: -68 } },
+  { id: "index", size: 18, center: { x: -65, y: 75, z: 26 } },
+  { id: "evidence", size: 16, center: { x: 60, y: 120, z: 74 } },
+  { id: "delivery", size: 20, center: { x: 185, y: 24, z: -24 } },
+  { id: "runtime", size: 16, center: { x: -155, y: -70, z: 52 } },
+  { id: "memory", size: 19, center: { x: -42, y: -125, z: -92 } },
+  { id: "vector", size: 18, center: { x: 55, y: -40, z: 38 } },
+  { id: "evaluation", size: 19, center: { x: 145, y: -100, z: -48 } },
 ] as const;
 
 type DensityLayoutNode = {
@@ -43,7 +45,7 @@ function densityNodeId(ordinal: number): string {
 function densityClusterPosition(
   ordinal: number,
   clusterIndex: number,
-  center: { readonly x: number; readonly y: number },
+  center: { readonly x: number; readonly y: number; readonly z: number },
 ): { readonly x: number; readonly y: number; readonly z: number } {
   const angle = densityUnit(ordinal, clusterIndex + 1) * Math.PI * 2;
   const radialSpread = 14 + (densityUnit(ordinal, clusterIndex + 11) * 42);
@@ -52,7 +54,12 @@ function densityClusterPosition(
   return {
     x: center.x + xOffset + (yOffset * 0.18),
     y: center.y + yOffset - (xOffset * 0.11),
-    z: (densityUnit(ordinal, 61) - 0.5) * 10,
+    // Keep the dense fixture volumetric: the reference uses depth to create
+    // scale/occlusion variation rather than laying every context node on one
+    // shallow xy sheet.
+    z: center.z + ((densityUnit(ordinal, 61) - 0.5) * 74)
+      + (xOffset * 0.08)
+      - (yOffset * 0.06),
   };
 }
 
@@ -90,24 +97,48 @@ const densityDirectNeighborNodes = [
     type: "concept" as const,
     kind: "index",
     label: "Index",
-    metadata: { densityRole: "direct-neighbor" },
-    layoutHint: { x: -38, y: 26, z: 12 },
+    metadata: { densityRole: "direct-neighbor", semanticRole: "retrieval index" },
+    layoutHint: { x: -38, y: 26, z: 36 },
   },
   {
     id: "concept:evidence",
     type: "concept" as const,
     kind: "evidence",
     label: "Evidence",
-    metadata: { densityRole: "direct-neighbor" },
-    layoutHint: { x: 39, y: 23, z: 8 },
+    metadata: { densityRole: "direct-neighbor", semanticRole: "grounding evidence" },
+    layoutHint: { x: 39, y: 23, z: 22 },
   },
   {
     id: "concept:vector",
     type: "concept" as const,
     kind: "vector",
     label: "Vector",
-    metadata: { densityRole: "direct-neighbor" },
-    layoutHint: { x: 4, y: -42, z: 15 },
+    metadata: { densityRole: "direct-neighbor", semanticRole: "embedding representation" },
+    layoutHint: { x: 4, y: -42, z: 52 },
+  },
+  {
+    id: "concept:model",
+    type: "concept" as const,
+    kind: "model",
+    label: "Model",
+    metadata: { densityRole: "direct-neighbor", semanticRole: "requested model" },
+    layoutHint: { x: -4, y: 72, z: 58 },
+  },
+  {
+    id: "concept:provider",
+    type: "concept" as const,
+    kind: "provider",
+    label: "Provider",
+    metadata: { densityRole: "direct-neighbor", semanticRole: "model provider" },
+    layoutHint: { x: 66, y: 50, z: 45 },
+  },
+  {
+    id: "concept:context",
+    type: "concept" as const,
+    kind: "context",
+    label: "Context",
+    metadata: { densityRole: "direct-neighbor", semanticRole: "request context" },
+    layoutHint: { x: -66, y: -24, z: 18 },
   },
 ] as const;
 
@@ -134,7 +165,7 @@ function createDensityBackgroundTopology() {
     });
     return { id: cluster.id, nodeOrdinals, nodes, treeLinks };
   });
-  if (nextOrdinal - 1 !== densityNodeCount - 4) {
+  if (nextOrdinal - 1 !== densityNodeCount - densityDirectNeighborNodes.length - 1) {
     throw new Error("Density cluster sizes must account for every background node.");
   }
   const bridgePairs = [
@@ -191,7 +222,7 @@ const densityNodes = [
     kind: "retrieval",
     label: "Query",
     metadata: { densityRole: "focus" },
-    layoutHint: { x: 0, y: 0, z: 28 },
+    layoutHint: { x: 0, y: 0, z: 72 },
   },
   ...densityDirectNeighborNodes,
   ...densityBackgroundTopology.nodes,
@@ -223,20 +254,211 @@ const densityInput = {
       relationKind: "searches",
       ordinal: 2,
     },
+    {
+      id: "query-model",
+      source: densityFocusNodeId,
+      target: "concept:model",
+      relationKind: "requests",
+      ordinal: 3,
+    },
+    {
+      id: "query-provider",
+      source: densityFocusNodeId,
+      target: "concept:provider",
+      relationKind: "resolves-via",
+      ordinal: 4,
+    },
+    {
+      id: "query-context",
+      source: densityFocusNodeId,
+      target: "concept:context",
+      relationKind: "scoped-by",
+      ordinal: 5,
+    },
     ...densityBackgroundTopology.links.map((link, index) => ({
       ...link,
-      ordinal: index + 3,
+      ordinal: index + 6,
     })),
   ],
 } as const satisfies GraphInput;
 
+const densityNodesById = new Map<string, GraphNode>(densityInput.nodes.map((node) => [node.id, node]));
+
+// Keep the reference-facing term stable while the renderer uses a typed node
+// id internally. This also makes browser history resolve aliases by the same
+// rule as the initial deep-link.
+const densityTermAliases = new Map<string, string>([
+  ["model-provider-request", densityFocusNodeId],
+]);
+
+function densityNodeForTerm(rawTerm: string | null): GraphNode | null {
+  if (!rawTerm) return null;
+  const normalizedTerm = rawTerm.trim().toLocaleLowerCase();
+  const slug = normalizedTerm.replace(/\s+/g, "-");
+  const aliasNodeId = densityTermAliases.get(slug);
+  if (aliasNodeId) return densityNodesById.get(aliasNodeId) ?? null;
+  return densityInput.nodes.find((candidate) => (
+    candidate.id === rawTerm
+    || candidate.id === normalizedTerm
+    || candidate.label.toLocaleLowerCase() === normalizedTerm
+    || candidate.label.toLocaleLowerCase().replace(/\s+/g, "-") === slug
+  )) ?? null;
+}
+
+type DensityNodeDetails = {
+  readonly category: string;
+  readonly definition: string;
+  readonly source: string;
+  readonly summary: string;
+  readonly usage: string;
+};
+
+const densityNodeDetails = new Map<string, DensityNodeDetails>([
+  [densityFocusNodeId, {
+    category: "Retrieval relation",
+    definition: "A query binds the requested model, provider, context and evidence into one retrievable graph request.",
+    source: "Density reference fixture",
+    summary: "The query anchor for a model-provider request path.",
+    usage: "Select a related concept to follow the request path without losing the surrounding graph.",
+  }],
+  ["concept:index", {
+    category: "Retrieval concept",
+    definition: "An index narrows the candidate concepts that can satisfy the request.",
+    source: "Density reference fixture",
+    summary: "The retrieval index that serves the query.",
+    usage: "Follow the index when you want to inspect how the request finds candidates.",
+  }],
+  ["concept:evidence", {
+    category: "Grounding concept",
+    definition: "Evidence is the material returned with a match so the request can be checked and grounded.",
+    source: "Density reference fixture",
+    summary: "The grounding evidence returned for the query.",
+    usage: "Follow evidence to inspect why a result is considered trustworthy.",
+  }],
+  ["concept:vector", {
+    category: "Representation concept",
+    definition: "A vector is the embedding representation used to compare the request with candidate concepts.",
+    source: "Density reference fixture",
+    summary: "The embedding representation used during search.",
+    usage: "Follow the vector when you want to inspect the semantic matching layer.",
+  }],
+  ["concept:model", {
+    category: "Request concept",
+    definition: "The model identifies which inference capability the request is asking the provider to run.",
+    source: "Density reference fixture",
+    summary: "The model requested by the query.",
+    usage: "Follow the model to compare provider capability and request intent.",
+  }],
+  ["concept:provider", {
+    category: "Provider concept",
+    definition: "A provider resolves the model request to an available inference endpoint.",
+    source: "Density reference fixture",
+    summary: "The provider that resolves the requested model.",
+    usage: "Follow the provider to inspect the endpoint chosen for the request.",
+  }],
+  ["concept:context", {
+    category: "Request concept",
+    definition: "Context carries the surrounding constraints that make a query meaningful to the graph.",
+    source: "Density reference fixture",
+    summary: "The request context that scopes the query.",
+    usage: "Follow context to inspect the inputs carried into retrieval.",
+  }],
+]);
+
+type DensityRelationship = {
+  readonly direction: "incoming" | "outgoing";
+  readonly linkId: string;
+  readonly nodeId: string;
+  readonly nodeLabel: string;
+  readonly ordinal: number;
+  readonly relationKind: string;
+};
+
+function densityDetailSummary(node: GraphNode): string {
+  const details = densityNodeDetails.get(node.id);
+  if (details) return details.summary;
+  const role = node.metadata?.densityRole;
+  if (role === "focus") return "The query anchor for the dense graph fixture.";
+  if (role === "direct-neighbor") return `${node.label} is directly connected to the query anchor.`;
+  const cluster = node.metadata?.clusterId;
+  return typeof cluster === "string"
+    ? `${node.label} is a background node in the ${cluster} density cluster.`
+    : `${node.label} is a background node in the dense graph fixture.`;
+}
+
+function densityDetailsForNode(node: GraphNode): DensityNodeDetails {
+  const known = densityNodeDetails.get(node.id);
+  if (known) return known;
+  const cluster = typeof node.metadata?.clusterId === "string" ? node.metadata.clusterId : "background";
+  return {
+    category: `${cluster} context`,
+    definition: `${node.label} is a contextual concept in the ${cluster} branch of the request graph.`,
+    source: "Density reference fixture",
+    summary: `${node.label} is a contextual concept in the dense graph.`,
+    usage: "Select a connected concept to continue reading the graph context.",
+  };
+}
+
+function densityRelationships(nodeId: string): readonly DensityRelationship[] {
+  return densityInput.links
+    .map((link, inputIndex) => {
+      if (link.source !== nodeId && link.target !== nodeId) return null;
+      const outgoing = link.source === nodeId;
+      const relatedNodeId = outgoing ? link.target : link.source;
+      return {
+        direction: outgoing ? "outgoing" as const : "incoming" as const,
+        linkId: link.id,
+        nodeId: relatedNodeId,
+        nodeLabel: densityNodesById.get(relatedNodeId)?.label ?? relatedNodeId,
+        ordinal: link.ordinal ?? inputIndex,
+        relationKind: link.relationKind,
+      };
+    })
+    .filter((relationship): relationship is DensityRelationship => relationship !== null)
+    .sort((left, right) => (
+      left.ordinal - right.ordinal
+      || left.nodeLabel.localeCompare(right.nodeLabel)
+      || left.linkId.localeCompare(right.linkId)
+    ));
+}
+
+function densityNavigationTarget(nodeId: string, direction: -1 | 1): GraphNode | null {
+  const currentIndex = densityInput.nodes.findIndex((node) => node.id === nodeId);
+  if (currentIndex < 0 || densityInput.nodes.length === 0) return null;
+  const nextIndex = (currentIndex + direction + densityInput.nodes.length) % densityInput.nodes.length;
+  return densityInput.nodes[nextIndex] ?? null;
+}
+
+function densityTermPath(nodeId: string | null): string {
+  const location = new URL(window.location.href);
+  if (nodeId) location.searchParams.set("term", nodeId);
+  else location.searchParams.delete("term");
+  return `${location.pathname}${location.search}${location.hash}`;
+}
+
 type RendererStatus = "failed" | "mounted" | "pending";
 type WebglStatus = "failed" | "mounted" | "pending";
+type DensityScreenProjection = {
+  readonly bounds: {
+    readonly height: number;
+    readonly maxX: number;
+    readonly maxY: number;
+    readonly minX: number;
+    readonly minY: number;
+    readonly width: number;
+  } | null;
+  readonly camera: ReturnType<GraphWorkbench["getTransitionObservation"]> extends infer T
+    ? T extends { camera: infer C } ? C : null
+    : null;
+  readonly positions: readonly { readonly id: string; readonly x: number; readonly y: number }[];
+};
 type RenderTelemetry =
   | {
       readonly availability: "observed";
+      readonly ambientMotion: ReturnType<GraphWorkbench["getAmbientMotionObservation"]>;
       readonly observation: GraphRenderObservation;
       readonly observationScope: "renderer-live-data-and-scene-object-material";
+      readonly screenProjection: DensityScreenProjection;
       readonly selectionNodeId: string | null;
     }
   | {
@@ -253,10 +475,38 @@ function Telemetry({ testId, value }: { readonly testId: string; readonly value:
   );
 }
 
+function densityScreenProjection(workbench: GraphWorkbench): DensityScreenProjection {
+  const positions = densityInput.nodes.flatMap((node) => {
+    const position = workbench.getNodeScreenPosition(node.id);
+    return position && Number.isFinite(position.x) && Number.isFinite(position.y)
+      ? [{ id: node.id, x: position.x, y: position.y }]
+      : [];
+  });
+  if (positions.length === 0) {
+    return {
+      bounds: null,
+      camera: workbench.getTransitionObservation()?.camera ?? null,
+      positions,
+    };
+  }
+  const minX = Math.min(...positions.map(({ x }) => x));
+  const maxX = Math.max(...positions.map(({ x }) => x));
+  const minY = Math.min(...positions.map(({ y }) => y));
+  const maxY = Math.max(...positions.map(({ y }) => y));
+  return {
+    bounds: { height: maxY - minY, maxX, maxY, minX, minY, width: maxX - minX },
+    camera: workbench.getTransitionObservation()?.camera ?? null,
+    positions,
+  };
+}
+
 export function DenseGraphFixture() {
+  const detailPanelRef = useRef<HTMLElement | null>(null);
   const graphHostRef = useRef<HTMLDivElement | null>(null);
   const workbenchRef = useRef<GraphWorkbench | null>(null);
+  const initialTermAppliedRef = useRef(false);
   const selectionNodeIdRef = useRef<string | null>(null);
+  const settledGraphFitRef = useRef(false);
   const [rendererStatus, setRendererStatus] = useState<RendererStatus>("pending");
   const [webglStatus, setWebglStatus] = useState<WebglStatus>("pending");
   const [rendererReason, setRendererReason] = useState<string | null>(null);
@@ -272,9 +522,14 @@ export function DenseGraphFixture() {
   const [renderRevision, setRenderRevision] = useState(0);
   const rendererReady = rendererStatus === "mounted" && webglStatus === "mounted";
 
+  const selectNode = useCallback((nodeId: string | null, source: GraphSelectionSource) => {
+    if (!rendererReady) return;
+    workbenchRef.current?.selectNode(nodeId, source);
+  }, [rendererReady]);
+
   const selectFocus = useCallback(() => {
-    workbenchRef.current?.selectNode(densityFocusNodeId, "density-control");
-  }, []);
+    selectNode(densityFocusNodeId, "density-control");
+  }, [selectNode]);
 
   useEffect(() => {
     const host = graphHostRef.current;
@@ -318,6 +573,13 @@ export function DenseGraphFixture() {
               nodeId: event.nodeId,
               source: event.source,
             });
+            if (event.source !== "deep-link" && event.source !== "history") {
+              const nextPath = densityTermPath(event.nodeId);
+              const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+              if (nextPath !== currentPath) {
+                window.history.pushState({ graphWorkbenchTerm: event.nodeId }, "", nextPath);
+              }
+            }
             setRenderTelemetry({
               availability: "pending",
               reason: "Waiting for the current density selection observation.",
@@ -327,7 +589,7 @@ export function DenseGraphFixture() {
         });
         workbenchRef.current = workbench;
         workbench.mount(host);
-        workbench.setPresentation({ ambientMotion: false, theme: "dark" });
+        workbench.setPresentation({ ambientMotion: true, theme: "dark" });
         workbench.resize(host.clientWidth, host.clientHeight);
         resizeObserver = new ResizeObserver(([entry]) => {
           workbench.resize(entry.contentRect.width, entry.contentRect.height);
@@ -365,9 +627,15 @@ export function DenseGraphFixture() {
           graphCanvas.addEventListener("webglcontextlost", contextLostListener, { once: true });
           finishCanvasProbe();
           setWebglStatus("mounted");
-          workbench.fit(0);
           fitFrame = window.requestAnimationFrame(() => {
-            if (!disposed) workbench.fit(0);
+            fitFrame = window.requestAnimationFrame(() => {
+              // A deep-link can select a node before the deferred startup fit
+              // runs. Do not let that initial full-graph fit overwrite the
+              // selection camera target.
+              if (!disposed && selectionNodeIdRef.current === null) {
+                workbench.fit(0);
+              }
+            });
           });
           return true;
         };
@@ -402,11 +670,38 @@ export function DenseGraphFixture() {
   }, []);
 
   useEffect(() => {
+    if (!rendererReady || initialTermAppliedRef.current) return;
+    initialTermAppliedRef.current = true;
+    const rawTerm = new URL(window.location.href).searchParams.get("term");
+    if (rawTerm === null) return;
+    const node = densityNodeForTerm(rawTerm);
+    if (node) {
+      selectNode(node.id, "deep-link");
+      return;
+    }
+    window.history.replaceState(window.history.state, "", densityTermPath(null));
+  }, [rendererReady, selectNode]);
+
+  useEffect(() => {
+    const restoreSelectionFromHistory = () => {
+      const rawTerm = new URL(window.location.href).searchParams.get("term");
+      const node = densityNodeForTerm(rawTerm);
+      selectNode(node?.id ?? null, "history");
+    };
+    window.addEventListener("popstate", restoreSelectionFromHistory);
+    return () => window.removeEventListener("popstate", restoreSelectionFromHistory);
+  }, [selectNode]);
+
+  useEffect(() => {
     if (!rendererReady) return undefined;
     let disposed = false;
     let frame: number | null = null;
     let observationDeadline: number | null = null;
     let observationFinished = false;
+    // One settled fit is needed only for the unselected startup scene. A
+    // selected scene already owns its camera target and must not be reframed
+    // back to the full graph after its transition settles.
+    let settledFitRequested = settledGraphFitRef.current || selectionNodeIdRef.current !== null;
 
     const finishObservation = () => {
       observationFinished = true;
@@ -433,11 +728,24 @@ export function DenseGraphFixture() {
           && observation.links.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)
           && (!transition || (!transition.active && transition.progress === 1));
         if (complete) {
+          if (!settledFitRequested && selectionNodeIdRef.current === null) {
+            // The vendor graph creates node/link Object3D instances over its
+            // render ticks. Fit once after the complete scene observation so
+            // the camera includes the final volumetric bounds, not the early
+            // canvas-only placeholder scene.
+            settledFitRequested = true;
+            settledGraphFitRef.current = true;
+            workbenchRef.current?.fit(0);
+            frame = window.requestAnimationFrame(observe);
+            return;
+          }
           finishObservation();
           setRenderTelemetry({
             availability: "observed",
+            ambientMotion: workbenchRef.current!.getAmbientMotionObservation(),
             observation,
             observationScope: "renderer-live-data-and-scene-object-material",
+            screenProjection: densityScreenProjection(workbenchRef.current!),
             selectionNodeId: selectionNodeIdRef.current,
           });
           return;
@@ -464,8 +772,40 @@ export function DenseGraphFixture() {
     };
   }, [renderRevision, rendererReady]);
 
+  const selectedNode = selection.nodeId ? densityNodesById.get(selection.nodeId) ?? null : null;
+  const selectedRelationships = selectedNode ? densityRelationships(selectedNode.id) : [];
+  const selectedDetails = selectedNode ? densityDetailsForNode(selectedNode) : null;
+  const previousNode = selectedNode ? densityNavigationTarget(selectedNode.id, -1) : null;
+  const nextNode = selectedNode ? densityNavigationTarget(selectedNode.id, 1) : null;
+  const detailOpen = selectedNode !== null;
+  const [copyState, setCopyState] = useState({ label: "Copy term link", nodeId: null as string | null });
+  const copyStatus = copyState.nodeId === selectedNode?.id ? copyState.label : "Copy term link";
+
+  const copyTermLink = async () => {
+    if (!navigator.clipboard) {
+      setCopyState({ label: "Copy unavailable", nodeId: selectedNode?.id ?? null });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      setCopyState({ label: "Link copied", nodeId: selectedNode?.id ?? null });
+    } catch {
+      setCopyState({ label: "Copy unavailable", nodeId: selectedNode?.id ?? null });
+    }
+  };
+
+  useEffect(() => {
+    if (detailOpen) return undefined;
+    const activeElement = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    if (!activeElement || !detailPanelRef.current?.contains(activeElement)) return undefined;
+    const focusFrame = window.requestAnimationFrame(() => graphHostRef.current?.focus({ preventScroll: true }));
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [detailOpen]);
+
   return (
-    <main className="fixture-page density-fixture">
+    <main className="fixture-page density-fixture" data-detail-open={detailOpen ? "true" : "false"}>
       <h1 className="sr-only">Graph Workbench Density Fixture</h1>
       <div className="density-controls">
         <span>{rendererReady ? "Density renderer ready" : rendererStatus === "failed" ? "Renderer unavailable" : "Preparing density renderer"}</span>
@@ -492,6 +832,98 @@ export function DenseGraphFixture() {
           </div>
         )}
       </section>
+      <aside
+        aria-hidden={!detailOpen}
+        aria-label="Selected node details"
+        className="detail-panel density-detail-panel"
+        data-active={detailOpen ? "true" : "false"}
+        data-testid="graph-density-detail-panel"
+        inert={detailOpen ? undefined : true}
+        ref={detailPanelRef}
+      >
+        <div className="detail-heading">
+          <div>
+            <p className="panel-kicker">Selected node</p>
+            <h2>{selectedNode?.label ?? "No node selected"}</h2>
+          </div>
+          <button
+            aria-label="Close selected node details"
+            className="drawer-close"
+            data-testid="graph-density-detail-close"
+            disabled={!selectedNode}
+            onClick={() => selectNode(null, "background")}
+            type="button"
+          >
+            ×
+          </button>
+        </div>
+        <div className="detail-content">
+          <p className="detail-summary">{selectedNode ? densityDetailSummary(selectedNode) : ""}</p>
+          <dl>
+            <div><dt>Identity</dt><dd>{selectedNode?.id ?? "—"}</dd></div>
+            <div><dt>Kind</dt><dd>{selectedNode?.kind ?? "—"}</dd></div>
+            <div><dt>Category</dt><dd>{selectedDetails?.category ?? "—"}</dd></div>
+            <div><dt>Neighbors</dt><dd>{selectedRelationships.length || "—"}</dd></div>
+            <div><dt>Source</dt><dd>{selectedDetails?.source ?? selection.source}</dd></div>
+          </dl>
+          <section aria-label="Node definition" className="detail-definition">
+            <p className="panel-kicker">Definition</p>
+            <p>{selectedDetails?.definition ?? ""}</p>
+            <p className="detail-usage"><strong>Usage</strong>{selectedDetails?.usage ?? ""}</p>
+          </section>
+          <section aria-label="Connected graph nodes" className="detail-relationships">
+            <p className="panel-kicker">Related concepts</p>
+            {selectedRelationships.length > 0 ? (
+              <div className="relationship-list">
+                {selectedRelationships.map((relationship) => (
+                  <button
+                    aria-label={`${relationship.direction === "outgoing" ? "Open" : "Return to"} ${relationship.nodeLabel}`}
+                    className="relationship-chip"
+                    data-testid={`graph-density-detail-relationship-${relationship.nodeId.replace(/:/g, "-")}`}
+                    key={relationship.linkId}
+                    onClick={() => selectNode(relationship.nodeId, "relationship")}
+                    type="button"
+                  >
+                    <span aria-hidden="true">{relationship.direction === "outgoing" ? "→" : "←"}</span>
+                    <strong>{relationship.nodeLabel}</strong>
+                    <small>{relationship.relationKind}</small>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="detail-empty">No direct graph connections.</p>
+            )}
+          </section>
+          <div className="detail-actions">
+            <button data-testid="graph-density-detail-copy-link" onClick={copyTermLink} type="button">
+              {copyStatus}
+            </button>
+            <button data-testid="graph-density-detail-clear" onClick={() => selectNode(null, "background")} type="button">
+              Clear focus
+            </button>
+          </div>
+          <nav aria-label="Selected node navigation" className="detail-navigation">
+            <button
+              data-testid="graph-density-detail-previous"
+              disabled={!previousNode}
+              onClick={() => previousNode && selectNode(previousNode.id, "navigation")}
+              type="button"
+            >
+              <span>Previous</span>
+              <strong>{previousNode?.label ?? "—"}</strong>
+            </button>
+            <button
+              data-testid="graph-density-detail-next"
+              disabled={!nextNode}
+              onClick={() => nextNode && selectNode(nextNode.id, "navigation")}
+              type="button"
+            >
+              <span>Next</span>
+              <strong>{nextNode?.label ?? "—"}</strong>
+            </button>
+          </nav>
+        </div>
+      </aside>
       <section className="telemetry-panel" aria-label="Density fixture telemetry">
         <Telemetry testId="graph-density-ready" value={{
           availability: rendererReady ? "observed" : rendererStatus === "failed" ? "unavailable" : "pending",
@@ -506,6 +938,9 @@ export function DenseGraphFixture() {
           target,
         }))} />
         <Telemetry testId="graph-render-observation" value={renderTelemetry} />
+        <Telemetry testId="graph-density-screen-projection" value={renderTelemetry.availability === "observed"
+          ? renderTelemetry.screenProjection
+          : renderTelemetry} />
         <Telemetry testId="graph-selection" value={{
           availability: rendererStatus === "failed" ? "unavailable" : "observed",
           neighborNodeIds: selection.neighborNodeIds,

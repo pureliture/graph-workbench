@@ -104,7 +104,7 @@ describe("selection-driven layout", () => {
     expect(first.links.map((link) => link.relationKind)).toEqual(["workflow-step", "serves"]);
   });
 
-  it("keeps only selected-node incident links visible and restores the full field when cleared", () => {
+  it("hides the idle relationship field and reveals only selected-node incident links", () => {
     const input = {
       ...graphFixture,
       nodes: [
@@ -121,7 +121,7 @@ describe("selection-driven layout", () => {
     const idle = createRenderGraphData(input, {});
     const selected = createRenderGraphData(input, { selectedNodeIds: ["component:api"] });
 
-    expect(idle.links.every((link) => link.visual.visible)).toBe(true);
+    expect(idle.links.every((link) => !link.visual.visible)).toBe(true);
     expect(new Map(selected.links.map((link) => [link.id, link.visual.visible]))).toEqual(new Map([
       ["release-api", true],
       ["api-web", true],
@@ -129,7 +129,7 @@ describe("selection-driven layout", () => {
     ]));
   });
 
-  it("uses a deterministic vertically clustered depth field and re-stages every non-pinned node on selection", () => {
+  it("keeps the deterministic depth field while restaging only the selected relationship lane", () => {
     const input = {
       ...graphFixture,
       nodes: [
@@ -152,8 +152,11 @@ describe("selection-driven layout", () => {
 
     expect(new Set(base.nodes.map((node) => node.z)).size).toBeGreaterThan(3);
     expect(Math.max(...base.nodes.map((node) => node.y)) - Math.min(...base.nodes.map((node) => node.y))).toBeGreaterThan(100);
-    ["relation:release", "component:api", "component:web", "component:docs"].forEach((id) => {
+    ["relation:release", "component:web"].forEach((id) => {
       expect(selectedById.get(id)).not.toEqual(baseById.get(id));
+    });
+    ["component:api", "component:docs"].forEach((id) => {
+      expect(selectedById.get(id)).toEqual(baseById.get(id));
     });
     expect(selectedById.get("component:pinned")).toEqual(baseById.get("component:pinned"));
     expect(selected.selection.targetNodePositions).toEqual(repeated.selection.targetNodePositions);
@@ -206,7 +209,7 @@ describe("selection-driven layout", () => {
     expect(distant.visual.opacity).toBeGreaterThan(0);
   });
 
-  it("uses one selection outcome for mouse, keyboard, and programmatic paths while cancelling stale camera transitions", () => {
+  it("uses one selection outcome for mouse, keyboard, and programmatic paths", () => {
     let callbacks: GraphRendererFactoryOptions["callbacks"] | null = null;
     let renderer: TransitionRenderer | null = null;
     const selections: Array<{ nodeId: string | null; source: string; node: unknown; settled: boolean }> = [];
@@ -247,7 +250,10 @@ describe("selection-driven layout", () => {
       settled: true,
     });
     expect(renderer?.transitions.at(-1)).toEqual({ nodeId: "component:web", reducedMotion: true });
-    expect(renderer?.cancelCalls).toBeGreaterThanOrEqual(4);
+    // The workbench leaves cancellation to the renderer. This lets a viewport
+    // resize retarget the same active scene without snapping its node frame to
+    // the final layout first.
+    expect(renderer?.cancelCalls).toBe(0);
     expect(workbench.getSelectionState()).toBe(renderer?.data?.selection);
   });
 
@@ -273,9 +279,8 @@ describe("selection-driven layout", () => {
     // viewport update -> renderer.resize() -> graphData sync.
     workbench.resize(390, 844);
 
-    expect(renderer!.operations.slice(operationsBeforeResize, operationsBeforeResize + 2)).toEqual([
+    expect(renderer!.operations.slice(operationsBeforeResize, operationsBeforeResize + 1)).toEqual([
       "data:component:api",
-      "cancel",
     ]);
     expect(renderer!.data?.selection).toMatchObject({
       nodeId: "component:api",
