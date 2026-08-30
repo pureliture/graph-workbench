@@ -85,6 +85,11 @@ const INTERACTION_LABEL_MINIMUM_PIXELS = Object.freeze({
     selected: 16,
     contextual: 14,
 });
+// Labels use a padded canvas glyph mask (56px type in a 96px texture). The
+// plane's projected height therefore overstates the visible glyph height.
+// Account for that stable mask ratio so the screen-space floor describes what
+// a user can actually read, not the transparent canvas around it.
+const LABEL_VISIBLE_GLYPH_HEIGHT_RATIO = 0.55;
 // The reference graph keeps the complete topology available, but deliberately
 // limits the amount of concurrently readable text. These are renderer-local
 // presentation budgets: they never remove data, search targets, or keyboard
@@ -1864,7 +1869,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                     ? INTERACTION_LABEL_MINIMUM_PIXELS.contextual
                     : 0;
             const readableLabelScale = interactionLabelMinimumPixels > 0
-                ? Math.max(labelScale, labelScaleForMinimumPixels(labelDistance, state.defaultVisual?.baseLabelScale.y ?? 8, scale, projection, data.selection.viewport.height, interactionLabelMinimumPixels))
+                ? Math.max(labelScale, labelScaleForMinimumPixels(labelDistance, (state.defaultVisual?.baseLabelScale.y ?? 8) * LABEL_VISIBLE_GLYPH_HEIGHT_RATIO, scale, projection, data.selection.viewport.height, interactionLabelMinimumPixels))
                 : labelScale;
             const labelPerspectiveVisibility = labelAlwaysReadable
                 ? 1

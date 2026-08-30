@@ -350,6 +350,14 @@ function projectedLabelHeightInPixels(
     / (2 * Math.tan((50 * Math.PI) / 360) * Math.max(1, distance));
 }
 
+function projectedLabelGlyphHeightInPixels(
+  node: GraphRenderNodeObservation,
+  camera: { readonly position: Coordinates },
+  viewport: { readonly height: number; readonly width: number },
+): number {
+  return projectedLabelHeightInPixels(node, camera, viewport) * 0.55;
+}
+
 function projectedEndpointInBodyCoordinates(
   body: Mesh,
   endpoint: Coordinates,
@@ -2250,8 +2258,8 @@ describe("Three.js camera transitions", () => {
     const observation = renderer.getRenderObservation!();
     const selected = observation.nodes.find((node) => node.id === "component:selected")!;
     const neighbor = observation.nodes.find((node) => node.id === "component:neighbor")!;
-    expect(projectedLabelHeightInPixels(selected, camera, viewport)).toBeGreaterThanOrEqual(16);
-    expect(projectedLabelHeightInPixels(neighbor, camera, viewport)).toBeGreaterThanOrEqual(14);
+    expect(projectedLabelGlyphHeightInPixels(selected, camera, viewport)).toBeGreaterThanOrEqual(16);
+    expect(projectedLabelGlyphHeightInPixels(neighbor, camera, viewport)).toBeGreaterThanOrEqual(14);
   });
 
   it("applies semantic default colors across theme and input updates while preserving descriptor overrides", () => {
