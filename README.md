@@ -213,7 +213,7 @@ click path를 실행하며, `Escape`는 selection을 해제합니다. Canvas 밖
 host가 제공합니다.
 
 선택 transition은 선택 node, 1-hop 이웃, 나머지 node의 renderer-local target을 같은 transaction에서
-계산합니다. Built-in renderer는 flat 2.5D silhouette, camera-facing label, depth-aware opacity,
+계산합니다. Built-in renderer는 구형 volumetric body, camera-facing label, depth-aware opacity,
 focused edge flow를 제공하며, reduced motion에서는 같은 target에 즉시 도달합니다.
 
 ## 공개 API

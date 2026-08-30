@@ -313,6 +313,50 @@ type DensityNodeDetails = {
   readonly usage: string;
 };
 
+const densitySections = [
+  "The Model",
+  "Sessions, Context Windows & Turns",
+  "Tools & Environment",
+  "Failure Modes",
+  "Handoffs",
+  "Memory and Steering",
+  "Patterns of Work",
+] as const;
+
+type DensityRichTable = {
+  readonly cells: readonly string[][];
+  readonly headers: readonly string[];
+  readonly caption: string;
+};
+
+type DensityRichDetails = DensityNodeDetails & {
+  readonly avoid?: string;
+  readonly bullets: readonly string[];
+  readonly heard?: { readonly answer: string; readonly question: string };
+  readonly longDefinition: readonly string[];
+  readonly section: string;
+  readonly sourceUrl: string;
+  readonly surfaces?: readonly string[];
+  readonly table?: DensityRichTable;
+};
+
+function densitySlugForNode(node: Pick<GraphNode, "id" | "label">): string {
+  if (node.id === densityFocusNodeId) return "model-provider-request";
+  return node.label.trim().toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")
+    || node.id.replace(/^[^:]+:/, "");
+}
+
+function densitySectionForNode(node: GraphNode): string {
+  if (node.id === densityFocusNodeId || node.id === "concept:model" || node.id === "concept:provider") {
+    return densitySections[0];
+  }
+  if (node.id === "concept:context") return densitySections[1];
+  if (node.id === "concept:index" || node.id === "concept:vector") return densitySections[2];
+  const cluster = typeof node.metadata?.clusterId === "string" ? node.metadata.clusterId : "";
+  const clusterIndex = densityClusterSpecs.findIndex((candidate) => candidate.id === cluster);
+  return densitySections[(clusterIndex + 3) % densitySections.length] ?? densitySections[6];
+}
+
 const densityNodeDetails = new Map<string, DensityNodeDetails>([
   [densityFocusNodeId, {
     category: "Retrieval relation",
@@ -374,18 +418,6 @@ type DensityRelationship = {
   readonly relationKind: string;
 };
 
-function densityDetailSummary(node: GraphNode): string {
-  const details = densityNodeDetails.get(node.id);
-  if (details) return details.summary;
-  const role = node.metadata?.densityRole;
-  if (role === "focus") return "The query anchor for the dense graph fixture.";
-  if (role === "direct-neighbor") return `${node.label} is directly connected to the query anchor.`;
-  const cluster = node.metadata?.clusterId;
-  return typeof cluster === "string"
-    ? `${node.label} is a background node in the ${cluster} density cluster.`
-    : `${node.label} is a background node in the dense graph fixture.`;
-}
-
 function densityDetailsForNode(node: GraphNode): DensityNodeDetails {
   const known = densityNodeDetails.get(node.id);
   if (known) return known;
@@ -397,6 +429,68 @@ function densityDetailsForNode(node: GraphNode): DensityNodeDetails {
     summary: `${node.label} is a contextual concept in the dense graph.`,
     usage: "Select a connected concept to continue reading the graph context.",
   };
+}
+
+function densityRichDetailsForNode(node: GraphNode): DensityRichDetails {
+  const base = densityDetailsForNode(node);
+  const slug = densitySlugForNode(node);
+  const section = densitySectionForNode(node);
+  const known = densityNodeDetails.has(node.id);
+  const detail: DensityRichDetails = {
+    ...base,
+    bullets: known
+      ? [
+        "The graph keeps this concept available as a stable navigation target.",
+        "Direct relationships are promoted when the term is selected.",
+        "Distant context remains available without taking over the reading path.",
+      ]
+      : [
+        "This contextual term is part of the complete 150-node dictionary field.",
+        "Hover reveals its local relationships without changing the selected route.",
+      ],
+    longDefinition: known
+      ? [
+        base.definition,
+        `${node.label} is grouped under ${section}. Read the short definition first, then follow a connected term to compare the surrounding request path.`,
+      ]
+      : [
+        base.definition,
+        `${node.label} is an intentionally small context entry in the ${section} section. It keeps the dense graph browsable while preserving a deterministic identity and relationship surface.`,
+      ],
+    section,
+    sourceUrl: `https://www.aicodingdictionary.com/?term=${encodeURIComponent(slug)}`,
+  };
+  if (node.id === densityFocusNodeId) {
+    return {
+      ...detail,
+      avoid: "Do not treat a query as the model response; it is the request boundary that binds the path.",
+      heard: {
+        answer: "Start at the query, then follow the direct pills to see where the request is resolved.",
+        question: "How does a model-provider request move through the graph?",
+      },
+      surfaces: ["retrieval", "routing", "context assembly"],
+      table: {
+        caption: "The request path in this fixture",
+        headers: ["Stage", "Role"],
+        cells: [
+          ["Query", "declares the request"],
+          ["Model + Provider", "resolves capability"],
+          ["Context + Evidence", "grounds the result"],
+        ],
+      },
+    };
+  }
+  if (node.id === "concept:evidence") {
+    return {
+      ...detail,
+      heard: {
+        answer: "Evidence is useful when a reader needs to check why a result should be trusted.",
+        question: "What makes a retrieved answer inspectable?",
+      },
+      surfaces: ["citations", "grounding", "review"],
+    };
+  }
+  return detail;
 }
 
 function densityRelationships(nodeId: string): readonly DensityRelationship[] {
@@ -429,10 +523,18 @@ function densityNavigationTarget(nodeId: string, direction: -1 | 1): GraphNode |
   return densityInput.nodes[nextIndex] ?? null;
 }
 
+function densitySectionNodes(nodes: readonly GraphNode[], section: string): readonly GraphNode[] {
+  return nodes.filter((node) => densitySectionForNode(node) === section);
+}
+
 function densityTermPath(nodeId: string | null): string {
   const location = new URL(window.location.href);
-  if (nodeId) location.searchParams.set("term", nodeId);
+  if (nodeId) {
+    const node = densityNodesById.get(nodeId);
+    location.searchParams.set("term", node?.id === densityFocusNodeId ? densitySlugForNode(node) : nodeId);
+  }
   else location.searchParams.delete("term");
+  location.searchParams.delete("q");
   return `${location.pathname}${location.search}${location.hash}`;
 }
 
@@ -475,8 +577,8 @@ function Telemetry({ testId, value }: { readonly testId: string; readonly value:
   );
 }
 
-function densityScreenProjection(workbench: GraphWorkbench): DensityScreenProjection {
-  const positions = densityInput.nodes.flatMap((node) => {
+function densityScreenProjection(workbench: GraphWorkbench, nodes: readonly GraphNode[] = densityInput.nodes): DensityScreenProjection {
+  const positions = nodes.flatMap((node) => {
     const position = workbench.getNodeScreenPosition(node.id);
     return position && Number.isFinite(position.x) && Number.isFinite(position.y)
       ? [{ id: node.id, x: position.x, y: position.y }]
@@ -506,6 +608,8 @@ export function DenseGraphFixture() {
   const workbenchRef = useRef<GraphWorkbench | null>(null);
   const initialTermAppliedRef = useRef(false);
   const selectionNodeIdRef = useRef<string | null>(null);
+  const hoverNodeIdRef = useRef<string | null>(null);
+  const hoverReleasePendingRef = useRef(false);
   const settledGraphFitRef = useRef(false);
   const [rendererStatus, setRendererStatus] = useState<RendererStatus>("pending");
   const [webglStatus, setWebglStatus] = useState<WebglStatus>("pending");
@@ -520,6 +624,7 @@ export function DenseGraphFixture() {
     reason: "Waiting for the density renderer scene observation.",
   });
   const [renderRevision, setRenderRevision] = useState(0);
+  const [expandedNodeId, setExpandedNodeId] = useState<string | null>(null);
   const rendererReady = rendererStatus === "mounted" && webglStatus === "mounted";
 
   const selectNode = useCallback((nodeId: string | null, source: GraphSelectionSource) => {
@@ -564,6 +669,19 @@ export function DenseGraphFixture() {
               setRendererStatus("mounted");
               setRendererReason(null);
             }
+          },
+          onNodeHover: ({ nodeId }) => {
+            if (disposed) return;
+            if (hoverNodeIdRef.current !== null && nodeId === null) {
+              hoverReleasePendingRef.current = true;
+            }
+            if (nodeId !== null) hoverReleasePendingRef.current = false;
+            hoverNodeIdRef.current = nodeId;
+            setRenderTelemetry({
+              availability: "pending",
+              reason: "Waiting for the current density hover observation.",
+            });
+            setRenderRevision((revision) => revision + 1);
           },
           onSelectionChange: (event: GraphSelectionEvent) => {
             if (disposed) return;
@@ -672,11 +790,17 @@ export function DenseGraphFixture() {
   useEffect(() => {
     if (!rendererReady || initialTermAppliedRef.current) return;
     initialTermAppliedRef.current = true;
-    const rawTerm = new URL(window.location.href).searchParams.get("term");
-    if (rawTerm === null) return;
+    const location = new URL(window.location.href);
+    const rawTerm = location.searchParams.get("term");
+    if (rawTerm === null) {
+      if (location.searchParams.has("q")) {
+        window.history.replaceState(window.history.state, "", densityTermPath(null));
+      }
+      return;
+    }
     const node = densityNodeForTerm(rawTerm);
     if (node) {
-      selectNode(node.id, "deep-link");
+      window.setTimeout(() => selectNode(node.id, "deep-link"), 0);
       return;
     }
     window.history.replaceState(window.history.state, "", densityTermPath(null));
@@ -684,7 +808,8 @@ export function DenseGraphFixture() {
 
   useEffect(() => {
     const restoreSelectionFromHistory = () => {
-      const rawTerm = new URL(window.location.href).searchParams.get("term");
+      const location = new URL(window.location.href);
+      const rawTerm = location.searchParams.get("term");
       const node = densityNodeForTerm(rawTerm);
       selectNode(node?.id ?? null, "history");
     };
@@ -726,6 +851,9 @@ export function DenseGraphFixture() {
           && observation.links.length === densityInput.links.length
           && observation.nodes.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)
           && observation.links.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)
+          && (!hoverReleasePendingRef.current || observation.links.every(({ objectVisible, visual }) => (
+            !objectVisible || visual.visible
+          )))
           && (!transition || (!transition.active && transition.progress === 1));
         if (complete) {
           if (!settledFitRequested && selectionNodeIdRef.current === null) {
@@ -748,6 +876,7 @@ export function DenseGraphFixture() {
             screenProjection: densityScreenProjection(workbenchRef.current!),
             selectionNodeId: selectionNodeIdRef.current,
           });
+          hoverReleasePendingRef.current = false;
           return;
         }
       } catch (error) {
@@ -774,10 +903,12 @@ export function DenseGraphFixture() {
 
   const selectedNode = selection.nodeId ? densityNodesById.get(selection.nodeId) ?? null : null;
   const selectedRelationships = selectedNode ? densityRelationships(selectedNode.id) : [];
-  const selectedDetails = selectedNode ? densityDetailsForNode(selectedNode) : null;
+  const selectedDetails = selectedNode ? densityRichDetailsForNode(selectedNode) : null;
   const previousNode = selectedNode ? densityNavigationTarget(selectedNode.id, -1) : null;
   const nextNode = selectedNode ? densityNavigationTarget(selectedNode.id, 1) : null;
   const detailOpen = selectedNode !== null;
+  const selectedOrdinal = selectedNode ? densityInput.nodes.findIndex((node) => node.id === selectedNode.id) + 1 : 0;
+  const [detailActionStatus, setDetailActionStatus] = useState<string | null>(null);
   const [copyState, setCopyState] = useState({ label: "Copy term link", nodeId: null as string | null });
   const copyStatus = copyState.nodeId === selectedNode?.id ? copyState.label : "Copy term link";
 
@@ -794,6 +925,51 @@ export function DenseGraphFixture() {
     }
   };
 
+  const copySelectedMarkdown = async () => {
+    if (!selectedNode || !selectedDetails) return;
+    if (!navigator.clipboard) {
+      setDetailActionStatus("Copy unavailable");
+      return;
+    }
+    const lines = [
+      `# ${selectedNode.label}`,
+      "",
+      ...selectedDetails.longDefinition,
+      "",
+      ...(selectedDetails.bullets.length > 0 ? ["## Key points", "", ...selectedDetails.bullets.map((item) => `- ${item}`), ""] : []),
+      `Source: [${selectedNode.label}](${selectedDetails.sourceUrl})`,
+    ];
+    const markdown = lines.join("\n");
+    try {
+      await navigator.clipboard?.writeText(markdown);
+      setDetailActionStatus("Markdown copied");
+    } catch {
+      setDetailActionStatus("Copy unavailable");
+    }
+  };
+
+  const shareSelectedNode = async () => {
+    if (!selectedNode) return;
+    const shareData = {
+      title: selectedNode.label,
+      text: selectedDetails?.summary ?? selectedNode.label,
+      url: window.location.href,
+    };
+    try {
+      if (typeof navigator.share === "function") {
+        await navigator.share(shareData);
+        setDetailActionStatus("Shared");
+      } else if (navigator.clipboard) {
+        await navigator.clipboard.writeText(window.location.href);
+        setDetailActionStatus("Link copied");
+      } else {
+        setDetailActionStatus("Share unavailable");
+      }
+    } catch {
+      setDetailActionStatus("Share unavailable");
+    }
+  };
+
   useEffect(() => {
     if (detailOpen) return undefined;
     const activeElement = document.activeElement instanceof HTMLElement
@@ -805,7 +981,11 @@ export function DenseGraphFixture() {
   }, [detailOpen]);
 
   return (
-    <main className="fixture-page density-fixture" data-detail-open={detailOpen ? "true" : "false"}>
+    <main
+      className="fixture-page density-fixture"
+      data-detail-open={detailOpen ? "true" : "false"}
+      data-renderer-failed={rendererStatus === "failed" ? "true" : "false"}
+    >
       <h1 className="sr-only">Graph Workbench Density Fixture</h1>
       <div className="density-controls">
         <span>{rendererReady ? "Density renderer ready" : rendererStatus === "failed" ? "Renderer unavailable" : "Preparing density renderer"}</span>
@@ -832,6 +1012,27 @@ export function DenseGraphFixture() {
           </div>
         )}
       </section>
+
+      <section className="semantic-fallback" aria-label="Dictionary terms">
+        <h2>Dictionary terms</h2>
+        {densitySections.map((section) => {
+          const sectionNodes = densitySectionNodes(densityInput.nodes, section);
+          return (
+            <section key={section}>
+              <h3>{section}</h3>
+              <ul>
+                {sectionNodes.map((node) => (
+                  <li key={node.id}>
+                    <strong>{node.label}</strong>
+                    <span>{densityDetailsForNode(node).definition}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          );
+        })}
+      </section>
+
       <aside
         aria-hidden={!detailOpen}
         aria-label="Selected node details"
@@ -841,10 +1042,14 @@ export function DenseGraphFixture() {
         inert={detailOpen ? undefined : true}
         ref={detailPanelRef}
       >
-        <div className="detail-heading">
+        <div className="detail-heading density-detail-heading">
           <div>
-            <p className="panel-kicker">Selected node</p>
+            <div className="density-detail-meta">
+              <p className="panel-kicker">{selectedDetails?.section ?? "Selected node"}</p>
+              {selectedNode && <span>{String(selectedOrdinal).padStart(2, "0")} / {densityInput.nodes.length}</span>}
+            </div>
             <h2>{selectedNode?.label ?? "No node selected"}</h2>
+            <p className="detail-summary">{selectedDetails?.summary ?? ""}</p>
           </div>
           <button
             aria-label="Close selected node details"
@@ -858,21 +1063,67 @@ export function DenseGraphFixture() {
           </button>
         </div>
         <div className="detail-content">
-          <p className="detail-summary">{selectedNode ? densityDetailSummary(selectedNode) : ""}</p>
           <dl>
             <div><dt>Identity</dt><dd>{selectedNode?.id ?? "—"}</dd></div>
             <div><dt>Kind</dt><dd>{selectedNode?.kind ?? "—"}</dd></div>
             <div><dt>Category</dt><dd>{selectedDetails?.category ?? "—"}</dd></div>
-            <div><dt>Neighbors</dt><dd>{selectedRelationships.length || "—"}</dd></div>
-            <div><dt>Source</dt><dd>{selectedDetails?.source ?? selection.source}</dd></div>
           </dl>
-          <section aria-label="Node definition" className="detail-definition">
-            <p className="panel-kicker">Definition</p>
-            <p>{selectedDetails?.definition ?? ""}</p>
-            <p className="detail-usage"><strong>Usage</strong>{selectedDetails?.usage ?? ""}</p>
-          </section>
-          <section aria-label="Connected graph nodes" className="detail-relationships">
-            <p className="panel-kicker">Related concepts</p>
+
+          {selectedDetails?.heard && (
+            <section aria-label="Heard in the wild" className="density-content-block heard-block">
+              <p className="panel-kicker">Heard in the wild</p>
+              <p className="heard-question">{selectedDetails.heard.question}</p>
+              <blockquote>{selectedDetails.heard.answer}</blockquote>
+            </section>
+          )}
+
+          {selectedDetails && (
+            <section aria-label="Full definition" className="detail-definition density-content-block">
+              <p className="panel-kicker">Definition</p>
+              <p>{selectedDetails.longDefinition[0]}</p>
+              {expandedNodeId === selectedNode?.id && (
+                <>
+                  {selectedDetails.longDefinition.slice(1).map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
+                  <ul className="density-bullet-list">
+                    {selectedDetails.bullets.map((bullet) => <li key={bullet}>{bullet}</li>)}
+                  </ul>
+                  {selectedDetails.table && (
+                    <table className="density-detail-table">
+                      <caption>{selectedDetails.table.caption}</caption>
+                      <thead><tr>{selectedDetails.table.headers.map((header) => <th key={header} scope="col">{header}</th>)}</tr></thead>
+                      <tbody>{selectedDetails.table.cells.map((row) => <tr key={row.join("|")}>{row.map((cell) => <td key={cell}>{cell}</td>)}</tr>)}</tbody>
+                    </table>
+                  )}
+                </>
+              )}
+              <button
+                aria-expanded={expandedNodeId === selectedNode?.id}
+                className="read-more-button"
+                data-testid="graph-density-detail-read-more"
+                onClick={() => setExpandedNodeId((current) => current === selectedNode?.id ? null : selectedNode?.id ?? null)}
+                type="button"
+              >
+                {expandedNodeId === selectedNode?.id ? "Show less" : "Read more"}
+              </button>
+              <p className="detail-usage"><strong>Usage</strong>{selectedDetails.usage}</p>
+            </section>
+          )}
+
+          {selectedDetails?.surfaces && (
+            <section aria-label="Surfaces as" className="density-content-block density-surfaces">
+              <p className="panel-kicker">Surfaces as:</p>
+              <div>{selectedDetails.surfaces.map((surface) => <span key={surface}>{surface}</span>)}</div>
+            </section>
+          )}
+          {selectedDetails?.avoid && (
+            <section aria-label="Avoid" className="density-content-block density-avoid">
+              <p className="panel-kicker">Avoid</p>
+              <p>{selectedDetails.avoid}</p>
+            </section>
+          )}
+
+          <section aria-label="Connected graph nodes" className="detail-relationships density-content-block">
+            <p className="panel-kicker">Connects to</p>
             {selectedRelationships.length > 0 ? (
               <div className="relationship-list">
                 {selectedRelationships.map((relationship) => (
@@ -893,15 +1144,40 @@ export function DenseGraphFixture() {
             ) : (
               <p className="detail-empty">No direct graph connections.</p>
             )}
+            {selectedRelationships[0] && (
+              <button
+                className="inline-term-link"
+                onClick={() => selectNode(selectedRelationships[0].nodeId, "relationship")}
+                type="button"
+              >
+                Explore {selectedRelationships[0].nodeLabel} inline →
+              </button>
+            )}
           </section>
+
+          <a
+            className="density-source-link"
+            href={selectedDetails?.sourceUrl ?? "https://www.aicodingdictionary.com/"}
+            rel="noopener noreferrer"
+            target="_blank"
+          >
+            Read the full source entry ↗
+          </a>
           <div className="detail-actions">
+            <button data-testid="graph-density-detail-share" disabled={!selectedNode} onClick={() => void shareSelectedNode()} type="button">
+              Share {selectedNode?.label ?? "term"}
+            </button>
+            <button data-testid="graph-density-detail-copy-markdown" disabled={!selectedNode} onClick={() => void copySelectedMarkdown()} type="button">
+              Copy {selectedNode?.label ?? "term"} as markdown
+            </button>
             <button data-testid="graph-density-detail-copy-link" onClick={copyTermLink} type="button">
               {copyStatus}
             </button>
             <button data-testid="graph-density-detail-clear" onClick={() => selectNode(null, "background")} type="button">
-              Clear focus
+              Close entry
             </button>
           </div>
+          {detailActionStatus && <p className="detail-action-status" role="status">{detailActionStatus}</p>}
           <nav aria-label="Selected node navigation" className="detail-navigation">
             <button
               data-testid="graph-density-detail-previous"
@@ -909,7 +1185,7 @@ export function DenseGraphFixture() {
               onClick={() => previousNode && selectNode(previousNode.id, "navigation")}
               type="button"
             >
-              <span>Previous</span>
+              <span>Prev</span>
               <strong>{previousNode?.label ?? "—"}</strong>
             </button>
             <button
@@ -924,6 +1200,7 @@ export function DenseGraphFixture() {
           </nav>
         </div>
       </aside>
+
       <section className="telemetry-panel" aria-label="Density fixture telemetry">
         <Telemetry testId="graph-density-ready" value={{
           availability: rendererReady ? "observed" : rendererStatus === "failed" ? "unavailable" : "pending",

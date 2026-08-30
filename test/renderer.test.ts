@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  BackSide,
   BoxGeometry,
   Color,
   Group,
@@ -479,7 +480,7 @@ describe("Three.js camera transitions", () => {
     expect(driftLookAt?.z).toBeCloseTo(1, 1);
   });
 
-  it("holds the density body set through an Orbit drag and release", () => {
+  it("keeps every density body and label stable through an Orbit drag and release", () => {
     const denseInput: GraphInput = {
       schemaVersion: 1,
       layout: { seed: "density-visibility-drag-test" },
@@ -506,26 +507,81 @@ describe("Three.js camera transitions", () => {
     const visibleBodyIds = () => renderer.getRenderObservation!().nodes
       .filter((node) => node.body?.objectVisible)
       .map((node) => node.id);
+    const visibleLabelIds = () => renderer.getRenderObservation!().nodes
+      .filter((node) => node.label.objectVisible)
+      .map((node) => node.id);
     const beforeDrag = visibleBodyIds();
-    expect(beforeDrag.length).toBeLessThan(denseInput.nodes.length);
+    const beforeLabels = visibleLabelIds();
+    expect(beforeDrag).toHaveLength(denseInput.nodes.length);
+    expect(beforeLabels).toHaveLength(denseInput.nodes.length);
 
     graph.cameraControls.dispatch("start");
     graph.projectionOffset = { x: 250, y: 220 };
     graph.cameraControls.dispatch("change");
     expect(visibleBodyIds()).toEqual(beforeDrag);
+    expect(visibleLabelIds()).toEqual(beforeLabels);
 
     graph.projectionOffset = { x: -170, y: -120 };
     graph.cameraControls.dispatch("change");
     expect(visibleBodyIds()).toEqual(beforeDrag);
+    expect(visibleLabelIds()).toEqual(beforeLabels);
 
     const projectionCallsBeforeRelease = graph.projectionCalls.length;
     graph.cameraControls.dispatch("end");
     expect(graph.projectionCalls).toHaveLength(projectionCallsBeforeRelease);
     expect(visibleBodyIds()).toEqual(beforeDrag);
+    expect(visibleLabelIds()).toEqual(beforeLabels);
 
     graph.nodeHoverCallback?.(graph.data.nodes[0]!);
     expect(graph.projectionCalls).toHaveLength(projectionCallsBeforeRelease);
     expect(visibleBodyIds()).toEqual(beforeDrag);
+    expect(visibleLabelIds()).toEqual(beforeLabels);
+  });
+
+  it("makes camera-facing depth visibly re-rank node and label exposure", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const input: GraphInput = {
+      schemaVersion: 1,
+      layout: { seed: "camera-exposure" },
+      nodes: [
+        {
+          id: "positive",
+          type: "component",
+          kind: "service",
+          label: "Positive",
+          layoutHint: { pinned: true, x: 110, y: 0, z: 0 },
+        },
+        {
+          id: "negative",
+          type: "component",
+          kind: "service",
+          label: "Negative",
+          layoutHint: { pinned: true, x: -110, y: 0, z: 0 },
+        },
+      ],
+      links: [],
+    };
+    renderer.setData(createRenderGraphData(input, { ambientMotion: false }));
+    graph.pose = {
+      lookAt: { x: 0, y: 0, z: 0 },
+      position: { x: 300, y: 0, z: 0 },
+    };
+    graph.cameraControls.dispatch("change");
+    const rotated = renderer.getRenderObservation!()!;
+    const positive = rotated.nodes.find((node) => node.id === "positive")!;
+    const negative = rotated.nodes.find((node) => node.id === "negative")!;
+
+    expect(positive.minimumVisibleMaterialOpacity).toBeGreaterThan(
+      (negative.minimumVisibleMaterialOpacity ?? 0) + 0.55,
+    );
+    expect(positive.label.minimumVisibleMaterialOpacity).toBeGreaterThan(
+      (negative.label.minimumVisibleMaterialOpacity ?? 0) + 0.55,
+    );
+    expect(positive.worldScale!.x).toBeGreaterThan(negative.worldScale!.x);
+    expect(positive.label.scale!.x).toBeGreaterThan(negative.label.scale!.x);
   });
 
   it("projects the current renderer node coordinates into canvas-local screen coordinates", () => {
@@ -598,7 +654,7 @@ describe("Three.js camera transitions", () => {
     expect(secondParticle.screenY).not.toBeNull();
   });
 
-  it("does not resurrect idle relationship lines for an unselected hover", () => {
+  it("shows only dashed incident relationship lines and attracts nearby nodes on an unselected hover", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
@@ -608,13 +664,143 @@ describe("Three.js camera transitions", () => {
     runLatestFrame(0);
 
     const observation = renderer.getRenderObservation!()!;
-    expect(observation.links.every(({ objectVisible, visual }) => (
+    const incidentLinks = observation.links.filter((link) => ["api-web", "release-api"].includes(link.id));
+    const distantLinks = observation.links.filter((link) => !["api-web", "release-api"].includes(link.id));
+    expect(incidentLinks).toHaveLength(2);
+    incidentLinks.forEach((link) => {
+      expect(link.objectVisible).toBe(true);
+      expect(link.visual.visible).toBe(false);
+      expect(link.visibleMaterialOpacities.some((opacity) => opacity > 0.6)).toBe(true);
+    });
+    expect(distantLinks.every(({ objectVisible, visual }) => (
       objectVisible === false && !visual.visible
     ))).toBe(true);
     const ambient = renderer.getAmbientMotionObservation!()!;
     expect(ambient.focusNodeId).toBe("component:api");
     expect(ambient.linkFlow.every(({ active, particleCount }) => !active && particleCount === 0)).toBe(true);
     expect(ambient.particles).toHaveLength(0);
+
+    const api = ambient.renderedNodePositions.find((node) => node.id === "component:api")!;
+    const web = ambient.renderedNodePositions.find((node) => node.id === "component:web")!;
+    const webAnchor = ambient.anchorNodePositions.find((node) => node.id === "component:web")!;
+    expect(web).not.toEqual(webAnchor);
+    expect(Math.hypot(web.x - api.x, web.y - api.y, web.z - api.z))
+      .toBeLessThan(Math.hypot(webAnchor.x - api.x, webAnchor.y - api.y, webAnchor.z - api.z));
+
+    graph.nodeHoverCallback?.(null);
+    runLatestFrame(1_000);
+    const settled = renderer.getAmbientMotionObservation!()!;
+    const settledWeb = settled.renderedNodePositions.find((node) => node.id === "component:web")!;
+    const settledAnchor = settled.anchorNodePositions.find((node) => node.id === "component:web")!;
+    expect(Math.hypot(settledWeb.x - settledAnchor.x, settledWeb.y - settledAnchor.y, settledWeb.z - settledAnchor.z))
+      .toBeLessThan(Math.hypot(web.x - webAnchor.x, web.y - webAnchor.y, web.z - webAnchor.z));
+  });
+
+  it("keeps hover attraction active while a selection is open", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const input: GraphInput = {
+      schemaVersion: 1,
+      layout: { seed: "selected-hover-attraction" },
+      nodes: [
+        {
+          id: "focus",
+          type: "relation",
+          kind: "workflow",
+          label: "Focus",
+          layoutHint: { pinned: true, x: 0, y: 0, z: 0 },
+        },
+        {
+          id: "hover",
+          type: "component",
+          kind: "service",
+          label: "Hover",
+          layoutHint: { pinned: true, x: 120, y: 0, z: 0 },
+        },
+      ],
+      links: [{ id: "focus-hover", source: "focus", target: "hover", relationKind: "connects" }],
+    };
+    renderer.setData(createRenderGraphData(input, { selectedNodeIds: ["focus"] }));
+    runLatestFrame(0);
+    const before = renderer.getAmbientMotionObservation!()!;
+    const beforeFocus = before.renderedNodePositions.find((node) => node.id === "focus")!;
+    const beforeHover = before.renderedNodePositions.find((node) => node.id === "hover")!;
+    const beforeDistance = Math.hypot(
+      beforeFocus.x - beforeHover.x,
+      beforeFocus.y - beforeHover.y,
+      beforeFocus.z - beforeHover.z,
+    );
+
+    graph.nodeHoverCallback?.(graph.data.nodes.find((node) => node.id === "hover")!);
+    // Keep the same timestamp so breathing/common drift cannot mask the
+    // transient attraction delta under test.
+    runLatestFrame(0);
+    const after = renderer.getAmbientMotionObservation!()!;
+    const afterFocus = after.renderedNodePositions.find((node) => node.id === "focus")!;
+    const afterHover = after.renderedNodePositions.find((node) => node.id === "hover")!;
+    const afterDistance = Math.hypot(
+      afterFocus.x - afterHover.x,
+      afterFocus.y - afterHover.y,
+      afterFocus.z - afterHover.z,
+    );
+
+    expect(afterDistance).toBeLessThan(beforeDistance - 1);
+  });
+
+  it("eases hover release across an interaction-sized transition window", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const input: GraphInput = {
+      schemaVersion: 1,
+      layout: { seed: "hover-release-easing" },
+      nodes: [
+        {
+          id: "focus",
+          type: "relation",
+          kind: "workflow",
+          label: "Focus",
+          layoutHint: { pinned: true, x: 0, y: 0, z: 0 },
+        },
+        {
+          id: "hover",
+          type: "component",
+          kind: "service",
+          label: "Hover",
+          layoutHint: { pinned: true, x: 120, y: 0, z: 0 },
+        },
+      ],
+      links: [{ id: "focus-hover", source: "focus", target: "hover", relationKind: "connects" }],
+    };
+    renderer.setData(createRenderGraphData(input, {}));
+    runLatestFrame(0);
+    const distance = () => {
+      const observation = renderer.getAmbientMotionObservation!()!;
+      const focus = observation.renderedNodePositions.find((node) => node.id === "focus")!;
+      const hover = observation.renderedNodePositions.find((node) => node.id === "hover")!;
+      return Math.hypot(focus.x - hover.x, focus.y - hover.y, focus.z - hover.z);
+    };
+    const idleDistance = distance();
+    graph.nodeHoverCallback?.(graph.data.nodes.find((node) => node.id === "hover")!);
+    runLatestFrame(0);
+    const hoveredDistance = distance();
+
+    graph.nodeHoverCallback?.(null);
+    const immediateReleaseDistance = distance();
+    runLatestFrame(120);
+    const midReleaseDistance = distance();
+    runLatestFrame(420);
+    const settledDistance = distance();
+
+    expect(hoveredDistance).toBeLessThan(idleDistance - 1);
+    // Pointer-up should leave the attraction in place for the first frames,
+    // then progressively restore the idle spacing instead of snapping.
+    expect(immediateReleaseDistance).toBeLessThan(idleDistance - 1);
+    expect(midReleaseDistance).toBeLessThan(idleDistance - 1);
+    expect(settledDistance).toBeGreaterThan(midReleaseDistance);
   });
 
   it("keeps default relationship curves shallow without adding a depth bow", () => {
@@ -799,6 +985,11 @@ describe("Three.js camera transitions", () => {
       const source = graph.nodeObjects.get(endpoint.sourceId)!;
       const body = source.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
       expect(body.userData.graphDefaultNodeSilhouette).toBe(silhouette);
+      expect(body.geometry.type).toBe("SphereGeometry");
+      const outline = source.children.find((child) => child.userData.graphVisualRole === "outline") as Mesh;
+      const rim = source.children.find((child) => child.userData.graphVisualRole === "focus-rim") as Mesh;
+      expect(outline.geometry).toBe(body.geometry);
+      expect(rim.geometry).toBe(body.geometry);
       expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z)
         .distanceTo(source.getWorldPosition(new Vector3()))).toBeGreaterThan(0.1);
       expectEndpointOnDefaultBodyBoundary(body, endpoint.start, graph.pose.position);
@@ -1334,8 +1525,8 @@ describe("Three.js camera transitions", () => {
     const selectedMaterial = selectedBody?.material as MeshStandardMaterial;
     expect(selectedMaterial).toBeInstanceOf(MeshStandardMaterial);
     expect("emissive" in selectedMaterial).toBe(true);
-    expect(selectedMaterial.metalness).toBeCloseTo(0.02);
-    expect(selectedMaterial.roughness).toBeCloseTo(0.78);
+    expect(selectedMaterial.metalness).toBeCloseTo(0.22);
+    expect(selectedMaterial.roughness).toBeCloseTo(0.58);
   });
 
   it("keeps quiet light-mode bodies readable while hiding nonincident links", () => {
@@ -2115,7 +2306,7 @@ describe("Three.js camera transitions", () => {
     });
   });
 
-  it("uses routine-harness lit node materials without an outline shell or selection ring", () => {
+  it("uses spherical lit node materials with a restrained shell and selection ring", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -2132,10 +2323,25 @@ describe("Three.js camera transitions", () => {
     expect(body.material).toBeInstanceOf(MeshStandardMaterial);
     expect((body.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
     expect((body.material as MeshStandardMaterial).depthWrite).toBe(false);
+    expect((body.material as MeshStandardMaterial).metalness).toBeCloseTo(0.22);
+    expect((body.material as MeshStandardMaterial).roughness).toBeCloseTo(0.58);
+    expect(body.geometry.type).toBe("SphereGeometry");
     expect((label.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
     expect((label.material as MeshStandardMaterial).transparent).toBe(true);
-    expect(object.children.some((child) => child.userData.graphVisualRole === "outline")).toBe(false);
-    expect(object.children.some((child) => child.userData.graphVisualRole === "focus-rim")).toBe(false);
+    const outline = object.children.find((child) => child.userData.graphVisualRole === "outline") as Mesh;
+    const rim = object.children.find((child) => child.userData.graphVisualRole === "focus-rim") as Mesh;
+    expect(outline).toBeInstanceOf(Mesh);
+    expect(outline.geometry).toBe(body.geometry);
+    expect(outline.scale.x).toBeCloseTo(1.08);
+    expect(outline.material).toBeInstanceOf(MeshBasicMaterial);
+    expect((outline.material as MeshBasicMaterial).side).toBe(BackSide);
+    expect((outline.material as MeshBasicMaterial).opacity).toBeCloseTo(
+      (body.material as MeshStandardMaterial).opacity * 0.72,
+    );
+    expect(rim).toBeInstanceOf(Mesh);
+    expect(rim.geometry).toBe(body.geometry);
+    expect(rim.scale.x).toBeCloseTo(1.16);
+    expect(rim.visible).toBe(false);
   });
 
   it("keeps renderer-owned volumetric bodies depth-capable through nested transforms", () => {
@@ -2202,8 +2408,9 @@ describe("Three.js camera transitions", () => {
       expect(material.color.getHexString()).toBe(new Color(color).getHexString());
       expect("clearcoat" in material).toBe(false);
       expect("emissive" in material).toBe(true);
-      expect(material.metalness).toBeCloseTo(0.02);
-      expect(material.roughness).toBeCloseTo(0.78);
+      const relation = color === "#fb7185";
+      expect(material.metalness).toBeCloseTo(relation ? 0.36 : 0.22);
+      expect(material.roughness).toBeCloseTo(relation ? 0.4 : 0.58);
     };
 
     renderer.setData(createRenderGraphData(graphFixture, { theme: "dark" }));
