@@ -1281,12 +1281,10 @@ test("keeps a 150-node density graph gently moving at idle and isolates its sele
       && (minimumVisibleMaterialOpacity ?? null) === null
   ))).toBe(true);
   const idleReadableLabels = idle.nodes.filter(({ label }) => label.objectVisible === true);
-  expect(idleReadableLabels.length).toBeLessThanOrEqual(24);
-  expect(idle.nodes.every((node) => (
-    node.label.objectVisible !== true || requiredNodeBody(node).objectVisible === true
-  ))).toBe(true);
+  expect(idleReadableLabels.length).toBe(densityNodeCount);
+  expect(idleReadableLabels.every(({ label }) => label.objectVisible === true)).toBe(true);
   const idleVisibleBodies = idle.nodes.filter((node) => requiredNodeBody(node).objectVisible === true);
-  expect(idleVisibleBodies.length).toBeLessThanOrEqual(48);
+  expect(idleVisibleBodies.length).toBe(densityNodeCount);
   const canvas = await page.getByTestId("graph-canvas").boundingBox();
   if (!canvas) throw new Error("density canvas does not have a measurable bounding box");
   const focusNodeIds = [
@@ -1331,6 +1329,33 @@ test("keeps a 150-node density graph gently moving at idle and isolates its sele
   expect(idleMaxX - idleMinX).toBeGreaterThan(canvas.width * 0.5);
   expect(idleMaxY - idleMinY).toBeGreaterThan(canvas.height * 0.5);
 
+  const queryProjection = idleTelemetry.screenProjection.positions.find(({ id }) => id === "relation:query");
+  if (!queryProjection) throw new Error("The density query node did not have a screen projection.");
+  await page.mouse.move(canvas.x + queryProjection.x, canvas.y + queryProjection.y);
+  await expect.poll(async () => {
+    const hovered = await readTelemetry<ObservedDensityRenderTelemetry>(page, "graph-render-observation");
+    if (hovered.availability !== "observed") return [];
+    return hovered.observation.links.filter(({ objectVisible }) => objectVisible).map(({ id }) => id).sort();
+  }).toEqual([
+    "query-context",
+    "query-evidence",
+    "query-index",
+    "query-model",
+    "query-provider",
+    "query-vector",
+  ]);
+  const hoveredTelemetry = await waitForDensityRenderObservation(page, null);
+  const hoveredLinks = hoveredTelemetry.observation.links.filter(({ objectVisible }) => objectVisible);
+  expect(hoveredLinks.every(({ visual, visibleMaterialOpacities }) => (
+    visual.visible === false && visibleMaterialOpacities.some((opacity) => opacity > 0.6)
+  ))).toBe(true);
+  await page.mouse.move(canvas.x + 12, canvas.y + 12);
+  await expect.poll(async () => {
+    const restored = await readTelemetry<ObservedDensityRenderTelemetry>(page, "graph-render-observation");
+    if (restored.availability !== "observed") return -1;
+    return restored.observation.links.filter(({ objectVisible }) => objectVisible).length;
+  }).toBe(0);
+
   await page.getByTestId("graph-density-selection-relation-query").click();
   const selection = await waitForSelection(page, "density-control");
   expect(selection).toMatchObject({
@@ -1368,16 +1393,10 @@ test("keeps a 150-node density graph gently moving at idle and isolates its sele
 
   const selectedReadableLabels = selected.nodes.filter(({ label }) => label.objectVisible === true);
   const selectedVisibleBodies = selected.nodes.filter((node) => requiredNodeBody(node).objectVisible === true);
-  expect(selectedReadableLabels.length).toBeLessThanOrEqual(24);
-  expect(selectedVisibleBodies.length).toBeLessThanOrEqual(48);
+  expect(selectedReadableLabels.length).toBe(densityNodeCount);
+  expect(selectedVisibleBodies.length).toBe(densityNodeCount);
   expect(selected.nodes.every((node) => (
-    node.label.objectVisible !== true || requiredNodeBody(node).objectVisible === true
-  ))).toBe(true);
-  expect(selected.nodes.some((node) => (
-    node.id.startsWith("concept:density-") && node.label.objectVisible === false
-  ))).toBe(true);
-  expect(selected.nodes.some((node) => (
-    node.id.startsWith("concept:density-") && requiredNodeBody(node).objectVisible === false
+    node.label.objectVisible === true && requiredNodeBody(node).objectVisible === true
   ))).toBe(true);
 
   const visibleLinks = selected.links.filter(({ objectVisible }) => objectVisible === true);
@@ -1449,6 +1468,62 @@ test("opens a density deep-link in the detail rail and clears it back to the ful
   await expect(page.getByTestId("graph-density-detail-panel")).toBeHidden();
   await expect(page).toHaveURL(/\/density$/);
   await waitForDensityRenderObservation(page, null);
+});
+
+test("keeps the desktop density chrome, search route, and rich detail controls addressable", async ({ page }) => {
+  await openDensityFixture(page);
+  await expect(page.getByTestId("density-credit-link")).toHaveAttribute("href", "https://www.aihero.dev/s/dictionary");
+  await expect(page.getByTestId("density-credit-link")).toHaveAttribute("target", "_blank");
+
+  await page.getByTestId("density-search-trigger").click();
+  const searchInput = page.getByTestId("density-search-input");
+  await expect(searchInput).toBeVisible();
+  await searchInput.fill("model");
+  await expect(page).toHaveURL(/\/density\?q=model$/);
+  await expect.poll(async () => readTelemetry<{
+    readonly activeNodeCount?: number;
+  }>(page, "graph-density-ready")).toMatchObject({ activeNodeCount: 1 });
+  await expect(page.getByTestId("density-search-summary")).toContainText("1 TERMS");
+  await expect(page.getByTestId("graph-density-detail-panel")).toBeHidden();
+
+  await page.getByTestId("density-search-clear").click();
+  await expect(page).toHaveURL(/\/density$/);
+  await expect(searchInput).toBeVisible();
+  await page.getByTestId("density-search-close").click();
+  await expect(page.getByTestId("density-search-input")).toBeHidden();
+  await page.getByTestId("density-search-trigger").click();
+  await page.getByTestId("density-search-input").fill("model");
+  await page.getByTestId("density-search-input").press("Escape");
+  await expect(page.getByTestId("density-search-input")).toBeHidden();
+  await expect(page).toHaveURL(/\/density$/);
+
+  await page.getByTestId("density-about-trigger").click();
+  const aboutDialog = page.getByTestId("density-about-dialog");
+  await expect(aboutDialog).toBeVisible();
+  await expect(aboutDialog).toContainText("A living map");
+  await page.getByTestId("density-about-close").click();
+  await expect(aboutDialog).toBeHidden();
+
+  const paletteToggle = page.getByTestId("density-palette-toggle");
+  const soundToggle = page.getByTestId("density-sound-toggle");
+  await expect(paletteToggle).toHaveAttribute("aria-pressed", "false");
+  await paletteToggle.click();
+  await expect(paletteToggle).toHaveAttribute("aria-pressed", "true");
+  await expect(soundToggle).toHaveAttribute("aria-pressed", "false");
+  await soundToggle.click();
+  await expect(soundToggle).toHaveAttribute("aria-pressed", "true");
+
+  await page.goto("/density?term=model-provider-request");
+  await expect(page.getByTestId("graph-density-detail-panel")).toBeVisible();
+  await expect(page.getByTestId("graph-density-detail-panel")).toContainText(/Heard in the wild/i);
+  await page.getByTestId("graph-density-detail-read-more").click();
+  await expect(page.getByTestId("graph-density-detail-read-more")).toHaveText("Show less");
+  await page.getByTestId("graph-density-detail-copy-markdown").click();
+  await expect(page.locator(".detail-action-status")).toContainText(/Markdown copied|Copy unavailable/);
+  await page.getByTestId("graph-density-detail-share").click();
+  await expect(page.locator(".detail-action-status")).toContainText(/Shared|Link copied|Share unavailable/);
+  await page.getByTestId("graph-density-detail-relationship-concept-model").click();
+  await expect(page).toHaveURL(/\/density\?term=concept%3Amodel$/);
 });
 
 test("resolves reference term aliases and restores them through browser history", async ({ page }) => {

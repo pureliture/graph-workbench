@@ -479,7 +479,7 @@ describe("Three.js camera transitions", () => {
     expect(driftLookAt?.z).toBeCloseTo(1, 1);
   });
 
-  it("holds the density body set through an Orbit drag and release", () => {
+  it("keeps every density body and label stable through an Orbit drag and release", () => {
     const denseInput: GraphInput = {
       schemaVersion: 1,
       layout: { seed: "density-visibility-drag-test" },
@@ -506,26 +506,35 @@ describe("Three.js camera transitions", () => {
     const visibleBodyIds = () => renderer.getRenderObservation!().nodes
       .filter((node) => node.body?.objectVisible)
       .map((node) => node.id);
+    const visibleLabelIds = () => renderer.getRenderObservation!().nodes
+      .filter((node) => node.label.objectVisible)
+      .map((node) => node.id);
     const beforeDrag = visibleBodyIds();
-    expect(beforeDrag.length).toBeLessThan(denseInput.nodes.length);
+    const beforeLabels = visibleLabelIds();
+    expect(beforeDrag).toHaveLength(denseInput.nodes.length);
+    expect(beforeLabels).toHaveLength(denseInput.nodes.length);
 
     graph.cameraControls.dispatch("start");
     graph.projectionOffset = { x: 250, y: 220 };
     graph.cameraControls.dispatch("change");
     expect(visibleBodyIds()).toEqual(beforeDrag);
+    expect(visibleLabelIds()).toEqual(beforeLabels);
 
     graph.projectionOffset = { x: -170, y: -120 };
     graph.cameraControls.dispatch("change");
     expect(visibleBodyIds()).toEqual(beforeDrag);
+    expect(visibleLabelIds()).toEqual(beforeLabels);
 
     const projectionCallsBeforeRelease = graph.projectionCalls.length;
     graph.cameraControls.dispatch("end");
     expect(graph.projectionCalls).toHaveLength(projectionCallsBeforeRelease);
     expect(visibleBodyIds()).toEqual(beforeDrag);
+    expect(visibleLabelIds()).toEqual(beforeLabels);
 
     graph.nodeHoverCallback?.(graph.data.nodes[0]!);
     expect(graph.projectionCalls).toHaveLength(projectionCallsBeforeRelease);
     expect(visibleBodyIds()).toEqual(beforeDrag);
+    expect(visibleLabelIds()).toEqual(beforeLabels);
   });
 
   it("projects the current renderer node coordinates into canvas-local screen coordinates", () => {
@@ -598,7 +607,7 @@ describe("Three.js camera transitions", () => {
     expect(secondParticle.screenY).not.toBeNull();
   });
 
-  it("does not resurrect idle relationship lines for an unselected hover", () => {
+  it("shows only dashed incident relationship lines and attracts nearby nodes on an unselected hover", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
@@ -608,13 +617,36 @@ describe("Three.js camera transitions", () => {
     runLatestFrame(0);
 
     const observation = renderer.getRenderObservation!()!;
-    expect(observation.links.every(({ objectVisible, visual }) => (
+    const incidentLinks = observation.links.filter((link) => ["api-web", "release-api"].includes(link.id));
+    const distantLinks = observation.links.filter((link) => !["api-web", "release-api"].includes(link.id));
+    expect(incidentLinks).toHaveLength(2);
+    incidentLinks.forEach((link) => {
+      expect(link.objectVisible).toBe(true);
+      expect(link.visual.visible).toBe(false);
+      expect(link.visibleMaterialOpacities.some((opacity) => opacity > 0.6)).toBe(true);
+    });
+    expect(distantLinks.every(({ objectVisible, visual }) => (
       objectVisible === false && !visual.visible
     ))).toBe(true);
     const ambient = renderer.getAmbientMotionObservation!()!;
     expect(ambient.focusNodeId).toBe("component:api");
     expect(ambient.linkFlow.every(({ active, particleCount }) => !active && particleCount === 0)).toBe(true);
     expect(ambient.particles).toHaveLength(0);
+
+    const api = ambient.renderedNodePositions.find((node) => node.id === "component:api")!;
+    const web = ambient.renderedNodePositions.find((node) => node.id === "component:web")!;
+    const webAnchor = ambient.anchorNodePositions.find((node) => node.id === "component:web")!;
+    expect(web).not.toEqual(webAnchor);
+    expect(Math.hypot(web.x - api.x, web.y - api.y, web.z - api.z))
+      .toBeLessThan(Math.hypot(webAnchor.x - api.x, webAnchor.y - api.y, webAnchor.z - api.z));
+
+    graph.nodeHoverCallback?.(null);
+    runLatestFrame(1_000);
+    const settled = renderer.getAmbientMotionObservation!()!;
+    const settledWeb = settled.renderedNodePositions.find((node) => node.id === "component:web")!;
+    const settledAnchor = settled.anchorNodePositions.find((node) => node.id === "component:web")!;
+    expect(Math.hypot(settledWeb.x - settledAnchor.x, settledWeb.y - settledAnchor.y, settledWeb.z - settledAnchor.z))
+      .toBeLessThan(Math.hypot(web.x - webAnchor.x, web.y - webAnchor.y, web.z - webAnchor.z));
   });
 
   it("keeps default relationship curves shallow without adding a depth bow", () => {

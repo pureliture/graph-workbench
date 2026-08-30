@@ -1,5 +1,5 @@
 import ForceGraph3D from "3d-force-graph";
-import { AmbientLight, BufferGeometry, CapsuleGeometry, CanvasTexture, CircleGeometry, Color, DoubleSide, DirectionalLight, Float32BufferAttribute, Group, Line, LineBasicMaterial, Mesh, MeshBasicMaterial, MeshStandardMaterial, NoColorSpace, Object3D, Quaternion, SphereGeometry, Sprite, SpriteMaterial, Vector3, } from "three";
+import { AmbientLight, BufferGeometry, CapsuleGeometry, CanvasTexture, CircleGeometry, Color, DoubleSide, DirectionalLight, Float32BufferAttribute, Group, Line, LineBasicMaterial, LineDashedMaterial, Mesh, MeshBasicMaterial, MeshStandardMaterial, NoColorSpace, Object3D, Quaternion, SphereGeometry, Sprite, SpriteMaterial, Vector3, } from "three";
 function boundedOpacity(value, fallback) {
     if (!Number.isFinite(value))
         return fallback;
@@ -78,16 +78,12 @@ const LABEL_PROJECTED_READABILITY = Object.freeze({
     minimum: 0.18,
     startsAtPixels: 3,
 });
-// The reference graph keeps the complete topology available, but deliberately
-// limits the amount of concurrently readable text. These are renderer-local
-// presentation budgets: they never remove data, search targets, or keyboard
-// navigation targets from the graph model.
+// The reference graph keeps the complete topology and label set available. The
+// dense selection camera still uses a threshold to decide when a focused
+// one-hop framing is preferable to a full-graph fit, but visibility is never
+// used to remove labels or bodies from the scene.
 const DENSITY_VISIBILITY = Object.freeze({
-    bodyBudget: Object.freeze({ compact: 24, regular: 48 }),
-    bodyCullAtNodeCount: 72,
-    labelBudget: Object.freeze({ compact: 12, regular: 24 }),
-    labelCell: Object.freeze({ compact: { height: 28, width: 112 }, regular: { height: 32, width: 134 } }),
-    labelCullAtNodeCount: 64,
+    selectionFramingAtNodeCount: 64,
 });
 const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 4.8, y: 3.6, z: 1.25 });
 const AMBIENT_NODE_BREATHING = Object.freeze({ x: 1.55, y: 1.85, z: 0.72 });
@@ -96,6 +92,11 @@ const AMBIENT_CAMERA_DRIFT = Object.freeze({ x: 1.1, y: 0.82, z: 0.34 });
 const AMBIENT_MAX_OFFSET = 7;
 const AMBIENT_RADIANS_PER_SECOND = 0.24;
 const ORBIT_DAMPING_FACTOR = 0.08;
+const HOVER_ATTRACTION_RADIUS = 180;
+const HOVER_ATTRACTION_STRENGTH = 0.24;
+const HOVER_PROXIMITY_STRENGTH = 0.08;
+const HOVER_ATTRACTION_MAX_OFFSET = 24;
+const HOVER_ATTRACTION_EASING = 0.18;
 const SELECTION_FOCAL_BOUNDS_BIAS = 0.24;
 const SELECTION_MIN_CAMERA_DISTANCE_RATIO = 0.5;
 const FLOW_SPEED_CYCLES_PER_SECOND = 0.11;
@@ -572,6 +573,24 @@ export function createDefaultGraphLinkObject(link, descriptor) {
         transparent: opacity < 1,
     });
     const line = new Line(geometry, material);
+    // Keep the canonical solid line for selected/ambient flows and layer a
+    // transient dashed child for the reference-style hover cue. Sharing the
+    // geometry means both cues follow the same trimmed curve without giving
+    // hover a second endpoint/positioning path.
+    const hoverMaterial = new LineDashedMaterial({
+        color: defaultLinkColor(descriptor),
+        dashSize: 2.4,
+        depthWrite: false,
+        gapSize: 1.7,
+        linewidth: descriptor?.width ?? 1.1,
+        opacity: 0.82,
+        transparent: true,
+    });
+    const hoverLine = new Line(geometry, hoverMaterial);
+    hoverLine.userData.graphVisualRole = "hover-edge";
+    hoverLine.visible = false;
+    line.add(hoverLine);
+    line.computeLineDistances();
     line.userData.graphLinkId = link.id;
     line.userData.graphDefaultLinkObject = true;
     line.userData.graphCurveBendDirection = stableUnit(`${link.id}:curve`) >= 0.5 ? 1 : -1;
@@ -628,6 +647,7 @@ function updateLinkObject(object, start, end) {
         ? object.userData.graphCurveBendDirection
         : 1;
     writeQuadraticCurve(positions, bendDirection, start, end);
+    object.computeLineDistances();
     object.visible = true;
     object.userData.graphDefaultLinkHasVisibleCurve = true;
     object.geometry.computeBoundingSphere();
@@ -975,6 +995,8 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     let selectionCameraDistanceCeiling = null;
     let transitionTick = null;
     let hoverNodeId = null;
+    let hoverAttractionProgress = 0;
+    let hoverAttractionTarget = 0;
     let ambientElapsedMs = 0;
     let ambientFrameCount = 0;
     let ambientLastTimestamp = null;
@@ -1067,141 +1089,16 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const data = currentData;
         if (!data)
             return;
-        // Density sampling is a settled-state pass. OrbitControls and hover
-        // updates reuse the current membership; re-ranking on those high-frequency
-        // callbacks makes unrelated nodes pop in and out as projected cells cross
-        // the greedy sampler. Explicit data, selection, or viewport updates pass
-        // `force` so the map is rebuilt when the scene itself has changed.
+        // Keep the complete body and label set available. The reference graph
+        // reduces visual weight through depth, opacity, and projected scale; it
+        // never re-ranks nodes into an arbitrary visibility budget while the user
+        // orbits the camera. Retaining this map seam lets scene transitions and
+        // host observations share one stable visibility contract.
         const visibilityMapComplete = densityVisibilityByNodeId.size === data.nodes.length
             && data.nodes.every((node) => densityVisibilityByNodeId.has(node.id));
         if (!force && visibilityMapComplete)
             return;
-        densityVisibilityByNodeId = new Map();
-        const nodeCount = data.nodes.length;
-        const labelsNeedCulling = nodeCount >= DENSITY_VISIBILITY.labelCullAtNodeCount;
-        const bodiesNeedCulling = nodeCount >= DENSITY_VISIBILITY.bodyCullAtNodeCount;
-        if (!labelsNeedCulling && !bodiesNeedCulling) {
-            data.nodes.forEach((node) => densityVisibilityByNodeId.set(node.id, FULL_NODE_DENSITY_VISIBILITY));
-            return;
-        }
-        const viewport = rendererViewport ?? data.selection.viewport;
-        const compact = Math.min(viewport.width, viewport.height) < 600;
-        const selectedNodeId = data.selection.nodeId;
-        const selectedState = selectedNodeId ? ambientNodes.get(selectedNodeId) : null;
-        const protectedNodeIds = new Set([
-            ...(selectedNodeId ? [selectedNodeId] : []),
-            ...data.selection.neighborNodeIds,
-            ...(hoverNodeId ? [hoverNodeId] : []),
-            ...(currentPresentation.focusNodeId ? [currentPresentation.focusNodeId] : []),
-            ...[...ambientNodes.values()].filter((state) => state.isMaster).map((state) => state.id),
-        ]);
-        const camera = cameraPose();
-        const margin = compact ? 18 : 28;
-        const candidates = data.nodes.map((node) => {
-            const state = ambientNodes.get(node.id);
-            const position = state
-                ? { x: state.renderedX, y: state.renderedY, z: state.renderedZ }
-                : nodePosition(node);
-            const projection = position
-                ? graph.graph2ScreenCoords(position.x, position.y, position.z)
-                : { x: Number.NaN, y: Number.NaN };
-            const projected = Number.isFinite(projection.x) && Number.isFinite(projection.y);
-            const inViewport = projected
-                && projection.x >= -margin
-                && projection.x <= viewport.width + margin
-                && projection.y >= -margin
-                && projection.y <= viewport.height + margin;
-            const screenCenterDistance = projected
-                ? Math.hypot(projection.x - (viewport.width / 2), projection.y - (viewport.height / 2))
-                : Infinity;
-            const cameraDistance = position
-                ? Math.hypot(position.x - camera.position.x, position.y - camera.position.y, position.z - camera.position.z)
-                : Infinity;
-            const selectedDistance = position && selectedState
-                ? Math.hypot(position.x - selectedState.renderedX, position.y - selectedState.renderedY, position.z - selectedState.renderedZ)
-                : 0;
-            return {
-                cameraDistance,
-                id: node.id,
-                inViewport,
-                projected,
-                screenCenterDistance,
-                selectedDistance,
-                x: projection.x,
-                y: projection.y,
-            };
-        });
-        const backgroundCandidates = candidates
-            .filter((candidate) => !protectedNodeIds.has(candidate.id))
-            .sort((left, right) => {
-            const viewportDifference = Number(right.inViewport) - Number(left.inViewport);
-            if (viewportDifference !== 0)
-                return viewportDifference;
-            if (selectedNodeId !== null) {
-                const selectedDifference = left.selectedDistance - right.selectedDistance;
-                if (Math.abs(selectedDifference) > AMBIENT_VISUAL_EPSILON)
-                    return selectedDifference;
-            }
-            const centerDifference = left.screenCenterDistance - right.screenCenterDistance;
-            if (Math.abs(centerDifference) > AMBIENT_VISUAL_EPSILON)
-                return centerDifference;
-            const cameraDifference = left.cameraDistance - right.cameraDistance;
-            if (Math.abs(cameraDifference) > AMBIENT_VISUAL_EPSILON)
-                return cameraDifference;
-            return left.id.localeCompare(right.id);
-        });
-        const selectBackground = (budget, cell, candidatePool = backgroundCandidates) => {
-            const selected = new Set();
-            const occupiedCells = new Set();
-            const selectedCandidates = [];
-            const center = { x: viewport.width / 2, y: viewport.height / 2 };
-            while (selected.size < budget) {
-                let best = null;
-                let bestScore = -Infinity;
-                for (const candidate of candidatePool) {
-                    if (selected.has(candidate.id) || !candidate.inViewport || !candidate.projected)
-                        continue;
-                    const cellKey = `${Math.floor(candidate.x / cell.width)}:${Math.floor(candidate.y / cell.height)}`;
-                    if (occupiedCells.has(cellKey))
-                        continue;
-                    const separation = selectedCandidates.length === 0
-                        ? Math.hypot(candidate.x - center.x, candidate.y - center.y)
-                        : Math.min(...selectedCandidates.map((selectedCandidate) => (Math.hypot(candidate.x - selectedCandidate.x, candidate.y - selectedCandidate.y))));
-                    if (separation > bestScore + AMBIENT_VISUAL_EPSILON
-                        || (Math.abs(separation - bestScore) <= AMBIENT_VISUAL_EPSILON
-                            && (best === null || candidate.id.localeCompare(best.id) < 0))) {
-                        best = candidate;
-                        bestScore = separation;
-                    }
-                }
-                if (!best)
-                    break;
-                const cellKey = `${Math.floor(best.x / cell.width)}:${Math.floor(best.y / cell.height)}`;
-                occupiedCells.add(cellKey);
-                selectedCandidates.push(best);
-                selected.add(best.id);
-            }
-            return selected;
-        };
-        const bodyBackground = bodiesNeedCulling
-            ? selectBackground(Math.max(0, (compact ? DENSITY_VISIBILITY.bodyBudget.compact : DENSITY_VISIBILITY.bodyBudget.regular)
-                - protectedNodeIds.size), compact ? { height: 38, width: 38 } : { height: 50, width: 50 })
-            : new Set(backgroundCandidates.map((candidate) => candidate.id));
-        // A label without its body reads as a floating orphan in a dense scene.
-        // Sample labels from the already visible body subset so the two budgets
-        // can differ without breaking node/label pairing.
-        const labelCandidates = backgroundCandidates.filter((candidate) => bodyBackground.has(candidate.id));
-        const labelBackground = labelsNeedCulling
-            ? selectBackground(Math.max(0, (compact ? DENSITY_VISIBILITY.labelBudget.compact : DENSITY_VISIBILITY.labelBudget.regular)
-                - protectedNodeIds.size), compact ? DENSITY_VISIBILITY.labelCell.compact : DENSITY_VISIBILITY.labelCell.regular, labelCandidates)
-            : new Set(labelCandidates.map((candidate) => candidate.id));
-        data.nodes.forEach((node) => {
-            const protectedNode = protectedNodeIds.has(node.id);
-            densityVisibilityByNodeId.set(node.id, {
-                bodyVisible: protectedNode || bodyBackground.has(node.id),
-                labelVisible: protectedNode || labelBackground.has(node.id),
-            });
-        });
+        densityVisibilityByNodeId = new Map(data.nodes.map((node) => [node.id, FULL_NODE_DENSITY_VISIBILITY]));
     }
     graph
         .backgroundColor("#08111f")
@@ -1262,6 +1159,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         .onNodeClick((node) => callbacks.onNodeClick(node.id))
         .onNodeHover((node) => {
         hoverNodeId = node?.id ?? null;
+        hoverAttractionTarget = hoverNodeId !== null && currentData?.selection.nodeId === null ? 1 : 0;
         if (currentData)
             applyFinalVisuals(currentData);
         applyAmbientVisuals();
@@ -1339,7 +1237,9 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const object = renderedLinkObjects.get(link.id);
         if (!object || object.userData.graphLinkId !== link.id)
             return;
-        setObjectMaterialColor(object, linkDescriptor(link).color ?? themePalette(currentPresentation.theme).edge);
+        const color = linkDescriptor(link).color ?? themePalette(currentPresentation.theme).edge;
+        setObjectMaterialColor(object, color);
+        setObjectMaterialColor(graphChildWithRole(object, "hover-edge"), color);
     }
     function applyParticlePalette() {
         // Tokens share the restrained edge tone, rather than a white highlight,
@@ -1403,9 +1303,20 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const nextObject = object instanceof Line && object.userData.graphDefaultLinkObject === true
             ? object
             : null;
-        if (state.object === nextObject)
+        if (state.object === nextObject) {
+            if (!state.hoverLine && nextObject) {
+                const candidate = graphChildWithRole(nextObject, "hover-edge");
+                state.hoverLine = candidate instanceof Line ? candidate : null;
+            }
             return;
+        }
         state.object = nextObject;
+        state.hoverLine = state.object
+            ? (() => {
+                const candidate = graphChildWithRole(state.object, "hover-edge");
+                return candidate instanceof Line ? candidate : null;
+            })()
+            : null;
         state.material = null;
         state.lastOpacity = Number.NaN;
         state.lastWidth = Number.NaN;
@@ -1487,6 +1398,24 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             material.linewidth = width;
             state.lastWidth = width;
         }
+    }
+    function hoverLineFor(state) {
+        return state.hoverLine;
+    }
+    function applyHoverLineVisual(state, visible, opacity, width) {
+        const line = hoverLineFor(state);
+        if (!line)
+            return;
+        if (line.visible !== visible)
+            line.visible = visible;
+        const material = line.material;
+        if (!(material instanceof LineDashedMaterial))
+            return;
+        if (changedAmbientVisualValue(material.opacity, opacity))
+            material.opacity = opacity;
+        if (changedAmbientVisualValue(material.linewidth, width))
+            material.linewidth = width;
+        ensureAmbientTransparency(material, true);
     }
     function applyNodeVisual(node, opacity, scale, rimOpacity, bodyVisible, labelVisible, labelOpacity, labelScale) {
         const object = renderedNodeObjects.get(node.id);
@@ -1577,6 +1506,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 id: link.id,
                 link,
                 object: object instanceof Line && object.userData.graphDefaultLinkObject === true ? object : null,
+                hoverLine: null,
                 material: null,
                 lastOpacity: Number.NaN,
                 lastWidth: Number.NaN,
@@ -1604,10 +1534,28 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     }
     function updateAmbientNodePositions() {
         const motionEnabled = ambientMotionEnabled();
+        const hoverMotionEnabled = motionEnabled
+            && currentData?.selection.nodeId === null
+            && hoverNodeId !== null;
+        hoverAttractionTarget = hoverMotionEnabled ? 1 : 0;
+        hoverAttractionProgress += (hoverAttractionTarget - hoverAttractionProgress) * HOVER_ATTRACTION_EASING;
+        if (Math.abs(hoverAttractionProgress - hoverAttractionTarget) <= 0.001) {
+            hoverAttractionProgress = hoverAttractionTarget;
+        }
         const phase = (ambientElapsedMs / 1000) * AMBIENT_RADIANS_PER_SECOND;
         const commonX = motionEnabled ? Math.sin(phase) * AMBIENT_COMMON_FLOAT.x : 0;
         const commonY = motionEnabled ? Math.cos(phase * 0.91) * AMBIENT_COMMON_FLOAT.y : 0;
         const commonZ = motionEnabled ? Math.sin(phase * 0.57) * AMBIENT_COMMON_FLOAT.z : 0;
+        const hoverFocus = hoverMotionEnabled && hoverNodeId ? ambientNodes.get(hoverNodeId) ?? null : null;
+        const hoverNeighborIds = new Set();
+        if (hoverFocus && currentData) {
+            currentData.links.forEach((link) => {
+                if (link.source === hoverFocus.id)
+                    hoverNeighborIds.add(link.target);
+                if (link.target === hoverFocus.id)
+                    hoverNeighborIds.add(link.source);
+            });
+        }
         for (const state of ambientNodes.values()) {
             const anchor = state.node;
             if (!Number.isFinite(anchor.x) || !Number.isFinite(anchor.y) || !Number.isFinite(anchor.z))
@@ -1621,9 +1569,27 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const breathingY = motionEnabled ? Math.cos(breathingPhase * 1.13) * AMBIENT_NODE_BREATHING.y : 0;
             const breathingZ = motionEnabled ? Math.sin(breathingPhase * 0.67) * AMBIENT_NODE_BREATHING.z : 0;
             if (state.object?.userData.graphDefaultNodeObject === true) {
-                state.renderedX = state.anchorX + commonX + breathingX;
-                state.renderedY = state.anchorY + commonY + breathingY;
-                state.renderedZ = state.anchorZ + commonZ + breathingZ;
+                let attractionX = 0;
+                let attractionY = 0;
+                let attractionZ = 0;
+                if (hoverFocus && state.id !== hoverFocus.id && hoverAttractionProgress > 0) {
+                    const deltaX = hoverFocus.anchorX - state.anchorX;
+                    const deltaY = hoverFocus.anchorY - state.anchorY;
+                    const deltaZ = hoverFocus.anchorZ - state.anchorZ;
+                    const distance = Math.hypot(deltaX, deltaY, deltaZ);
+                    const proximity = Math.max(0, 1 - (distance / HOVER_ATTRACTION_RADIUS));
+                    const factor = hoverNeighborIds.has(state.id)
+                        ? HOVER_ATTRACTION_STRENGTH
+                        : proximity * HOVER_PROXIMITY_STRENGTH;
+                    const appliedDistance = Math.min(HOVER_ATTRACTION_MAX_OFFSET, distance * factor * hoverAttractionProgress);
+                    const scale = distance > 0 ? appliedDistance / distance : 0;
+                    attractionX = deltaX * scale;
+                    attractionY = deltaY * scale;
+                    attractionZ = deltaZ * scale * 0.45;
+                }
+                state.renderedX = state.anchorX + commonX + breathingX + attractionX;
+                state.renderedY = state.anchorY + commonY + breathingY + attractionY;
+                state.renderedZ = state.anchorZ + commonZ + breathingZ + attractionZ;
                 state.object.position.set(state.renderedX, state.renderedY, state.renderedZ);
             }
             else {
@@ -2024,6 +1990,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             return true;
         }
         writeQuadraticCurve(positions, bendDirection, start, end, startProgress, endProgress);
+        object.computeLineDistances();
         object.visible = true;
         object.userData.graphDefaultLinkHasVisibleCurve = true;
         object.geometry.computeBoundingSphere();
@@ -2058,7 +2025,10 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         // its geometry refresh from resurrecting an idle hidden edge while still
         // updating endpoints for boundary telemetry and future focus/selection.
         if (canonicalLink && object.userData.graphDefaultLinkObject === true) {
-            object.visible = canonicalLink.visual.visible
+            const hoverIncident = currentData?.selection.nodeId === null
+                && hoverNodeId !== null
+                && (canonicalLink.source === hoverNodeId || canonicalLink.target === hoverNodeId);
+            object.visible = (canonicalLink.visual.visible || hoverIncident)
                 && object.userData.graphDefaultLinkHasVisibleCurve !== false;
         }
         return updated;
@@ -2103,26 +2073,42 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const incident = hasFocus && (state.link.source === focusNodeId || state.link.target === focusNodeId);
             const idleFlow = !hasFocus && state.ambientFlow;
             const selectedFocus = focusNodeId !== null && currentData?.selection.nodeId === focusNodeId;
+            const hoverFocus = !selectedFocus
+                && currentData?.selection.nodeId === null
+                && hoverNodeId !== null
+                && hoverNodeId === focusNodeId;
+            const hoverIncident = Boolean(hoverFocus && incident);
             const liveObject = renderedLinkObjects.get(state.id);
             refreshAmbientLinkObject(state, liveObject ?? null);
-            // Idle and hover share the same quiet relationship tier. Only an actual
-            // selection owns a durable visible-link cue; node hover may still
-            // brighten the focused body/label without resurrecting its edges.
-            const linkVisible = state.link.visual.visible;
-            state.active = Boolean(linkVisible && (incident || idleFlow) && state.object && ambientMotionEnabled());
+            // Selection owns the solid incident relationship flow. Hover is a
+            // transient, non-routing cue: only its incident edges become visible,
+            // rendered as a dashed child while the canonical link remains hidden.
+            const linkVisible = state.link.visual.visible || hoverIncident;
+            state.active = Boolean(linkVisible && ((selectedFocus && incident) || idleFlow) && state.object && ambientMotionEnabled());
             state.particleCount = 0;
             if (!source || !target || !state.object)
                 continue;
             updateLinkObjectFromWorldEndpoints(state.object, actualNodeWorldPosition(source), actualNodeWorldPosition(target), source, target);
             state.object.visible = linkVisible && state.object.userData.graphDefaultLinkHasVisibleCurve !== false;
-            if (!linkVisible)
+            if (!linkVisible) {
+                applyHoverLineVisual(state, false, 0, state.baseWidth);
                 continue;
+            }
             if (state.object.userData.graphDefaultLinkHasVisibleCurve !== true) {
                 state.active = false;
+                applyHoverLineVisual(state, false, 0, state.baseWidth);
                 continue;
             }
             let opacity;
             let width;
+            if (hoverIncident) {
+                // Hide the solid material while keeping the parent line attached so
+                // the dashed child follows the exact same curve and depth test.
+                applyAmbientDefaultLinkVisual(state, 0, state.baseWidth);
+                applyHoverLineVisual(state, true, 0.82, Math.max(1.05, state.baseWidth));
+                continue;
+            }
+            applyHoverLineVisual(state, false, 0, state.baseWidth);
             if (incident) {
                 opacity = Math.max(selectedFocus ? 0.58 : 0.46, state.baseOpacity);
                 width = Math.max(selectedFocus ? 1.18 : 1.02, state.baseWidth);
@@ -2716,7 +2702,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             return null;
         const data = currentData;
         const focalPoint = nodePosition(focused);
-        const focusedDensityFraming = data.nodes.length >= DENSITY_VISIBILITY.labelCullAtNodeCount;
+        const focusedDensityFraming = data.nodes.length >= DENSITY_VISIBILITY.selectionFramingAtNodeCount;
         const focusNodeIds = focusedDensityFraming
             ? new Set([nodeId, ...data.selection.neighborNodeIds])
             : new Set(data.nodes.map((node) => node.id));
