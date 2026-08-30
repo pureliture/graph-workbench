@@ -608,6 +608,8 @@ export function DenseGraphFixture() {
   const workbenchRef = useRef<GraphWorkbench | null>(null);
   const initialTermAppliedRef = useRef(false);
   const selectionNodeIdRef = useRef<string | null>(null);
+  const hoverNodeIdRef = useRef<string | null>(null);
+  const hoverReleasePendingRef = useRef(false);
   const settledGraphFitRef = useRef(false);
   const [rendererStatus, setRendererStatus] = useState<RendererStatus>("pending");
   const [webglStatus, setWebglStatus] = useState<WebglStatus>("pending");
@@ -668,8 +670,13 @@ export function DenseGraphFixture() {
               setRendererReason(null);
             }
           },
-          onNodeHover: () => {
+          onNodeHover: ({ nodeId }) => {
             if (disposed) return;
+            if (hoverNodeIdRef.current !== null && nodeId === null) {
+              hoverReleasePendingRef.current = true;
+            }
+            if (nodeId !== null) hoverReleasePendingRef.current = false;
+            hoverNodeIdRef.current = nodeId;
             setRenderTelemetry({
               availability: "pending",
               reason: "Waiting for the current density hover observation.",
@@ -844,6 +851,9 @@ export function DenseGraphFixture() {
           && observation.links.length === densityInput.links.length
           && observation.nodes.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)
           && observation.links.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)
+          && (!hoverReleasePendingRef.current || observation.links.every(({ objectVisible, visual }) => (
+            !objectVisible || visual.visible
+          )))
           && (!transition || (!transition.active && transition.progress === 1));
         if (complete) {
           if (!settledFitRequested && selectionNodeIdRef.current === null) {
@@ -866,6 +876,7 @@ export function DenseGraphFixture() {
             screenProjection: densityScreenProjection(workbenchRef.current!),
             selectionNodeId: selectionNodeIdRef.current,
           });
+          hoverReleasePendingRef.current = false;
           return;
         }
       } catch (error) {

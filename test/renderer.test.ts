@@ -537,6 +537,52 @@ describe("Three.js camera transitions", () => {
     expect(visibleLabelIds()).toEqual(beforeLabels);
   });
 
+  it("makes camera-facing depth visibly re-rank node and label exposure", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const input: GraphInput = {
+      schemaVersion: 1,
+      layout: { seed: "camera-exposure" },
+      nodes: [
+        {
+          id: "positive",
+          type: "component",
+          kind: "service",
+          label: "Positive",
+          layoutHint: { pinned: true, x: 110, y: 0, z: 0 },
+        },
+        {
+          id: "negative",
+          type: "component",
+          kind: "service",
+          label: "Negative",
+          layoutHint: { pinned: true, x: -110, y: 0, z: 0 },
+        },
+      ],
+      links: [],
+    };
+    renderer.setData(createRenderGraphData(input, { ambientMotion: false }));
+    graph.pose = {
+      lookAt: { x: 0, y: 0, z: 0 },
+      position: { x: 300, y: 0, z: 0 },
+    };
+    graph.cameraControls.dispatch("change");
+    const rotated = renderer.getRenderObservation!()!;
+    const positive = rotated.nodes.find((node) => node.id === "positive")!;
+    const negative = rotated.nodes.find((node) => node.id === "negative")!;
+
+    expect(positive.minimumVisibleMaterialOpacity).toBeGreaterThan(
+      (negative.minimumVisibleMaterialOpacity ?? 0) + 0.55,
+    );
+    expect(positive.label.minimumVisibleMaterialOpacity).toBeGreaterThan(
+      (negative.label.minimumVisibleMaterialOpacity ?? 0) + 0.55,
+    );
+    expect(positive.worldScale!.x).toBeGreaterThan(negative.worldScale!.x);
+    expect(positive.label.scale!.x).toBeGreaterThan(negative.label.scale!.x);
+  });
+
   it("projects the current renderer node coordinates into canvas-local screen coordinates", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
@@ -647,6 +693,113 @@ describe("Three.js camera transitions", () => {
     const settledAnchor = settled.anchorNodePositions.find((node) => node.id === "component:web")!;
     expect(Math.hypot(settledWeb.x - settledAnchor.x, settledWeb.y - settledAnchor.y, settledWeb.z - settledAnchor.z))
       .toBeLessThan(Math.hypot(web.x - webAnchor.x, web.y - webAnchor.y, web.z - webAnchor.z));
+  });
+
+  it("keeps hover attraction active while a selection is open", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const input: GraphInput = {
+      schemaVersion: 1,
+      layout: { seed: "selected-hover-attraction" },
+      nodes: [
+        {
+          id: "focus",
+          type: "relation",
+          kind: "workflow",
+          label: "Focus",
+          layoutHint: { pinned: true, x: 0, y: 0, z: 0 },
+        },
+        {
+          id: "hover",
+          type: "component",
+          kind: "service",
+          label: "Hover",
+          layoutHint: { pinned: true, x: 120, y: 0, z: 0 },
+        },
+      ],
+      links: [{ id: "focus-hover", source: "focus", target: "hover", relationKind: "connects" }],
+    };
+    renderer.setData(createRenderGraphData(input, { selectedNodeIds: ["focus"] }));
+    runLatestFrame(0);
+    const before = renderer.getAmbientMotionObservation!()!;
+    const beforeFocus = before.renderedNodePositions.find((node) => node.id === "focus")!;
+    const beforeHover = before.renderedNodePositions.find((node) => node.id === "hover")!;
+    const beforeDistance = Math.hypot(
+      beforeFocus.x - beforeHover.x,
+      beforeFocus.y - beforeHover.y,
+      beforeFocus.z - beforeHover.z,
+    );
+
+    graph.nodeHoverCallback?.(graph.data.nodes.find((node) => node.id === "hover")!);
+    // Keep the same timestamp so breathing/common drift cannot mask the
+    // transient attraction delta under test.
+    runLatestFrame(0);
+    const after = renderer.getAmbientMotionObservation!()!;
+    const afterFocus = after.renderedNodePositions.find((node) => node.id === "focus")!;
+    const afterHover = after.renderedNodePositions.find((node) => node.id === "hover")!;
+    const afterDistance = Math.hypot(
+      afterFocus.x - afterHover.x,
+      afterFocus.y - afterHover.y,
+      afterFocus.z - afterHover.z,
+    );
+
+    expect(afterDistance).toBeLessThan(beforeDistance - 1);
+  });
+
+  it("eases hover release across an interaction-sized transition window", () => {
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    const input: GraphInput = {
+      schemaVersion: 1,
+      layout: { seed: "hover-release-easing" },
+      nodes: [
+        {
+          id: "focus",
+          type: "relation",
+          kind: "workflow",
+          label: "Focus",
+          layoutHint: { pinned: true, x: 0, y: 0, z: 0 },
+        },
+        {
+          id: "hover",
+          type: "component",
+          kind: "service",
+          label: "Hover",
+          layoutHint: { pinned: true, x: 120, y: 0, z: 0 },
+        },
+      ],
+      links: [{ id: "focus-hover", source: "focus", target: "hover", relationKind: "connects" }],
+    };
+    renderer.setData(createRenderGraphData(input, {}));
+    runLatestFrame(0);
+    const distance = () => {
+      const observation = renderer.getAmbientMotionObservation!()!;
+      const focus = observation.renderedNodePositions.find((node) => node.id === "focus")!;
+      const hover = observation.renderedNodePositions.find((node) => node.id === "hover")!;
+      return Math.hypot(focus.x - hover.x, focus.y - hover.y, focus.z - hover.z);
+    };
+    const idleDistance = distance();
+    graph.nodeHoverCallback?.(graph.data.nodes.find((node) => node.id === "hover")!);
+    runLatestFrame(0);
+    const hoveredDistance = distance();
+
+    graph.nodeHoverCallback?.(null);
+    const immediateReleaseDistance = distance();
+    runLatestFrame(120);
+    const midReleaseDistance = distance();
+    runLatestFrame(420);
+    const settledDistance = distance();
+
+    expect(hoveredDistance).toBeLessThan(idleDistance - 1);
+    // Pointer-up should leave the attraction in place for the first frames,
+    // then progressively restore the idle spacing instead of snapping.
+    expect(immediateReleaseDistance).toBeLessThan(idleDistance - 1);
+    expect(midReleaseDistance).toBeLessThan(idleDistance - 1);
+    expect(settledDistance).toBeGreaterThan(midReleaseDistance);
   });
 
   it("keeps default relationship curves shallow without adding a depth bow", () => {

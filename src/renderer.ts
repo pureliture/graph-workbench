@@ -210,10 +210,12 @@ const AMBIENT_MAX_OFFSET = 7;
 const AMBIENT_RADIANS_PER_SECOND = 0.24;
 const ORBIT_DAMPING_FACTOR = 0.08;
 const HOVER_ATTRACTION_RADIUS = 180;
-const HOVER_ATTRACTION_STRENGTH = 0.24;
-const HOVER_PROXIMITY_STRENGTH = 0.08;
-const HOVER_ATTRACTION_MAX_OFFSET = 24;
-const HOVER_ATTRACTION_EASING = 0.18;
+const HOVER_ATTRACTION_STRENGTH = 0.32;
+const HOVER_PROXIMITY_STRENGTH = 0.12;
+const HOVER_ATTRACTION_MAX_OFFSET = 32;
+const HOVER_ATTRACTION_ENTER_DURATION_MS = 180;
+const HOVER_ATTRACTION_RELEASE_DURATION_MS = 360;
+const HOVER_ATTRACTION_FRAME_START_MS = 16;
 const SELECTION_FOCAL_BOUNDS_BIAS = 0.24;
 const SELECTION_MIN_CAMERA_DISTANCE_RATIO = 0.5;
 const FLOW_SPEED_CYCLES_PER_SECOND = 0.11;
@@ -237,7 +239,7 @@ const DEFAULT_LINK_BOUNDARY_PROBE_PROGRESS = 2 / (
 );
 const AMBIENT_VISUAL_EPSILON = 0.0001;
 const AMBIENT_MASTER_BODY_OPACITY_FLOOR = 0.5;
-const AMBIENT_MASTER_LABEL_OPACITY_FLOOR = 0.5;
+const AMBIENT_MASTER_LABEL_OPACITY_FLOOR = 0.62;
 // The previous far tier disappears against a white canvas. Keep light-mode
 // context readable without approaching selected or incident emphasis.
 const LIGHT_SELECTED_CONTEXT_FLOOR = Object.freeze({
@@ -249,13 +251,13 @@ const LIGHT_SELECTED_CONTEXT_FLOOR = Object.freeze({
 // The initial field needs enough mass to establish the graph before a user
 // selects anything. These values retain a visibly softer far tier without
 // making routine-harness's type palette disappear into the dark canvas.
-const IDLE_BODY_OPACITY = Object.freeze({ far: 0.46, nearRange: 0.3 });
-const IDLE_LABEL_OPACITY = Object.freeze({ far: 0.28, nearRange: 0.46 });
+const IDLE_BODY_OPACITY = Object.freeze({ far: 0.18, nearRange: 0.78 });
+const IDLE_LABEL_OPACITY = Object.freeze({ far: 0.08, nearRange: 0.82 });
 // The quiet field needs to remain independently legible before focus, while
 // still leaving a clear gap to the selected relationship tier (0.58+).
 const IDLE_LINK_OPACITY = Object.freeze({ maximum: 0.28, minimum: 0.22 });
-const IDLE_NODE_SCALE = Object.freeze({ far: 0.86, nearRange: 0.28 });
-const IDLE_LABEL_SCALE = Object.freeze({ far: 0.8, nearRange: 0.2 });
+const IDLE_NODE_SCALE = Object.freeze({ far: 0.64, nearRange: 0.48 });
+const IDLE_LABEL_SCALE = Object.freeze({ far: 0.54, nearRange: 0.44 });
 
 function smoothstep(progress: number): number {
   const bounded = Math.max(0, Math.min(1, progress));
@@ -999,6 +1001,11 @@ function easeInOutCubic(progress: number): number {
     : 1 - (((-2 * bounded) + 2) ** 3) / 2;
 }
 
+function easeOutCubic(progress: number): number {
+  const bounded = Math.min(1, Math.max(0, progress));
+  return 1 - ((1 - bounded) ** 3);
+}
+
 function interpolatePose(start: CameraPose, end: CameraPose, progress: number): CameraPose {
   const eased = easeInOutCubic(progress);
   return {
@@ -1472,8 +1479,12 @@ export function createThreeForceGraphRenderer({
   let selectionCameraDistanceCeiling: { readonly distance: number; readonly nodeId: string } | null = null;
   let transitionTick: ((timestamp: number) => void) | null = null;
   let hoverNodeId: string | null = null;
+  let hoverAttractionFocusNodeId: string | null = null;
   let hoverAttractionProgress = 0;
   let hoverAttractionTarget = 0;
+  let hoverAttractionTransitionStart = 0;
+  let hoverAttractionTransitionElapsedMs = 0;
+  let hoverAttractionLastElapsedMs: number | null = null;
   let ambientElapsedMs = 0;
   let ambientFrameCount = 0;
   let ambientLastTimestamp: number | null = null;
@@ -1644,7 +1655,9 @@ export function createThreeForceGraphRenderer({
     .onNodeClick((node) => callbacks.onNodeClick(node.id))
     .onNodeHover((node) => {
       hoverNodeId = node?.id ?? null;
-      hoverAttractionTarget = hoverNodeId !== null && currentData?.selection.nodeId === null ? 1 : 0;
+      // Hover is a transient layer over the current scene. A selection keeps
+      // its rail and one-hop framing, but it must not disable the local pull
+      // and incident-edge cue around the node under the pointer.
       if (currentData) applyFinalVisuals(currentData);
       applyAmbientVisuals();
       ensureMotionFrame();
@@ -1918,6 +1931,11 @@ export function createThreeForceGraphRenderer({
     return state.hoverLine;
   }
 
+  function activeHoverNodeId(): string | null {
+    if (hoverNodeId !== null) return hoverNodeId;
+    return hoverAttractionProgress > 0 ? hoverAttractionFocusNodeId : null;
+  }
+
   function applyHoverLineVisual(
     state: AmbientLinkState,
     visible: boolean,
@@ -2063,19 +2081,57 @@ export function createThreeForceGraphRenderer({
 
   function updateAmbientNodePositions(): void {
     const motionEnabled = ambientMotionEnabled();
-    const hoverMotionEnabled = motionEnabled
-      && currentData?.selection.nodeId === null
-      && hoverNodeId !== null;
-    hoverAttractionTarget = hoverMotionEnabled ? 1 : 0;
-    hoverAttractionProgress += (hoverAttractionTarget - hoverAttractionProgress) * HOVER_ATTRACTION_EASING;
-    if (Math.abs(hoverAttractionProgress - hoverAttractionTarget) <= 0.001) {
-      hoverAttractionProgress = hoverAttractionTarget;
+    const hoverMotionEnabled = motionEnabled && hoverNodeId !== null;
+    if (hoverNodeId !== null) hoverAttractionFocusNodeId = hoverNodeId;
+    const nextHoverAttractionTarget = hoverMotionEnabled ? 1 : 0;
+    if (nextHoverAttractionTarget !== hoverAttractionTarget) {
+      hoverAttractionTarget = nextHoverAttractionTarget;
+      hoverAttractionTransitionStart = hoverAttractionProgress;
+      hoverAttractionTransitionElapsedMs = 0;
+    }
+    const elapsedDelta = hoverAttractionLastElapsedMs === null
+      ? HOVER_ATTRACTION_FRAME_START_MS
+      : Math.max(0, ambientElapsedMs - hoverAttractionLastElapsedMs);
+    hoverAttractionLastElapsedMs = ambientElapsedMs;
+    if (hoverAttractionProgress !== hoverAttractionTarget) {
+      const durationMs = hoverAttractionTarget === 1
+        ? HOVER_ATTRACTION_ENTER_DURATION_MS
+        : HOVER_ATTRACTION_RELEASE_DURATION_MS;
+      // `applyAmbientVisuals` also runs synchronously from pointer callbacks,
+      // before the next RAF has a timestamp. Give that first frame a nominal
+      // 16ms step, then use the real elapsed time so release speed is stable
+      // across refresh rates rather than snapping back in a few frames.
+      const transitionDelta = elapsedDelta > 0
+        ? elapsedDelta
+        : hoverAttractionTransitionElapsedMs === 0
+          ? HOVER_ATTRACTION_FRAME_START_MS
+          : 0;
+      hoverAttractionTransitionElapsedMs = Math.min(
+        durationMs,
+        hoverAttractionTransitionElapsedMs + transitionDelta,
+      );
+      const transitionProgress = hoverAttractionTransitionElapsedMs / durationMs;
+      const easedProgress = hoverAttractionTarget === 0
+        ? easeInOutCubic(transitionProgress)
+        : easeOutCubic(transitionProgress);
+      hoverAttractionProgress = interpolate(
+        hoverAttractionTransitionStart,
+        hoverAttractionTarget,
+        easedProgress,
+      );
+      if (transitionProgress >= 1) hoverAttractionProgress = hoverAttractionTarget;
+    }
+    if (hoverAttractionTarget === 0 && hoverAttractionProgress <= 0.001) {
+      hoverAttractionProgress = 0;
+      hoverAttractionFocusNodeId = null;
     }
     const phase = (ambientElapsedMs / 1000) * AMBIENT_RADIANS_PER_SECOND;
     const commonX = motionEnabled ? Math.sin(phase) * AMBIENT_COMMON_FLOAT.x : 0;
     const commonY = motionEnabled ? Math.cos(phase * 0.91) * AMBIENT_COMMON_FLOAT.y : 0;
     const commonZ = motionEnabled ? Math.sin(phase * 0.57) * AMBIENT_COMMON_FLOAT.z : 0;
-    const hoverFocus = hoverMotionEnabled && hoverNodeId ? ambientNodes.get(hoverNodeId) ?? null : null;
+    const hoverFocus = hoverAttractionFocusNodeId && hoverAttractionProgress > 0
+      ? ambientNodes.get(hoverAttractionFocusNodeId) ?? null
+      : null;
     const hoverNeighborIds = new Set<string>();
     if (hoverFocus && currentData) {
       currentData.links.forEach((link) => {
@@ -2236,7 +2292,7 @@ export function createThreeForceGraphRenderer({
         : neighbor || focused
           ? 0.7 + (near * 0.24)
           : selectedNodeId
-            ? 0.14 + (near * 0.31)
+            ? 0.08 + (near * 0.52)
             : IDLE_BODY_OPACITY.far + (near * IDLE_BODY_OPACITY.nearRange);
       const opacity = Math.max(
         node.visual.opacityFloor,
@@ -2250,11 +2306,11 @@ export function createThreeForceGraphRenderer({
       const baseLabelOpacity = selected
         ? 1
         : neighbor || focused || hovered
-          ? 0.68 + (near * 0.2)
+            ? 0.68 + (near * 0.2)
           : master
             ? Math.max(AMBIENT_MASTER_LABEL_OPACITY_FLOOR, 0.32 + (near * 0.26))
             : selectedNodeId
-              ? 0.02 + (near * 0.24)
+              ? 0.03 + (near * 0.52)
               : IDLE_LABEL_OPACITY.far + (near * IDLE_LABEL_OPACITY.nearRange);
       const contextLabelOpacity = lightSelectedContext && !selected && !neighbor && !focused && !hovered
         ? Math.max(baseLabelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity)
@@ -2264,7 +2320,7 @@ export function createThreeForceGraphRenderer({
         Math.min(1.15, 480 / Math.max(1, Math.min(data.selection.viewport.width, data.selection.viewport.height))),
       );
       let scale = selectedNodeId
-        ? 0.64 + (near * 0.33)
+        ? 0.54 + (near * 0.42)
         : IDLE_NODE_SCALE.far + (near * IDLE_NODE_SCALE.nearRange);
       if (selected) {
         scale = 1.22;
@@ -2733,9 +2789,10 @@ export function createThreeForceGraphRenderer({
     // its geometry refresh from resurrecting an idle hidden edge while still
     // updating endpoints for boundary telemetry and future focus/selection.
     if (canonicalLink && object.userData.graphDefaultLinkObject === true) {
-      const hoverIncident = currentData?.selection.nodeId === null
-        && hoverNodeId !== null
-        && (canonicalLink.source === hoverNodeId || canonicalLink.target === hoverNodeId);
+      const activeHoverId = activeHoverNodeId();
+      const hoverIncident = activeHoverId !== null
+        && activeHoverId !== currentData?.selection.nodeId
+        && (canonicalLink.source === activeHoverId || canonicalLink.target === activeHoverId);
       object.visible = (canonicalLink.visual.visible || hoverIncident)
         && object.userData.graphDefaultLinkHasVisibleCurve !== false;
     }
@@ -2771,6 +2828,8 @@ export function createThreeForceGraphRenderer({
   function applyFocusedLinkFlow(): void {
     const focusNodeId = ambientFocusNodeId();
     const hasFocus = focusNodeId !== null;
+    const selectedNodeId = currentData?.selection.nodeId ?? null;
+    const activeHoverId = activeHoverNodeId();
     let nextParticle = 0;
     for (const particle of flowParticles) {
       particle.linkId = null;
@@ -2779,20 +2838,21 @@ export function createThreeForceGraphRenderer({
     for (const state of ambientLinks.values()) {
       const source = renderedState(state.link.source);
       const target = renderedState(state.link.target);
-      const incident = hasFocus && (state.link.source === focusNodeId || state.link.target === focusNodeId);
+      const selectedIncident = selectedNodeId !== null
+        && (state.link.source === selectedNodeId || state.link.target === selectedNodeId);
+      const hoverIncident = activeHoverId !== null
+        && activeHoverId !== selectedNodeId
+        && (state.link.source === activeHoverId || state.link.target === activeHoverId);
+      const incident = selectedNodeId !== null ? selectedIncident : hoverIncident;
       const idleFlow = !hasFocus && state.ambientFlow;
-      const selectedFocus = focusNodeId !== null && currentData?.selection.nodeId === focusNodeId;
-      const hoverFocus = !selectedFocus
-        && currentData?.selection.nodeId === null
-        && hoverNodeId !== null
-        && hoverNodeId === focusNodeId;
-      const hoverIncident = Boolean(hoverFocus && incident);
+      const hoverOnly = hoverIncident && !selectedIncident;
+      const selectedFocus = selectedNodeId !== null && selectedNodeId === focusNodeId;
       const liveObject = renderedLinkObjects.get(state.id);
       refreshAmbientLinkObject(state, liveObject ?? null);
       // Selection owns the solid incident relationship flow. Hover is a
       // transient, non-routing cue: only its incident edges become visible,
       // rendered as a dashed child while the canonical link remains hidden.
-      const linkVisible = state.link.visual.visible || hoverIncident;
+      const linkVisible = state.link.visual.visible || hoverOnly;
       state.active = Boolean(
         linkVisible && ((selectedFocus && incident) || idleFlow) && state.object && ambientMotionEnabled(),
       );
@@ -2817,11 +2877,19 @@ export function createThreeForceGraphRenderer({
       }
       let opacity: number;
       let width: number;
-      if (hoverIncident) {
+      if (hoverOnly) {
         // Hide the solid material while keeping the parent line attached so
         // the dashed child follows the exact same curve and depth test.
+        const hoverOpacity = hoverNodeId === null
+          ? 0.82 * hoverAttractionProgress
+          : 0.82;
         applyAmbientDefaultLinkVisual(state, 0, state.baseWidth);
-        applyHoverLineVisual(state, true, 0.82, Math.max(1.05, state.baseWidth));
+        applyHoverLineVisual(
+          state,
+          hoverOpacity > 0.02,
+          hoverOpacity,
+          Math.max(1.05, state.baseWidth),
+        );
         continue;
       }
       applyHoverLineVisual(state, false, 0, state.baseWidth);
