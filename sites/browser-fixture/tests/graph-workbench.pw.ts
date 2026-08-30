@@ -1470,50 +1470,18 @@ test("opens a density deep-link in the detail rail and clears it back to the ful
   await waitForDensityRenderObservation(page, null);
 });
 
-test("keeps the desktop density chrome, search route, and rich detail controls addressable", async ({ page }) => {
+test("keeps the existing density surface free of reference branding", async ({ page }) => {
   await openDensityFixture(page);
-  await expect(page.getByTestId("density-credit-link")).toHaveAttribute("href", "https://www.aihero.dev/s/dictionary");
-  await expect(page.getByTestId("density-credit-link")).toHaveAttribute("target", "_blank");
+  await expect(page.getByTestId("graph-density-selection-relation-query")).toHaveText("Select Query focus");
+  await expect(page.locator("header, .density-chrome, .density-splash, .density-credit-link")).toHaveCount(0);
 
-  await page.getByTestId("density-search-trigger").click();
-  const searchInput = page.getByTestId("density-search-input");
-  await expect(searchInput).toBeVisible();
-  await searchInput.fill("model");
-  await expect(page).toHaveURL(/\/density\?q=model$/);
-  await expect.poll(async () => readTelemetry<{
-    readonly activeNodeCount?: number;
-  }>(page, "graph-density-ready")).toMatchObject({ activeNodeCount: 1 });
-  await expect(page.getByTestId("density-search-summary")).toContainText("1 TERMS");
-  await expect(page.getByTestId("graph-density-detail-panel")).toBeHidden();
-
-  await page.getByTestId("density-search-clear").click();
-  await expect(page).toHaveURL(/\/density$/);
-  await expect(searchInput).toBeVisible();
-  await page.getByTestId("density-search-close").click();
-  await expect(page.getByTestId("density-search-input")).toBeHidden();
-  await page.getByTestId("density-search-trigger").click();
-  await page.getByTestId("density-search-input").fill("model");
-  await page.getByTestId("density-search-input").press("Escape");
-  await expect(page.getByTestId("density-search-input")).toBeHidden();
-  await expect(page).toHaveURL(/\/density$/);
-
-  await page.getByTestId("density-about-trigger").click();
-  const aboutDialog = page.getByTestId("density-about-dialog");
-  await expect(aboutDialog).toBeVisible();
-  await expect(aboutDialog).toContainText("A living map");
-  await page.getByTestId("density-about-close").click();
-  await expect(aboutDialog).toBeHidden();
-
-  const paletteToggle = page.getByTestId("density-palette-toggle");
-  const soundToggle = page.getByTestId("density-sound-toggle");
-  await expect(paletteToggle).toHaveAttribute("aria-pressed", "false");
-  await paletteToggle.click();
-  await expect(paletteToggle).toHaveAttribute("aria-pressed", "true");
-  await expect(soundToggle).toHaveAttribute("aria-pressed", "false");
-  await soundToggle.click();
-  await expect(soundToggle).toHaveAttribute("aria-pressed", "true");
+  await page.waitForTimeout(100);
+  await expect(page.locator("header, .density-chrome, .density-splash, .density-credit-link")).toHaveCount(0);
 
   await page.goto("/density?term=model-provider-request");
+  await expect(page.getByTestId("graph-shell")).toBeVisible();
+  await expect(page.getByTestId("graph-canvas")).toBeVisible();
+  await waitForDensityRenderObservation(page, "relation:query");
   await expect(page.getByTestId("graph-density-detail-panel")).toBeVisible();
   await expect(page.getByTestId("graph-density-detail-panel")).toContainText(/Heard in the wild/i);
   await page.getByTestId("graph-density-detail-read-more").click();
@@ -1522,6 +1490,7 @@ test("keeps the desktop density chrome, search route, and rich detail controls a
   await expect(page.locator(".detail-action-status")).toContainText(/Markdown copied|Copy unavailable/);
   await page.getByTestId("graph-density-detail-share").click();
   await expect(page.locator(".detail-action-status")).toContainText(/Shared|Link copied|Share unavailable/);
+  await expect(page.getByText("Read the full source entry ↗")).toBeVisible();
   await page.getByTestId("graph-density-detail-relationship-concept-model").click();
   await expect(page).toHaveURL(/\/density\?term=concept%3Amodel$/);
 });

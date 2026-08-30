@@ -523,18 +523,6 @@ function densityNavigationTarget(nodeId: string, direction: -1 | 1): GraphNode |
   return densityInput.nodes[nextIndex] ?? null;
 }
 
-function densityInputForQuery(query: string): GraphInput {
-  const normalized = query.trim().toLocaleLowerCase();
-  if (!normalized) return densityInput;
-  const nodes = densityInput.nodes.filter((node) => node.label.toLocaleLowerCase().includes(normalized));
-  const nodeIds = new Set(nodes.map((node) => node.id));
-  return {
-    ...densityInput,
-    nodes,
-    links: densityInput.links.filter((link) => nodeIds.has(link.source) && nodeIds.has(link.target)),
-  };
-}
-
 function densitySectionNodes(nodes: readonly GraphNode[], section: string): readonly GraphNode[] {
   return nodes.filter((node) => densitySectionForNode(node) === section);
 }
@@ -547,15 +535,6 @@ function densityTermPath(nodeId: string | null): string {
   }
   else location.searchParams.delete("term");
   location.searchParams.delete("q");
-  return `${location.pathname}${location.search}${location.hash}`;
-}
-
-function densitySearchPath(query: string): string {
-  const location = new URL(window.location.href);
-  const normalized = query.trim();
-  if (normalized) location.searchParams.set("q", normalized);
-  else location.searchParams.delete("q");
-  location.searchParams.delete("term");
   return `${location.pathname}${location.search}${location.hash}`;
 }
 
@@ -626,13 +605,8 @@ function densityScreenProjection(workbench: GraphWorkbench, nodes: readonly Grap
 export function DenseGraphFixture() {
   const detailPanelRef = useRef<HTMLElement | null>(null);
   const graphHostRef = useRef<HTMLDivElement | null>(null);
-  const searchInputRef = useRef<HTMLInputElement | null>(null);
-  const searchTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const aboutDialogRef = useRef<HTMLElement | null>(null);
-  const aboutReturnFocusRef = useRef<HTMLElement | null>(null);
   const workbenchRef = useRef<GraphWorkbench | null>(null);
   const initialTermAppliedRef = useRef(false);
-  const initialRouteAppliedRef = useRef(false);
   const selectionNodeIdRef = useRef<string | null>(null);
   const settledGraphFitRef = useRef(false);
   const [rendererStatus, setRendererStatus] = useState<RendererStatus>("pending");
@@ -648,55 +622,17 @@ export function DenseGraphFixture() {
     reason: "Waiting for the density renderer scene observation.",
   });
   const [renderRevision, setRenderRevision] = useState(0);
-  const initialSearchQuery = typeof window === "undefined"
-    ? ""
-    : new URL(window.location.href).searchParams.get("q") ?? "";
-  const [searchOpen, setSearchOpen] = useState(() => initialSearchQuery.trim().length > 0);
-  const [searchQuery, setSearchQuery] = useState(() => initialSearchQuery);
-  const [aboutOpen, setAboutOpen] = useState(false);
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
-  const [soundMuted, setSoundMuted] = useState(false);
   const [expandedNodeId, setExpandedNodeId] = useState<string | null>(null);
-  const loadingSplash = renderTelemetry.availability === "pending" && rendererStatus !== "failed";
   const rendererReady = rendererStatus === "mounted" && webglStatus === "mounted";
-  const activeInput = densityInputForQuery(searchQuery);
-  const searchResults = activeInput.nodes;
-  const searchQueryRef = useRef(searchQuery);
-  useEffect(() => {
-    searchQueryRef.current = searchQuery;
-  }, [searchQuery]);
 
   const selectNode = useCallback((nodeId: string | null, source: GraphSelectionSource) => {
     if (!rendererReady) return;
-    if (nodeId !== null && searchQuery.trim()) {
-      setSearchQuery("");
-      setSearchOpen(false);
-    }
     workbenchRef.current?.selectNode(nodeId, source);
-  }, [rendererReady, searchQuery]);
+  }, [rendererReady]);
 
   const selectFocus = useCallback(() => {
     selectNode(densityFocusNodeId, "density-control");
   }, [selectNode]);
-
-  const openSearch = useCallback(() => {
-    searchTriggerRef.current = document.activeElement instanceof HTMLButtonElement
-      ? document.activeElement
-      : searchTriggerRef.current;
-    setSearchOpen(true);
-    window.setTimeout(() => searchInputRef.current?.focus(), 0);
-  }, []);
-
-  const closeSearch = useCallback((restoreFocus = true) => {
-    setSearchOpen(false);
-    if (restoreFocus) window.setTimeout(() => searchTriggerRef.current?.focus(), 0);
-  }, []);
-
-  const setSearchRoute = useCallback((query: string) => {
-    const nextPath = densitySearchPath(query);
-    const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-    if (nextPath !== currentPath) window.history.replaceState(window.history.state, "", nextPath);
-  }, []);
 
   useEffect(() => {
     const host = graphHostRef.current;
@@ -749,9 +685,7 @@ export function DenseGraphFixture() {
               source: event.source,
             });
             if (event.source !== "deep-link" && event.source !== "history") {
-              const nextPath = event.source === "search"
-                ? densitySearchPath(searchQueryRef.current)
-                : densityTermPath(event.nodeId);
+              const nextPath = densityTermPath(event.nodeId);
               const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
               if (nextPath !== currentPath) {
                 window.history.pushState({ graphWorkbenchTerm: event.nodeId }, "", nextPath);
@@ -847,58 +781,27 @@ export function DenseGraphFixture() {
   }, []);
 
   useEffect(() => {
-    if (!rendererReady) return;
-    const nextInput = densityInputForQuery(searchQuery);
-    workbenchRef.current?.setInput(nextInput);
-    if (searchQuery.trim()) {
-      workbenchRef.current?.selectNode(null, "search");
-    }
-  }, [rendererReady, searchQuery]);
-
-  useEffect(() => {
-    if (!rendererReady) return;
-    const nodeId = selectionNodeIdRef.current;
-    workbenchRef.current?.setPresentation({
-      ambientMotion: true,
-      focusNodeId: nodeId,
-      selectedNodeIds: nodeId ? [nodeId] : [],
-      theme,
-    });
-  }, [rendererReady, theme]);
-
-  useEffect(() => {
     if (!rendererReady || initialTermAppliedRef.current) return;
     initialTermAppliedRef.current = true;
     const location = new URL(window.location.href);
-    const rawQuery = location.searchParams.get("q");
-    if (rawQuery?.trim()) {
-      initialRouteAppliedRef.current = true;
+    const rawTerm = location.searchParams.get("term");
+    if (rawTerm === null) {
+      if (location.searchParams.has("q")) {
+        window.history.replaceState(window.history.state, "", densityTermPath(null));
+      }
       return;
     }
-    const rawTerm = location.searchParams.get("term");
-    if (rawTerm === null) return;
     const node = densityNodeForTerm(rawTerm);
     if (node) {
-      initialRouteAppliedRef.current = true;
       window.setTimeout(() => selectNode(node.id, "deep-link"), 0);
       return;
     }
-    initialRouteAppliedRef.current = true;
     window.history.replaceState(window.history.state, "", densityTermPath(null));
   }, [rendererReady, selectNode]);
 
   useEffect(() => {
     const restoreSelectionFromHistory = () => {
       const location = new URL(window.location.href);
-      const rawQuery = location.searchParams.get("q");
-      if (rawQuery?.trim()) {
-        setSearchQuery(rawQuery);
-        setSearchOpen(true);
-        selectNode(null, "history");
-        return;
-      }
-      setSearchQuery("");
-      setSearchOpen(false);
       const rawTerm = location.searchParams.get("term");
       const node = densityNodeForTerm(rawTerm);
       selectNode(node?.id ?? null, "history");
@@ -934,12 +837,11 @@ export function DenseGraphFixture() {
     const observe = () => {
       if (disposed || observationFinished) return;
       try {
-        const expectedInput = densityInputForQuery(searchQuery);
         const observation = workbenchRef.current?.getRenderObservation() ?? null;
         const transition = workbenchRef.current?.getTransitionObservation() ?? null;
         const complete = observation
-          && observation.nodes.length === expectedInput.nodes.length
-          && observation.links.length === expectedInput.links.length
+          && observation.nodes.length === densityInput.nodes.length
+          && observation.links.length === densityInput.links.length
           && observation.nodes.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)
           && observation.links.every(({ objectTracked, sceneAttached }) => objectTracked && sceneAttached)
           && (!transition || (!transition.active && transition.progress === 1));
@@ -961,7 +863,7 @@ export function DenseGraphFixture() {
             ambientMotion: workbenchRef.current!.getAmbientMotionObservation(),
             observation,
             observationScope: "renderer-live-data-and-scene-object-material",
-            screenProjection: densityScreenProjection(workbenchRef.current!, expectedInput.nodes),
+            screenProjection: densityScreenProjection(workbenchRef.current!),
             selectionNodeId: selectionNodeIdRef.current,
           });
           return;
@@ -986,14 +888,14 @@ export function DenseGraphFixture() {
       if (frame !== null) window.cancelAnimationFrame(frame);
       if (observationDeadline !== null) window.clearTimeout(observationDeadline);
     };
-  }, [renderRevision, rendererReady, searchQuery]);
+  }, [renderRevision, rendererReady]);
 
   const selectedNode = selection.nodeId ? densityNodesById.get(selection.nodeId) ?? null : null;
   const selectedRelationships = selectedNode ? densityRelationships(selectedNode.id) : [];
   const selectedDetails = selectedNode ? densityRichDetailsForNode(selectedNode) : null;
   const previousNode = selectedNode ? densityNavigationTarget(selectedNode.id, -1) : null;
   const nextNode = selectedNode ? densityNavigationTarget(selectedNode.id, 1) : null;
-  const detailOpen = selectedNode !== null && !searchQuery.trim();
+  const detailOpen = selectedNode !== null;
   const selectedOrdinal = selectedNode ? densityInput.nodes.findIndex((node) => node.id === selectedNode.id) + 1 : 0;
   const [detailActionStatus, setDetailActionStatus] = useState<string | null>(null);
   const [copyState, setCopyState] = useState({ label: "Copy term link", nodeId: null as string | null });
@@ -1057,23 +959,6 @@ export function DenseGraphFixture() {
     }
   };
 
-  const updateSearchQuery = (query: string) => {
-    setSearchQuery(query);
-    setSearchRoute(query);
-  };
-
-  const clearSearch = () => {
-    setSearchQuery("");
-    setSearchRoute("");
-    setSearchOpen(true);
-    window.setTimeout(() => searchInputRef.current?.focus(), 0);
-  };
-
-  const closeAbout = useCallback(() => {
-    setAboutOpen(false);
-    window.setTimeout(() => aboutReturnFocusRef.current?.focus(), 0);
-  }, []);
-
   useEffect(() => {
     if (detailOpen) return undefined;
     const activeElement = document.activeElement instanceof HTMLElement
@@ -1084,227 +969,58 @@ export function DenseGraphFixture() {
     return () => window.cancelAnimationFrame(focusFrame);
   }, [detailOpen]);
 
-  useEffect(() => {
-    if (!aboutOpen && !searchOpen) return undefined;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      if (aboutOpen) {
-        closeAbout();
-        return;
-      }
-      closeSearch();
-      setSearchQuery("");
-      setSearchRoute("");
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [aboutOpen, closeAbout, closeSearch, searchOpen, setSearchRoute]);
-
-  useEffect(() => {
-    if (!aboutOpen) return undefined;
-    aboutReturnFocusRef.current = document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-    const frame = window.requestAnimationFrame(() => {
-      aboutDialogRef.current?.querySelector<HTMLElement>("button, a")?.focus();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [aboutOpen]);
-
   return (
     <main
       className="fixture-page density-fixture"
       data-detail-open={detailOpen ? "true" : "false"}
       data-renderer-failed={rendererStatus === "failed" ? "true" : "false"}
-      data-theme={theme}
     >
-      <a className="skip-link" href="#density-main">Skip to main content</a>
-      <h1 className="sr-only">The AI Coding Dictionary — desktop graph</h1>
-
-      {loadingSplash && (
-        <div className="density-splash" data-active="true" role="status">
-          <p className="splash-title">MATT POCOCK&apos;S AI CODING DICTIONARY</p>
-          <span className="splash-rule" aria-hidden="true" />
-          <p className="splash-status">Preparing the graph field</p>
-        </div>
-      )}
-
-      <header className="density-chrome" aria-label="Dictionary controls">
-        <a
-          className="density-brand"
-          href="https://www.aihero.dev/s/dictionary"
-          rel="noopener noreferrer"
-          target="_blank"
+      <h1 className="sr-only">Graph Workbench Density Fixture</h1>
+      <div className="density-controls">
+        <span>{rendererReady ? "Density renderer ready" : rendererStatus === "failed" ? "Renderer unavailable" : "Preparing density renderer"}</span>
+        <button
+          data-testid="graph-density-selection-relation-query"
+          disabled={!rendererReady}
+          onClick={selectFocus}
+          type="button"
         >
-          <span className="density-brand-mark" aria-hidden="true">AI</span>
-          <span>
-            <strong>AI Coding Dictionary</strong>
-            <small>by AI Hero</small>
-          </span>
-        </a>
-        <div className="density-chrome-actions">
-          <form
-            className={`density-search ${searchOpen ? "is-open" : ""}`}
-            onSubmit={(event) => event.preventDefault()}
-            role="search"
-          >
-            {!searchOpen ? (
-              <button
-                aria-label="Search the dictionary"
-                className="density-icon-button"
-                data-testid="density-search-trigger"
-                onClick={openSearch}
-                title="Search"
-                type="button"
-              >
-                <span aria-hidden="true">⌕</span>
-              </button>
-            ) : (
-              <>
-                <span className="density-search-glyph" aria-hidden="true">⌕</span>
-                <input
-                  aria-label="Search the dictionary"
-                  autoComplete="off"
-                  data-testid="density-search-input"
-                  onChange={(event) => updateSearchQuery(event.target.value)}
-                  placeholder="Search terms"
-                  ref={searchInputRef}
-                  type="search"
-                  value={searchQuery}
-                />
-                <span className="density-search-count">{searchResults.length} TERMS</span>
-                {searchQuery && (
-                  <button
-                    aria-label="Clear search"
-                    className="density-search-clear"
-                    data-testid="density-search-clear"
-                    onClick={clearSearch}
-                    type="button"
-                  >
-                    ×
-                  </button>
-                )}
-                <button
-                  aria-label="Close search"
-                  className="density-search-close"
-                  data-testid="density-search-close"
-                  onClick={() => {
-                    setSearchQuery("");
-                    setSearchRoute("");
-                    closeSearch();
-                  }}
-                  type="button"
-                >
-                  Esc
-                </button>
-              </>
-            )}
-          </form>
-          <button
-            aria-label="About the AI Coding Dictionary"
-            className="density-icon-button"
-            data-testid="density-about-trigger"
-            onClick={() => {
-              aboutReturnFocusRef.current = document.activeElement instanceof HTMLElement
-                ? document.activeElement
-                : null;
-              setAboutOpen(true);
-            }}
-            title="About"
-            type="button"
-          >
-            <span aria-hidden="true">i</span>
-          </button>
-          <button
-            aria-label={theme === "light" ? "Switch to grayscale" : "Switch to section colors"}
-            aria-pressed={theme === "light"}
-            className="density-icon-button"
-            data-testid="density-palette-toggle"
-            onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
-            title={theme === "light" ? "Switch to grayscale" : "Switch to section colors"}
-            type="button"
-          >
-            <span aria-hidden="true">◐</span>
-          </button>
-          <button
-            aria-label={soundMuted ? "Unmute interface sounds" : "Mute interface sounds"}
-            aria-pressed={soundMuted}
-            className="density-icon-button"
-            data-testid="density-sound-toggle"
-            onClick={() => setSoundMuted((muted) => !muted)}
-            title={soundMuted ? "Unmute interface sounds" : "Mute interface sounds"}
-            type="button"
-          >
-            <span aria-hidden="true">{soundMuted ? "⌁" : "◖"}</span>
-          </button>
-        </div>
-      </header>
-
-      <div className="density-main" id="density-main">
-        <section className="graph-stage" aria-label="150-node density graph workbench">
-          <div className="graph-panel">
-            <div className="graph-shell" data-testid="graph-shell" ref={graphHostRef} />
-            <div className="density-field-hud" aria-live="polite">
-              <span>{searchQuery.trim() ? `${searchResults.length} TERMS` : "150 TERMS"}</span>
-              <span>{rendererReady ? "Drag to orbit · Scroll to zoom" : "Preparing graph"}</span>
-            </div>
-            <button
-              className="density-focus-button"
-              data-testid="graph-density-selection-relation-query"
-              disabled={!rendererReady || Boolean(searchQuery.trim())}
-              onClick={selectFocus}
-              type="button"
-            >
-              Focus Query
-            </button>
-            <a
-              className="density-credit-link"
-              data-testid="density-credit-link"
-              href="https://www.aihero.dev/s/dictionary"
-              rel="noopener noreferrer"
-              target="_blank"
-            >
-              AIHero.dev ↗
-            </a>
-            {searchOpen && searchQuery.trim() && (
-              <div className="density-search-summary" data-testid="density-search-summary">
-                <strong>{searchResults.length} TERMS</strong>
-                <span>{searchResults.length === 0 ? "No matching terms" : "Matching labels"}</span>
-              </div>
-            )}
-          </div>
-          {rendererStatus === "failed" && (
-            <div className="renderer-failure" data-testid="graph-renderer-failure" role="alert">
-              <span className="failure-mark" aria-hidden="true">!</span>
-              <div>
-                <strong>Renderer unavailable</strong>
-                <span data-testid="graph-renderer-failure-reason">{rendererReason}</span>
-              </div>
-            </div>
-          )}
-        </section>
-
-        <section className="semantic-fallback" aria-label="Dictionary terms">
-          <h2>Dictionary terms</h2>
-          {densitySections.map((section) => {
-            const sectionNodes = densitySectionNodes(densityInput.nodes, section);
-            return (
-              <section key={section}>
-                <h3>{section}</h3>
-                <ul>
-                  {sectionNodes.map((node) => (
-                    <li key={node.id}>
-                      <strong>{node.label}</strong>
-                      <span>{densityDetailsForNode(node).definition}</span>
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            );
-          })}
-        </section>
+          Select Query focus
+        </button>
       </div>
+      <section className="graph-stage" aria-label="150-node density graph workbench">
+        <div className="graph-panel">
+          <div className="graph-shell" data-testid="graph-shell" ref={graphHostRef} />
+        </div>
+        {rendererStatus === "failed" && (
+          <div className="renderer-failure" data-testid="graph-renderer-failure" role="alert">
+            <span className="failure-mark" aria-hidden="true">!</span>
+            <div>
+              <strong>Renderer unavailable</strong>
+              <span data-testid="graph-renderer-failure-reason">{rendererReason}</span>
+            </div>
+          </div>
+        )}
+      </section>
+
+      <section className="semantic-fallback" aria-label="Dictionary terms">
+        <h2>Dictionary terms</h2>
+        {densitySections.map((section) => {
+          const sectionNodes = densitySectionNodes(densityInput.nodes, section);
+          return (
+            <section key={section}>
+              <h3>{section}</h3>
+              <ul>
+                {sectionNodes.map((node) => (
+                  <li key={node.id}>
+                    <strong>{node.label}</strong>
+                    <span>{densityDetailsForNode(node).definition}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          );
+        })}
+      </section>
 
       <aside
         aria-hidden={!detailOpen}
@@ -1434,7 +1150,7 @@ export function DenseGraphFixture() {
             rel="noopener noreferrer"
             target="_blank"
           >
-            Read the full entry on aihero.dev ↗
+            Read the full source entry ↗
           </a>
           <div className="detail-actions">
             <button data-testid="graph-density-detail-share" disabled={!selectedNode} onClick={() => void shareSelectedNode()} type="button">
@@ -1474,52 +1190,15 @@ export function DenseGraphFixture() {
         </div>
       </aside>
 
-      <div
-        aria-hidden={!aboutOpen}
-        className="density-about-backdrop"
-        data-open={aboutOpen ? "true" : "false"}
-        onPointerDown={(event) => {
-          if (event.target === event.currentTarget) closeAbout();
-        }}
-      >
-        <section
-          aria-labelledby="density-about-title"
-          aria-modal={aboutOpen || undefined}
-          className="density-about-dialog"
-          data-testid="density-about-dialog"
-          inert={aboutOpen ? undefined : true}
-          ref={aboutDialogRef}
-          role="dialog"
-        >
-          <div className="density-about-heading">
-            <div>
-              <p className="panel-kicker">About</p>
-              <h2 id="density-about-title">The AI Coding Dictionary</h2>
-            </div>
-            <button aria-label="Close About" className="drawer-close" data-testid="density-about-close" onClick={closeAbout} type="button">×</button>
-          </div>
-          <div className="density-about-content">
-            <p>A living map of the language, patterns, and failure modes that shape modern AI-assisted software work.</p>
-            <p>Explore the field by hovering, orbiting, and selecting a term. Each entry keeps its definition, relationships, and source together.</p>
-            <div className="density-about-links">
-              <a href="https://www.aihero.dev/s/dictionary" rel="noopener noreferrer" target="_blank">AIHero.dev dictionary ↗</a>
-              <a href="https://github.com/total-typescript" rel="noopener noreferrer" target="_blank">GitHub ↗</a>
-            </div>
-            <p className="density-credit">A project by <strong>Matt Pocock</strong>, with partners badass.dev, Joel Hooks, and Vojta Holik.</p>
-          </div>
-        </section>
-      </div>
-
       <section className="telemetry-panel" aria-label="Density fixture telemetry">
         <Telemetry testId="graph-density-ready" value={{
           availability: rendererReady ? "observed" : rendererStatus === "failed" ? "unavailable" : "pending",
-          activeNodeCount: activeInput.nodes.length,
           nodeCount: densityInput.nodes.length,
           reason: rendererReason,
         }} />
-        <Telemetry testId="graph-input-node-ids" value={activeInput.nodes.map(({ id }) => id)} />
-        <Telemetry testId="graph-input-link-ids" value={activeInput.links.map(({ id }) => id)} />
-        <Telemetry testId="graph-input-topology" value={activeInput.links.map(({ id, source, target }) => ({
+        <Telemetry testId="graph-input-node-ids" value={densityInput.nodes.map(({ id }) => id)} />
+        <Telemetry testId="graph-input-link-ids" value={densityInput.links.map(({ id }) => id)} />
+        <Telemetry testId="graph-input-topology" value={densityInput.links.map(({ id, source, target }) => ({
           id,
           source,
           target,
