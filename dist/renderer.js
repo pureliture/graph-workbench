@@ -1,5 +1,5 @@
 import ForceGraph3D from "3d-force-graph";
-import { AmbientLight, BufferGeometry, CapsuleGeometry, CanvasTexture, CircleGeometry, Color, DoubleSide, DirectionalLight, Float32BufferAttribute, Group, Line, LineBasicMaterial, LineDashedMaterial, Mesh, MeshBasicMaterial, MeshStandardMaterial, NoColorSpace, Object3D, Quaternion, SphereGeometry, Sprite, SpriteMaterial, Vector3, } from "three";
+import { AmbientLight, BackSide, BufferGeometry, CanvasTexture, CircleGeometry, Color, DoubleSide, DirectionalLight, Float32BufferAttribute, Group, Line, LineBasicMaterial, LineDashedMaterial, Mesh, MeshBasicMaterial, MeshStandardMaterial, NoColorSpace, Object3D, Quaternion, SphereGeometry, Sprite, SpriteMaterial, Vector3, } from "three";
 function boundedOpacity(value, fallback) {
     if (!Number.isFinite(value))
         return fallback;
@@ -139,6 +139,12 @@ const IDLE_LABEL_OPACITY = Object.freeze({ far: 0.08, nearRange: 0.82 });
 const IDLE_LINK_OPACITY = Object.freeze({ maximum: 0.28, minimum: 0.22 });
 const IDLE_NODE_SCALE = Object.freeze({ far: 0.64, nearRange: 0.48 });
 const IDLE_LABEL_SCALE = Object.freeze({ far: 0.54, nearRange: 0.44 });
+// HarnessKit's visual envelope is a softly lit sphere with a restrained shell
+// around it. Keep the shell subordinate to the current AIHero-inspired body
+// colors and leave all label/interaction policy in the existing renderer path.
+const DEFAULT_NODE_OUTLINE_OPACITY_RATIO = 0.72;
+const DEFAULT_NODE_OUTLINE_SCALE = 1.08;
+const DEFAULT_NODE_FOCUS_RIM_SCALE = 1.16;
 function smoothstep(progress) {
     const bounded = Math.max(0, Math.min(1, progress));
     return bounded * bounded * (3 - (2 * bounded));
@@ -244,20 +250,11 @@ function defaultNodeVisualInputsRevision(data) {
     });
 }
 function createDefaultNodeGeometry(silhouette) {
-    if (silhouette.kind === "capsule") {
-        const radius = silhouette.height / 2;
-        const length = Math.max(0.01, silhouette.width - silhouette.height);
-        const geometry = new CapsuleGeometry(radius, length, 10, 20);
-        // CapsuleGeometry is vertical by default; the semantic workflow capsule
-        // remains horizontal in its projected silhouette after this rotation.
-        geometry.rotateZ(Math.PI / 2);
-        return geometry;
-    }
-    // Circular silhouettes are rendered as real volumetric bodies. Their
-    // projected outline remains circular from the default camera, but orbiting
-    // and depth overlap now expose an actual z extent instead of a camera-facing
-    // paper disc.
-    return new SphereGeometry(silhouette.width / 2, silhouette.kind === "dot" ? 12 : 24, silhouette.kind === "dot" ? 8 : 16);
+    // Keep the current semantic size tiers and labels, but use one spherical
+    // visual family for every built-in node. This is the HarnessKit-inspired
+    // envelope; AIHero's label and interaction choreography stays unchanged.
+    const relationTier = silhouette.cameraRadius >= 6;
+    return new SphereGeometry(silhouette.cameraRadius, relationTier ? 32 : 24, relationTier ? 20 : 16);
 }
 function makeCameraFacingMesh(mesh) {
     const cameraWorldQuaternion = new Quaternion();
@@ -532,6 +529,7 @@ export function createDefaultGraphNodeObject(node, descriptor) {
     const opacity = boundedOpacity(descriptor?.opacity, 1);
     const group = new Group();
     const silhouette = defaultNodeSilhouette(node);
+    const relationTier = silhouette.cameraRadius >= 6;
     const bodyMaterial = new MeshStandardMaterial({
         color,
         // Bodies are intentionally rendered as translucent depth cues. Writing
@@ -539,9 +537,9 @@ export function createDefaultGraphNodeObject(node, descriptor) {
         // while OrbitControls changes the camera, so overlapping nodes can flash
         // as transparent fragments occlude one another from frame to frame.
         depthWrite: false,
+        metalness: relationTier ? 0.36 : 0.22,
         opacity,
-        roughness: 0.78,
-        metalness: 0.02,
+        roughness: relationTier ? 0.4 : 0.58,
         side: DoubleSide,
         transparent: opacity < 1,
     });
@@ -552,6 +550,31 @@ export function createDefaultGraphNodeObject(node, descriptor) {
     body.userData.graphDefaultNodeSilhouetteSignature = defaultNodeSilhouetteSignature(silhouette);
     makeCameraFacingMesh(body);
     group.add(body);
+    const outlineMaterial = new MeshBasicMaterial({
+        color: THEME_PALETTES.dark.outline,
+        depthWrite: false,
+        opacity: opacity * DEFAULT_NODE_OUTLINE_OPACITY_RATIO,
+        side: BackSide,
+        transparent: true,
+    });
+    const outline = new Mesh(geometry, outlineMaterial);
+    outline.scale.setScalar(DEFAULT_NODE_OUTLINE_SCALE);
+    outline.renderOrder = 1;
+    outline.userData.graphVisualRole = "outline";
+    group.add(outline);
+    const focusRimMaterial = new MeshBasicMaterial({
+        color: THEME_PALETTES.dark.rim,
+        depthWrite: false,
+        opacity: 0,
+        side: BackSide,
+        transparent: true,
+    });
+    const focusRim = new Mesh(geometry, focusRimMaterial);
+    focusRim.scale.setScalar(DEFAULT_NODE_FOCUS_RIM_SCALE);
+    focusRim.renderOrder = 2;
+    focusRim.userData.graphVisualRole = "focus-rim";
+    focusRim.visible = false;
+    group.add(focusRim);
     // Default bodies use volumetric geometry and restrained lighting. Depth is
     // still reinforced by the renderer's scale/opacity hierarchy, while the
     // light rig gives orbiting and occlusion a visible surface response.
@@ -1205,14 +1228,25 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             return;
         const silhouette = defaultVisualInputForNode(node).silhouette;
         if (body.userData.graphDefaultNodeSilhouetteSignature !== defaultNodeSilhouetteSignature(silhouette)) {
-            const previousGeometry = body.geometry;
-            body.geometry = createDefaultNodeGeometry(silhouette);
+            const nextGeometry = createDefaultNodeGeometry(silhouette);
+            const previousGeometries = new Set();
+            const geometries = [
+                body,
+                graphChildWithRole(object, "outline"),
+                graphChildWithRole(object, "focus-rim"),
+            ];
+            geometries.forEach((candidate) => {
+                if (candidate instanceof Mesh) {
+                    previousGeometries.add(candidate.geometry);
+                    candidate.geometry = nextGeometry;
+                }
+            });
             body.userData.graphDefaultNodeSilhouette = silhouette.kind;
             body.userData.graphDefaultNodeSilhouetteSignature = defaultNodeSilhouetteSignature(silhouette);
             // The renderer owns this body and its generated geometry. Dispose only
             // the replaced body geometry; factory-return custom objects are never
             // reshaped or disposed here.
-            previousGeometry.dispose();
+            previousGeometries.forEach((geometry) => geometry.dispose());
         }
         const label = graphChildWithRole(object, "node-label");
         if (label) {
@@ -1278,19 +1312,28 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         if (state.defaultVisual || object?.userData.graphDefaultNodeObject !== true)
             return;
         const body = graphChildWithRole(object, "body");
+        const outline = graphChildWithRole(object, "outline");
         const label = graphChildWithRole(object, "node-label");
         if (!(body instanceof Mesh) || !(body.material instanceof MeshStandardMaterial))
             return;
         if (!(label instanceof Sprite) || !(label.material instanceof SpriteMaterial))
             return;
+        const outlineMesh = outline instanceof Mesh ? outline : null;
+        const outlineMaterial = outlineMesh?.material instanceof MeshBasicMaterial
+            ? outlineMesh.material
+            : null;
         state.defaultVisual = {
             baseLabelScale: staticLabelBaseScale(label),
             body,
             bodyMaterial: body.material,
+            outline: outlineMesh,
+            outlineMaterial,
             label,
             labelMaterial: label.material,
             lastBodyOpacity: Number.NaN,
             lastBodyVisible: null,
+            lastOutlineOpacity: Number.NaN,
+            lastOutlineVisible: null,
             lastLabelOpacity: Number.NaN,
             lastLabelScale: Number.NaN,
             lastLabelVisible: null,
@@ -1342,6 +1385,8 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             return;
         visual.lastBodyOpacity = Number.NaN;
         visual.lastBodyVisible = null;
+        visual.lastOutlineOpacity = Number.NaN;
+        visual.lastOutlineVisible = null;
         visual.lastLabelOpacity = Number.NaN;
         visual.lastLabelScale = Number.NaN;
         visual.lastLabelVisible = null;
@@ -1378,6 +1423,18 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         if (visual.lastBodyVisible !== bodyVisible) {
             visual.body.visible = bodyVisible;
             visual.lastBodyVisible = bodyVisible;
+        }
+        if (visual.outline && visual.outlineMaterial) {
+            const outlineOpacity = opacity * DEFAULT_NODE_OUTLINE_OPACITY_RATIO;
+            if (changedAmbientVisualValue(visual.lastOutlineOpacity, outlineOpacity)) {
+                visual.outlineMaterial.opacity = outlineOpacity;
+                visual.lastOutlineOpacity = outlineOpacity;
+            }
+            ensureAmbientTransparency(visual.outlineMaterial, true);
+            if (visual.lastOutlineVisible !== bodyVisible) {
+                visual.outline.visible = bodyVisible;
+                visual.lastOutlineVisible = bodyVisible;
+            }
         }
         if (changedAmbientVisualValue(visual.lastScale, scale)) {
             object.scale.setScalar(scale);
@@ -1446,6 +1503,11 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const body = graphChildWithRole(object, "body");
             if (body)
                 body.visible = bodyVisible;
+            const outline = graphChildWithRole(object, "outline");
+            if (outline) {
+                outline.visible = bodyVisible;
+                setObjectMaterialOpacity(outline, opacity * DEFAULT_NODE_OUTLINE_OPACITY_RATIO);
+            }
         }
         const rim = graphChildWithRole(object, "focus-rim");
         if (rim) {
@@ -1829,16 +1891,11 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         return body;
     }
     function defaultNodeSilhouetteContainsLocalPoint(silhouette, point) {
-        const radius = silhouette.height / 2;
-        if (silhouette.kind !== "capsule") {
-            return point.x * point.x + point.y * point.y <= radius * radius;
-        }
-        const halfStraight = Math.max(0, (silhouette.width / 2) - radius);
-        if (Math.abs(point.x) <= halfStraight)
-            return Math.abs(point.y) <= radius;
-        const capCenterX = point.x < 0 ? -halfStraight : halfStraight;
-        const capOffsetX = point.x - capCenterX;
-        return (capOffsetX * capOffsetX) + (point.y * point.y) <= radius * radius;
+        // The built-in body is now spherical for every semantic tier. Use the
+        // actual camera radius rather than the legacy capsule height so links are
+        // trimmed at the same projected boundary the user sees.
+        const radius = silhouette.cameraRadius;
+        return point.x * point.x + point.y * point.y <= radius * radius;
     }
     function curvePointProjectsInsideDefaultNode(body, silhouette, camera, point) {
         if (![point.x, point.y, point.z].every(Number.isFinite))
@@ -2849,9 +2906,16 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const liveNode = data.nodes.find((candidate) => candidate.id === id);
             const livePosition = nodePosition(liveNode) ?? nodePosition(node);
             const body = object ? graphChildWithRole(object, "body") : null;
+            const objectObservation = observeGraphObject(id, object, scene);
+            const bodyObservation = body ? observeGraphObject(id, body, scene) : null;
             nodes.push({
-                ...observeGraphObject(id, object, scene),
-                body: body ? observeGraphObject(id, body, scene) : null,
+                ...objectObservation,
+                // The public node opacity describes the primary body, not decorative
+                // shell meshes. Keep that contract stable now that the HarnessKit-
+                // inspired outline is part of the built-in visual envelope.
+                minimumVisibleMaterialOpacity: bodyObservation?.minimumVisibleMaterialOpacity
+                    ?? objectObservation.minimumVisibleMaterialOpacity,
+                body: bodyObservation,
                 bodyMaterialColor: object?.userData.graphDefaultNodeObject === true
                     ? objectMaterialColor(body)
                     : null,

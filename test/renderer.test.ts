@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  BackSide,
   BoxGeometry,
   Color,
   Group,
@@ -984,6 +985,11 @@ describe("Three.js camera transitions", () => {
       const source = graph.nodeObjects.get(endpoint.sourceId)!;
       const body = source.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
       expect(body.userData.graphDefaultNodeSilhouette).toBe(silhouette);
+      expect(body.geometry.type).toBe("SphereGeometry");
+      const outline = source.children.find((child) => child.userData.graphVisualRole === "outline") as Mesh;
+      const rim = source.children.find((child) => child.userData.graphVisualRole === "focus-rim") as Mesh;
+      expect(outline.geometry).toBe(body.geometry);
+      expect(rim.geometry).toBe(body.geometry);
       expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z)
         .distanceTo(source.getWorldPosition(new Vector3()))).toBeGreaterThan(0.1);
       expectEndpointOnDefaultBodyBoundary(body, endpoint.start, graph.pose.position);
@@ -1519,8 +1525,8 @@ describe("Three.js camera transitions", () => {
     const selectedMaterial = selectedBody?.material as MeshStandardMaterial;
     expect(selectedMaterial).toBeInstanceOf(MeshStandardMaterial);
     expect("emissive" in selectedMaterial).toBe(true);
-    expect(selectedMaterial.metalness).toBeCloseTo(0.02);
-    expect(selectedMaterial.roughness).toBeCloseTo(0.78);
+    expect(selectedMaterial.metalness).toBeCloseTo(0.22);
+    expect(selectedMaterial.roughness).toBeCloseTo(0.58);
   });
 
   it("keeps quiet light-mode bodies readable while hiding nonincident links", () => {
@@ -2300,7 +2306,7 @@ describe("Three.js camera transitions", () => {
     });
   });
 
-  it("uses routine-harness lit node materials without an outline shell or selection ring", () => {
+  it("uses spherical lit node materials with a restrained shell and selection ring", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -2317,10 +2323,25 @@ describe("Three.js camera transitions", () => {
     expect(body.material).toBeInstanceOf(MeshStandardMaterial);
     expect((body.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
     expect((body.material as MeshStandardMaterial).depthWrite).toBe(false);
+    expect((body.material as MeshStandardMaterial).metalness).toBeCloseTo(0.22);
+    expect((body.material as MeshStandardMaterial).roughness).toBeCloseTo(0.58);
+    expect(body.geometry.type).toBe("SphereGeometry");
     expect((label.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
     expect((label.material as MeshStandardMaterial).transparent).toBe(true);
-    expect(object.children.some((child) => child.userData.graphVisualRole === "outline")).toBe(false);
-    expect(object.children.some((child) => child.userData.graphVisualRole === "focus-rim")).toBe(false);
+    const outline = object.children.find((child) => child.userData.graphVisualRole === "outline") as Mesh;
+    const rim = object.children.find((child) => child.userData.graphVisualRole === "focus-rim") as Mesh;
+    expect(outline).toBeInstanceOf(Mesh);
+    expect(outline.geometry).toBe(body.geometry);
+    expect(outline.scale.x).toBeCloseTo(1.08);
+    expect(outline.material).toBeInstanceOf(MeshBasicMaterial);
+    expect((outline.material as MeshBasicMaterial).side).toBe(BackSide);
+    expect((outline.material as MeshBasicMaterial).opacity).toBeCloseTo(
+      (body.material as MeshStandardMaterial).opacity * 0.72,
+    );
+    expect(rim).toBeInstanceOf(Mesh);
+    expect(rim.geometry).toBe(body.geometry);
+    expect(rim.scale.x).toBeCloseTo(1.16);
+    expect(rim.visible).toBe(false);
   });
 
   it("keeps renderer-owned volumetric bodies depth-capable through nested transforms", () => {
@@ -2387,8 +2408,9 @@ describe("Three.js camera transitions", () => {
       expect(material.color.getHexString()).toBe(new Color(color).getHexString());
       expect("clearcoat" in material).toBe(false);
       expect("emissive" in material).toBe(true);
-      expect(material.metalness).toBeCloseTo(0.02);
-      expect(material.roughness).toBeCloseTo(0.78);
+      const relation = color === "#fb7185";
+      expect(material.metalness).toBeCloseTo(relation ? 0.36 : 0.22);
+      expect(material.roughness).toBeCloseTo(relation ? 0.4 : 0.58);
     };
 
     renderer.setData(createRenderGraphData(graphFixture, { theme: "dark" }));
