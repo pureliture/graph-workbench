@@ -78,6 +78,18 @@ const LABEL_PROJECTED_READABILITY = Object.freeze({
     minimum: 0.18,
     startsAtPixels: 3,
 });
+// Selection-context labels are the graph's direct identity cue. Keep them
+// legible even when the one-hop framing preserves a distant camera, while
+// leaving the quiet ambient field governed by projected-size opacity.
+const INTERACTION_LABEL_MINIMUM_PIXELS = Object.freeze({
+    selected: 16,
+    contextual: 14,
+});
+// Labels use a padded canvas glyph mask (56px type in a 96px texture). The
+// plane's projected height therefore overstates the visible glyph height.
+// Account for that stable mask ratio so the screen-space floor describes what
+// a user can actually read, not the transparent canvas around it.
+const LABEL_VISIBLE_GLYPH_HEIGHT_RATIO = 0.55;
 // The reference graph keeps the complete topology available, but deliberately
 // limits the amount of concurrently readable text. These are renderer-local
 // presentation budgets: they never remove data, search targets, or keyboard
@@ -149,6 +161,12 @@ function labelPerspectiveReadability(cameraDistance, labelWorldHeight, projectio
     return LABEL_PROJECTED_READABILITY.minimum
         + ((1 - LABEL_PROJECTED_READABILITY.minimum) * smoothstep(progress));
 }
+function labelScaleForMinimumPixels(cameraDistance, baseLabelHeight, nodeScale, projection, viewportHeight, minimumPixels) {
+    const halfFovRadians = (projection.fovDegrees * Math.PI) / 360;
+    const minimumWorldHeight = (minimumPixels * 2 * Math.tan(halfFovRadians)
+        * Math.max(1, cameraDistance)) / Math.max(1, viewportHeight);
+    return minimumWorldHeight / Math.max(1, baseLabelHeight * nodeScale);
+}
 function themePalette(theme) {
     return theme === "light" ? THEME_PALETTES.light : THEME_PALETTES.dark;
 }
@@ -195,6 +213,13 @@ function descriptorForLink(link, supplied) {
         opacity: supplied?.opacity ?? link.visual.opacity,
         width: supplied?.width ?? link.visual.width,
     };
+}
+function labelVisibilityForNode(node, presentation) {
+    const policy = presentation.labelVisibility;
+    return policy?.byNodeId?.[node.id]
+        ?? policy?.byType?.[node.type]
+        ?? policy?.default
+        ?? "auto";
 }
 function nodeEmissiveIntensity(node) {
     // This remains part of the long-standing custom-object visual update path.
@@ -694,6 +719,13 @@ function cameraFrameScheduler(container) {
 function interpolate(start, end, progress) {
     return start + ((end - start) * progress);
 }
+function cameraTransitionDuration(options, fallback) {
+    if (options.reducedMotion)
+        return 0;
+    return Number.isFinite(options.durationMs)
+        ? Math.max(0, options.durationMs)
+        : fallback;
+}
 function easeInOutCubic(progress) {
     const bounded = Math.min(1, Math.max(0, progress));
     return bounded < 0.5
@@ -847,6 +879,27 @@ function renderDataRevision(data) {
         selectionNodeId: data.selection.nodeId,
     });
 }
+function hostRecoveryKeyForData(data) {
+    return data?.presentation.recoveryKey ?? null;
+}
+function isCameraPose(value) {
+    if (!value)
+        return false;
+    return [
+        value.position.x,
+        value.position.y,
+        value.position.z,
+        value.lookAt.x,
+        value.lookAt.y,
+        value.lookAt.z,
+    ].every((coordinate) => Number.isFinite(coordinate));
+}
+function cloneCameraPose(pose) {
+    return {
+        lookAt: { ...pose.lookAt },
+        position: { ...pose.position },
+    };
+}
 function firstMaterialOpacity(object, fallback) {
     if (!object)
         return fallback;
@@ -875,6 +928,12 @@ function sceneVisualForNode(node, data, descriptor, density = FULL_NODE_DENSITY_
     const baseOpacity = boundedOpacity(descriptor.opacity, node.visual.opacity);
     const isSelected = data.selection.nodeId === node.id;
     const isNeighbor = data.selection.neighborNodeIds.includes(node.id);
+    const labelVisibility = labelVisibilityForNode(node, data.presentation);
+    const interactionVisible = isSelected
+        || isNeighbor
+        || data.presentation.focusNodeId === node.id;
+    const labelVisible = labelVisibility !== "hidden"
+        && (labelVisibility !== "interaction" || interactionVisible);
     // The initial camera faces the positive Z direction. A stable world-space
     // depth cue therefore gives receding nodes smaller, quieter silhouettes even
     // before the user starts orbiting; selection keeps the active node crisp.
@@ -896,9 +955,13 @@ function sceneVisualForNode(node, data, descriptor, density = FULL_NODE_DENSITY_
         // floor. Counteracting the group depth scale and boosting narrow viewports
         // makes distant labels readable without reviving outlines or focus rings.
         bodyVisible: density.bodyVisible,
-        labelVisible: density.labelVisible,
-        labelOpacity: density.labelVisible ? labelOpacity : 0,
-        labelScale: (isSelected ? 1 : 1 / depthScale) * viewportScale,
+        labelVisible: density.labelVisible && labelVisible,
+        labelOpacity: density.labelVisible && labelVisible ? labelOpacity : 0,
+        // A zero scale keeps a hidden default Sprite out of label bounds and
+        // raycasting while its immutable base scale remains available for reuse.
+        labelScale: density.labelVisible && labelVisible
+            ? (isSelected ? 1 : 1 / depthScale) * viewportScale
+            : 0,
         opacity: density.bodyVisible
             ? Math.max(node.visual.opacityFloor, isSelected ? baseOpacity : baseOpacity * depthOpacity)
             : 0,
@@ -983,6 +1046,13 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     let ambientCameraAnchor = null;
     let ambientCameraAnchorElapsedMs = 0;
     let ambientCameraLastPose = null;
+    let focusCameraBaseline = null;
+    let activityState = {};
+    let explicitlySuspended = false;
+    let zeroSized = container.clientWidth <= 0 || container.clientHeight <= 0;
+    let webglContextLost = false;
+    let webglRecoveryCapsule = null;
+    const privateRecoveryRevisions = new WeakMap();
     const ambientNodes = new Map();
     const ambientLinks = new Map();
     let densityVisibilityByNodeId = new Map();
@@ -1036,7 +1106,8 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         progress: 1,
         reducedMotion: false,
     };
-    const ownerDocument = graph.renderer().domElement.ownerDocument;
+    const renderElement = graph.renderer().domElement;
+    const ownerDocument = renderElement.ownerDocument;
     const controls = graph.controls();
     const cameraInteractionControls = isCameraInteractionControls(controls) ? controls : null;
     const cursorZoomControls = isCursorZoomControls(controls) ? controls : null;
@@ -1526,9 +1597,27 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     function ambientFocusNodeId() {
         return currentData?.selection.nodeId ?? hoverNodeId ?? currentPresentation.focusNodeId ?? null;
     }
+    function reducedMotionEnabled() {
+        return activityState.reducedMotion
+            ?? currentData?.presentation.reducedMotion
+            ?? currentPresentation.reducedMotion
+            ?? false;
+    }
+    function hostActivityAllowsMotion() {
+        return activityState.expanded !== false
+            && activityState.foreground !== false
+            && activityState.intersecting !== false;
+    }
+    function rendererMotionPaused() {
+        return explicitlySuspended
+            || zeroSized
+            || webglContextLost
+            || ownerDocument.visibilityState === "hidden"
+            || !hostActivityAllowsMotion();
+    }
     function ambientMotionEnabled() {
         return currentData?.presentation.ambientMotion !== false
-            && currentData?.presentation.reducedMotion !== true
+            && !reducedMotionEnabled()
             && !ambientPaused
             && ambientNodes.size > 0;
     }
@@ -1728,6 +1817,10 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const neighbor = data.selection.neighborNodeIds.includes(node.id);
             const focused = node.id === focusNodeId;
             const hovered = node.id === hoverNodeId;
+            const labelVisibility = labelVisibilityForNode(node, data.presentation);
+            const interactionVisible = selected || neighbor || focused || hovered;
+            const labelVisible = labelVisibility !== "hidden"
+                && (labelVisibility !== "interaction" || interactionVisible);
             // Keep semantic readability floors in the renderer-owned state built
             // from the canonical visual contract, not a vendor live node's fields.
             const master = state.isMaster;
@@ -1741,7 +1834,9 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             const opacity = Math.max(node.visual.opacityFloor, master ? AMBIENT_MASTER_BODY_OPACITY_FLOOR : 0, lightSelectedContext && !selected && !neighbor && !focused
                 ? LIGHT_SELECTED_CONTEXT_FLOOR.bodyOpacity
                 : 0, state.baseOpacity * bodyFactor);
-            const labelAlwaysVisible = selected || neighbor || focused || hovered || master;
+            const labelAlwaysReadable = labelVisibility === "always"
+                || interactionVisible
+                || (labelVisibility === "auto" && master);
             const baseLabelOpacity = selected
                 ? 1
                 : neighbor || focused || hovered
@@ -1768,12 +1863,20 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 ? 0.62 + (near * 0.38)
                 : IDLE_LABEL_SCALE.far + (near * IDLE_LABEL_SCALE.nearRange));
             const labelDistance = Math.hypot(state.renderedX - camera.position.x, state.renderedY - camera.position.y, state.renderedZ - camera.position.z);
-            const labelPerspectiveVisibility = labelAlwaysVisible
+            const interactionLabelMinimumPixels = selected
+                ? INTERACTION_LABEL_MINIMUM_PIXELS.selected
+                : interactionVisible
+                    ? INTERACTION_LABEL_MINIMUM_PIXELS.contextual
+                    : 0;
+            const readableLabelScale = interactionLabelMinimumPixels > 0
+                ? Math.max(labelScale, labelScaleForMinimumPixels(labelDistance, (state.defaultVisual?.baseLabelScale.y ?? 8) * LABEL_VISIBLE_GLYPH_HEIGHT_RATIO, scale, projection, data.selection.viewport.height, interactionLabelMinimumPixels))
+                : labelScale;
+            const labelPerspectiveVisibility = labelAlwaysReadable
                 ? 1
                 : labelPerspectiveReadability(labelDistance, (state.defaultVisual?.baseLabelScale.y ?? 8) * scale * labelScale, projection, data.selection.viewport.height);
             const readableLabelOpacity = contextLabelOpacity * labelPerspectiveVisibility;
             const density = densityVisibilityForNode(node.id);
-            applyAmbientDefaultNodeVisual(state, density.bodyVisible ? opacity : 0, scale, density.bodyVisible, density.labelVisible, density.labelVisible ? readableLabelOpacity : 0, labelScale);
+            applyAmbientDefaultNodeVisual(state, density.bodyVisible ? opacity : 0, scale, density.bodyVisible, density.labelVisible && labelVisible, density.labelVisible && labelVisible ? readableLabelOpacity : 0, density.labelVisible && labelVisible ? readableLabelScale : 0);
         }
     }
     function renderedState(id) {
@@ -2208,7 +2311,9 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 && !data.selection.neighborNodeIds.includes(node.id)
                 && object?.userData.graphDefaultNodeObject === true;
             applyNodePalette(node);
-            applyNodeVisual(node, lightQuietContext ? Math.max(visual.opacity, LIGHT_SELECTED_CONTEXT_FLOOR.bodyOpacity) : visual.opacity, visual.scale, data.selection.nodeId === node.id ? visual.opacity : 0, visual.bodyVisible, visual.labelVisible, lightQuietContext ? Math.max(visual.labelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity) : visual.labelOpacity, visual.labelScale);
+            applyNodeVisual(node, lightQuietContext ? Math.max(visual.opacity, LIGHT_SELECTED_CONTEXT_FLOOR.bodyOpacity) : visual.opacity, visual.scale, data.selection.nodeId === node.id ? visual.opacity : 0, visual.bodyVisible, visual.labelVisible, lightQuietContext && visual.labelVisible
+                ? Math.max(visual.labelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity)
+                : visual.labelOpacity, visual.labelScale);
         });
         data.links.forEach((link) => {
             const descriptor = linkDescriptor(link);
@@ -2487,8 +2592,37 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             ensureMotionFrame();
         }
     }
+    function refreshMotionPauseState() {
+        const nextPaused = rendererMotionPaused();
+        const pauseChanged = ambientPaused !== nextPaused;
+        ambientPaused = nextPaused;
+        ambientLastTimestamp = null;
+        if (nextPaused) {
+            // Settle scene state but preserve the exact live camera pose. A resumed
+            // host must not replay a transition from an old start pose.
+            if (activeTransition)
+                cancelCameraTransition();
+            if (motionFrame !== null)
+                frameScheduler.cancel(motionFrame);
+            motionFrame = null;
+            ambientVisualsDirty = false;
+            if (pauseChanged)
+                applyAmbientVisuals();
+            return;
+        }
+        if (!transitionTick && !ambientMotionEnabled() && motionFrame !== null) {
+            frameScheduler.cancel(motionFrame);
+            motionFrame = null;
+        }
+        if (pauseChanged)
+            applyAmbientVisuals();
+        ensureMotionFrame();
+    }
     function ensureMotionFrame() {
-        if (destroyed || motionFrame !== null || (!transitionTick && !ambientMotionEnabled()))
+        if (destroyed
+            || ambientPaused
+            || motionFrame !== null
+            || (!transitionTick && !ambientMotionEnabled()))
             return;
         let frameId = 0;
         frameId = frameScheduler.request((timestamp) => {
@@ -2520,21 +2654,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         motionFrame = frameId;
     }
     const onVisibilityChange = () => {
-        const hidden = ownerDocument.visibilityState === "hidden";
-        ambientPaused = hidden;
-        ambientLastTimestamp = null;
-        if (hidden) {
-            if (activeTransition)
-                activeTransition.startedAt = null;
-            if (motionFrame !== null)
-                frameScheduler.cancel(motionFrame);
-            motionFrame = null;
-            ambientVisualsDirty = false;
-            applyAmbientVisuals();
-            return;
-        }
-        applyAmbientVisuals();
-        ensureMotionFrame();
+        refreshMotionPauseState();
     };
     ownerDocument.addEventListener("visibilitychange", onVisibilityChange);
     // `graph.controls()` exposes the live OrbitControls instance for the configured
@@ -2598,6 +2718,65 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         // report or render the previous camera orientation.
         cameraInteractionControls?.update?.();
     }
+    function captureRecoveryCapsule() {
+        if (destroyed)
+            return null;
+        const capsule = {
+            camera: cloneCameraPose(cameraPose()),
+            recoveryKey: hostRecoveryKeyForData(currentData),
+            restoreBaseline: focusCameraBaseline ? cloneCameraPose(focusCameraBaseline) : null,
+            schemaVersion: 1,
+        };
+        if (capsule.recoveryKey === null && currentDataRevision !== null) {
+            // Keyless recovery is intentionally same-renderer only. The exact
+            // compatibility revision remains private and is lost on clone/serialize.
+            privateRecoveryRevisions.set(capsule, currentDataRevision);
+        }
+        return capsule;
+    }
+    function restoreRecoveryCapsule(capsule) {
+        const currentHostRecoveryKey = hostRecoveryKeyForData(currentData);
+        const identityMatches = capsule.recoveryKey !== null
+            ? capsule.recoveryKey === currentHostRecoveryKey
+            : currentHostRecoveryKey === null
+                && currentDataRevision !== null
+                && privateRecoveryRevisions.get(capsule) === currentDataRevision;
+        if (destroyed
+            || capsule.schemaVersion !== 1
+            || !identityMatches
+            || !isCameraPose(capsule.camera)
+            || (capsule.restoreBaseline !== null && !isCameraPose(capsule.restoreBaseline))) {
+            return false;
+        }
+        pendingSceneTransition = null;
+        cancelCameraTransition();
+        setCameraPose(cloneCameraPose(capsule.camera));
+        focusCameraBaseline = capsule.restoreBaseline
+            ? cloneCameraPose(capsule.restoreBaseline)
+            : null;
+        ambientCameraAnchor = null;
+        ambientCameraLastPose = null;
+        applyAmbientVisuals();
+        ensureMotionFrame();
+        return true;
+    }
+    const onWebGLContextLost = (event) => {
+        event.preventDefault();
+        webglRecoveryCapsule = captureRecoveryCapsule();
+        webglContextLost = true;
+        refreshMotionPauseState();
+    };
+    const onWebGLContextRestored = () => {
+        const capsule = webglRecoveryCapsule;
+        webglRecoveryCapsule = null;
+        webglContextLost = false;
+        if (capsule)
+            restoreRecoveryCapsule(capsule);
+        refreshMotionPauseState();
+    };
+    renderElement.addEventListener("webglcontextlost", onWebGLContextLost);
+    renderElement.addEventListener("webglcontextrestored", onWebGLContextRestored);
+    refreshMotionPauseState();
     function startTransition({ durationMs, reducedMotion = false, scene = null, targetCamera = null, }) {
         if (activeTransition)
             cancelCameraTransition();
@@ -2776,15 +2955,28 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const targetCamera = nodeCameraTarget(nodeId);
         if (!targetCamera)
             return;
+        focusCameraBaseline ??= cloneCameraPose(cameraPose());
         const scene = pendingSceneTransition?.targetFocusNodeId === nodeId
             ? pendingSceneTransition
             : null;
         pendingSceneTransition = null;
         startTransition({
-            durationMs: options.reducedMotion ? 0 : scene?.durationMs ?? 420,
+            durationMs: cameraTransitionDuration(options, scene?.durationMs ?? 420),
             reducedMotion: options.reducedMotion,
             scene,
             targetCamera,
+        });
+    }
+    function restoreFocusCamera(options) {
+        pendingSceneTransition = null;
+        const baseline = focusCameraBaseline;
+        if (!baseline)
+            return;
+        focusCameraBaseline = null;
+        startTransition({
+            durationMs: cameraTransitionDuration(options, 250),
+            reducedMotion: options.reducedMotion,
+            targetCamera: baseline,
         });
     }
     function getRenderObservation() {
@@ -2837,6 +3029,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
     }
     return {
         cancelCameraTransition,
+        captureRecoveryCapsule,
         destroy() {
             if (destroyed)
                 return;
@@ -2849,6 +3042,8 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             deferredDataDuringTransition = null;
             cancelCameraTransition();
             ownerDocument.removeEventListener("visibilitychange", onVisibilityChange);
+            renderElement.removeEventListener("webglcontextlost", onWebGLContextLost);
+            renderElement.removeEventListener("webglcontextrestored", onWebGLContextRestored);
             cameraInteractionControls?.removeEventListener("start", beginCameraControlInteraction);
             cameraInteractionControls?.removeEventListener("change", updateCameraControlInteraction);
             cameraInteractionControls?.removeEventListener("end", endCameraControlInteraction);
@@ -2857,6 +3052,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             ambientNodes.clear();
             ambientLinks.clear();
             nodeLightRig.removeFromParent();
+            webglRecoveryCapsule = null;
             particleGroup.removeFromParent();
             if (!particleResourcesDisposed) {
                 particleResourcesDisposed = true;
@@ -2867,6 +3063,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         },
         fit(durationMs = 250) {
             pendingSceneTransition = null;
+            focusCameraBaseline = null;
             transitionToFit(durationMs);
         },
         focus(nodeId) {
@@ -2938,7 +3135,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 particles,
                 paused: ambientPaused,
                 phase: (ambientElapsedMs / 1000) * AMBIENT_RADIANS_PER_SECOND,
-                reducedMotion: currentData.presentation.reducedMotion === true,
+                reducedMotion: reducedMotionEnabled(),
                 renderedNodePositions,
                 renderedScreenPositions,
             };
@@ -2958,10 +3155,13 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             };
         },
         resize(width, height) {
+            const requestedWidth = width ?? container.clientWidth;
+            const requestedHeight = height ?? container.clientHeight;
+            zeroSized = requestedWidth <= 0 || requestedHeight <= 0;
             const next = dimensions(container, width, height);
             rendererViewport = { width: next.width, height: next.height };
             graph.width(next.width).height(next.height);
-            if (initialFitPending && currentData) {
+            if (!zeroSized && initialFitPending && currentData) {
                 graph.zoomToFit(0, 28);
                 initialFitPending = false;
             }
@@ -2972,10 +3172,26 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 refreshDensityVisibility(true);
                 applyAmbientVisuals();
             }
+            refreshMotionPauseState();
+        },
+        resume() {
+            if (destroyed)
+                return;
+            explicitlySuspended = false;
+            refreshMotionPauseState();
         },
         restoreCamera() {
             pendingSceneTransition = null;
+            focusCameraBaseline = null;
             transitionToFit(250);
+        },
+        restoreFocusCamera,
+        restoreRecoveryCapsule,
+        setActivityState(state) {
+            if (destroyed)
+                return;
+            activityState = { ...state };
+            refreshMotionPauseState();
         },
         setData(data) {
             applyData(data);
@@ -2995,10 +3211,17 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                     applyFinalVisuals(currentData);
                 rebuildAmbientState();
                 applyAmbientVisuals();
+                refreshMotionPauseState();
                 ensureMotionFrame();
                 return;
             }
             applyData(nextData);
+        },
+        suspend() {
+            if (destroyed)
+                return;
+            explicitlySuspended = true;
+            refreshMotionPauseState();
         },
         transitionToNode,
         zoom(scale) {

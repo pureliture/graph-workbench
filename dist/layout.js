@@ -224,7 +224,8 @@ function selectedLayoutPositions(input, basePositions, nodesById, selectedNodeId
 }
 /**
  * Creates renderer-local, deterministic positions and visual cues without mutating GraphInput.
- * A selection locks only the selected node and its one-hop neighborhood to settled targets.
+ * A selection locks only the selected node and its one-hop neighborhood to settled targets
+ * unless the host asks to preserve the existing deterministic layout.
  */
 export function createRenderGraphData(input, presentation, options = {}) {
     const viewport = normalizeViewport(options.viewport);
@@ -236,8 +237,11 @@ export function createRenderGraphData(input, presentation, options = {}) {
         organicPosition(node, input.layout.seed, index, input.nodes.length),
     ]));
     const nodesById = new Map(input.nodes.map((node) => [node.id, node]));
-    const positions = selectedLayoutPositions(input, basePositions, nodesById, selectedNodeId, neighborNodeIds, viewport);
-    const settledNodeIds = new Set(selectedNodeId ? [selectedNodeId, ...neighborNodeIds] : []);
+    const preservesSelectionLayout = presentation.selectionLayout === "preserve";
+    const positions = preservesSelectionLayout
+        ? basePositions
+        : selectedLayoutPositions(input, basePositions, nodesById, selectedNodeId, neighborNodeIds, viewport);
+    const settledNodeIds = new Set(!preservesSelectionLayout && selectedNodeId ? [selectedNodeId, ...neighborNodeIds] : []);
     const nodes = input.nodes.map((node) => {
         const position = positions.get(node.id);
         const settled = settledNodeIds.has(node.id);

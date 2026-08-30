@@ -193,11 +193,36 @@ flowchart LR
 `selectNode()`는 같은 selected identity와 ordered 1-hop neighborhood를 만듭니다. `focusNode()`는
 selection을 바꾸지 않는 camera-only compatibility method입니다.
 
+Host가 pointer·keyboard gesture의 선택을 소유해야 하면 `resolveSelection`에서 **동기적으로** 수락 여부와
+후속 camera/layout 정책을 반환합니다. `false`를 반환한 gesture는 selection, renderer data, camera,
+layout과 callback을 모두 바꾸지 않습니다.
+
+```ts
+const workbench = createBrowserGraphWorkbench({
+  input,
+  resolveSelection(intent) {
+    if (!hostReducer.accepts(intent.nodeId, intent.source)) return false;
+    return intent.nodeId
+      ? { camera: { kind: "contextual", durationMs: 250 }, layout: "preserve" }
+      : { camera: { kind: "restore", durationMs: 250 }, layout: "preserve" };
+  },
+});
+```
+
+Built-in browser renderer는 focus chain의 첫 camera pose를 보관합니다. `restore`는 그 pose가 있을 때만
+복원하며, 없을 때 Fit으로 대체하지 않습니다. Custom/legacy renderer에는 해당 optional seam이 없을 수 있으므로
+host는 필요하면 자체 camera policy를 제공해야 합니다.
+
 ```ts
 workbench.selectNode("component:api", "matrix");
 
 workbench.setPresentation({
   ambientMotion: true,
+  labelVisibility: {
+    byNodeId: { "component:private": "hidden" },
+    byType: { component: "interaction", relation: "always" },
+    default: "auto",
+  },
   theme: "dark",
   nodeDescriptors: {
     "component:api": { color: "#38bdf8", label: "Public API" },
@@ -207,6 +232,15 @@ workbench.setPresentation({
 // 앱 설정이 reduced motion을 요청할 때만 사용합니다.
 // workbench.setReducedMotion(true);
 ```
+
+Label policy는 `byNodeId` → `byType` → `default` → `"auto"` 순서로 해석합니다. `hidden`은 renderer-owned
+scene label을 숨기며 node identity, keyboard path와 host detail UI를 바꾸지 않습니다. `interaction`은
+selected/neighbor/focus/hover context에서만 표시합니다.
+
+Visible host는 renderer activity를 힌트로 전달할 수 있습니다. `suspend()`/`resume()`은 scene을 버리지 않고
+renderer-owned animation만 제어합니다. Snapshot replacement 또는 WebGL recovery가 필요한 host는 정확한
+projection fingerprint를 `presentation.recoveryKey`로 제공한 뒤 `captureRecoveryCapsule()`과
+`restoreRecoveryCapsule()`을 사용할 수 있습니다. recovery key가 일치하지 않으면 복원은 `false`를 반환합니다.
 
 Mount된 container는 focus 가능해집니다. Arrow keys는 node selection을 이동하고, `Enter`는 현재 node의
 click path를 실행하며, `Escape`는 selection을 해제합니다. Canvas 밖의 접근 가능한 detail/fallback UI는
@@ -229,7 +263,7 @@ focused edge flow를 제공하며, reduced motion에서는 같은 target에 즉�
 
 | 범주 | API |
 |---|---|
-| Lifecycle | `mount`, `unmount`, `destroy` |
+| Lifecycle | `mount`, `unmount`, `destroy`, `setActivityState`, `suspend`, `resume`, `captureRecoveryCapsule`, `restoreRecoveryCapsule` |
 | Input/presentation | `setInput`, `setPresentation`, `setReducedMotion` |
 | Selection | `selectNode`, `focusNode`, `getSelectionState` |
 | Camera/layout | `resize`, `fit`, `zoom`, `restoreCamera` |

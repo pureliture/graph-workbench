@@ -40,8 +40,10 @@ class TransitionRenderer implements GraphRenderer {
   cancelCalls = 0;
   data: RenderGraphData | null = null;
   operations: string[] = [];
+  presentationCalls = 0;
   presentation: GraphPresentation | null = null;
-  transitions: Array<{ nodeId: string; reducedMotion: boolean }> = [];
+  restoreCalls = 0;
+  transitions: Array<{ durationMs?: number; nodeId: string; reducedMotion: boolean }> = [];
 
   cancelCameraTransition(): void {
     this.cancelCalls += 1;
@@ -51,14 +53,21 @@ class TransitionRenderer implements GraphRenderer {
   fit(): void {}
   focus(): void { throw new Error("enhanced transition seam should be preferred"); }
   resize(): void {}
-  restoreCamera(): void {}
+  restoreCamera(): void { this.restoreCalls += 1; }
   setData(data: RenderGraphData): void {
     this.data = data;
     this.operations.push(`data:${data.selection.nodeId ?? "null"}`);
   }
-  setPresentation(presentation: GraphPresentation): void { this.presentation = presentation; }
-  transitionToNode(nodeId: string, options: { reducedMotion: boolean }): void {
-    this.transitions.push({ nodeId, reducedMotion: options.reducedMotion });
+  setPresentation(presentation: GraphPresentation): void {
+    this.presentation = presentation;
+    this.presentationCalls += 1;
+  }
+  transitionToNode(nodeId: string, options: { durationMs?: number; reducedMotion: boolean }): void {
+    this.transitions.push({
+      ...(options.durationMs === undefined ? {} : { durationMs: options.durationMs }),
+      nodeId,
+      reducedMotion: options.reducedMotion,
+    });
   }
   zoom(): void {}
 }
@@ -127,6 +136,31 @@ describe("selection-driven layout", () => {
       ["api-web", true],
       ["docs-archive", false],
     ]));
+  });
+
+  it("keeps selected identity and visual cues while preserving the base layout", () => {
+    const base = createRenderGraphData(graphFixture, {});
+    const preserve = createRenderGraphData(graphFixture, {
+      selectedNodeIds: ["component:api"],
+      selectionLayout: "preserve",
+    });
+    const constellation = createRenderGraphData(graphFixture, {
+      selectedNodeIds: ["component:api"],
+      selectionLayout: "constellation",
+    });
+
+    expect(preserve.selection).toMatchObject({
+      nodeId: "component:api",
+      neighborNodeIds: ["relation:release", "component:web"],
+      settled: true,
+    });
+    expect(preserve.selection.targetNodePositions).toEqual(base.selection.targetNodePositions);
+    expect(preserve.nodes.every((node) => node.fx === undefined && node.fy === undefined && node.fz === undefined)).toBe(true);
+    expect(constellation.selection.targetNodePositions).not.toEqual(base.selection.targetNodePositions);
+    const selectedConstellationNode = constellation.nodes.find((node) => node.id === "component:api");
+    expect(selectedConstellationNode).toMatchObject({ visual: { labelCue: "primary", opacity: 1 } });
+    expect([selectedConstellationNode?.fx, selectedConstellationNode?.fy, selectedConstellationNode?.fz]
+      .every((value) => typeof value === "number" && Number.isFinite(value))).toBe(true);
   });
 
   it("keeps the deterministic depth field while restaging only the selected relationship lane", () => {
@@ -255,6 +289,105 @@ describe("selection-driven layout", () => {
     // the final layout first.
     expect(renderer?.cancelCalls).toBe(0);
     expect(workbench.getSelectionState()).toBe(renderer?.data?.selection);
+    expect(renderer?.presentation?.selectionLayout).toBe("constellation");
+  });
+
+  it("offers an immutable intent before mutations and leaves every selection side effect untouched when rejected", () => {
+    let callbacks: GraphRendererFactoryOptions["callbacks"] | null = null;
+    let renderer: TransitionRenderer | null = null;
+    const selectionChange = vi.fn();
+    const focusChange = vi.fn();
+    const nodeClick = vi.fn();
+    const resolveSelection = vi.fn(() => false as const);
+    const workbench = createGraphWorkbench({
+      input: graphFixture,
+      onFocusChange: focusChange,
+      onNodeClick: nodeClick,
+      onSelectionChange: selectionChange,
+      resolveSelection,
+      rendererFactory: (options) => {
+        callbacks = options.callbacks;
+        renderer = new TransitionRenderer();
+        return renderer;
+      },
+    });
+
+    workbench.mount(new FakeElement() as unknown as HTMLElement);
+    const dataCallsBefore = renderer!.operations.length;
+    const presentationCallsBefore = renderer!.presentationCalls;
+    const transitionCallsBefore = renderer!.transitions.length;
+    const cancellationCallsBefore = renderer!.cancelCalls;
+
+    callbacks?.onNodeClick("component:api");
+
+    expect(resolveSelection).toHaveBeenCalledOnce();
+    expect(resolveSelection).toHaveBeenCalledWith({
+      input: graphFixture,
+      node: graphFixture.nodes[1],
+      neighborNodeIds: ["relation:release", "component:web"],
+      nodeId: "component:api",
+      source: "mouse",
+    });
+    expect(renderer!.operations).toHaveLength(dataCallsBefore);
+    expect(renderer!.presentationCalls).toBe(presentationCallsBefore);
+    expect(renderer!.transitions).toHaveLength(transitionCallsBefore);
+    expect(renderer!.cancelCalls).toBe(cancellationCallsBefore);
+    expect(workbench.getSelectionState().nodeId).toBeNull();
+    expect(selectionChange).not.toHaveBeenCalled();
+    expect(focusChange).not.toHaveBeenCalled();
+    expect(nodeClick).not.toHaveBeenCalled();
+  });
+
+  it("applies accepted preserve and camera policies while retaining the contextual legacy fallback", () => {
+    let callbacks: GraphRendererFactoryOptions["callbacks"] | null = null;
+    let renderer: TransitionRenderer | null = null;
+    const workbench = createGraphWorkbench({
+      input: graphFixture,
+      resolveSelection: () => ({
+        camera: { durationMs: 180, kind: "contextual" },
+        layout: "preserve",
+      }),
+      rendererFactory: (options) => {
+        callbacks = options.callbacks;
+        renderer = new TransitionRenderer();
+        return renderer;
+      },
+    });
+
+    workbench.mount(new FakeElement() as unknown as HTMLElement);
+    callbacks?.onNodeClick("component:api");
+
+    expect(renderer!.presentation?.selectionLayout).toBe("preserve");
+    expect(renderer!.data?.selection).toMatchObject({
+      nodeId: "component:api",
+      neighborNodeIds: ["relation:release", "component:web"],
+    });
+    expect(renderer!.data?.nodes.every((node) => node.fx === undefined && node.fy === undefined && node.fz === undefined)).toBe(true);
+    expect(renderer!.transitions.at(-1)).toEqual({ durationMs: 180, nodeId: "component:api", reducedMotion: false });
+
+    const noneCameraWorkbench = createGraphWorkbench({
+      input: graphFixture,
+      resolveSelection: () => ({ camera: { kind: "none" }, layout: "constellation" }),
+      rendererFactory: () => renderer!,
+    });
+    noneCameraWorkbench.mount(new FakeElement() as unknown as HTMLElement);
+    const transitionsBefore = renderer!.transitions.length;
+    const cancellationsBefore = renderer!.cancelCalls;
+    noneCameraWorkbench.selectNode("component:web");
+    expect(renderer!.presentation?.selectionLayout).toBe("constellation");
+    expect(renderer!.transitions).toHaveLength(transitionsBefore);
+    expect(renderer!.cancelCalls).toBe(cancellationsBefore);
+
+    const restoreRenderer = new TransitionRenderer();
+    const restoreWorkbench = createGraphWorkbench({
+      input: graphFixture,
+      resolveSelection: () => ({ camera: { durationMs: 220, kind: "restore" } }),
+      rendererFactory: () => restoreRenderer,
+    });
+    restoreWorkbench.mount(new FakeElement() as unknown as HTMLElement);
+    restoreWorkbench.selectNode("component:web");
+    expect(restoreRenderer.restoreCalls).toBe(1);
+    expect(restoreRenderer.transitions).toHaveLength(0);
   });
 
   it("reframes a mouse-selected full cloud after a ResizeObserver-style viewport sync", () => {
