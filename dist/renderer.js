@@ -78,6 +78,13 @@ const LABEL_PROJECTED_READABILITY = Object.freeze({
     minimum: 0.18,
     startsAtPixels: 3,
 });
+// Selection-context labels are the graph's direct identity cue. Keep them
+// legible even when the one-hop framing preserves a distant camera, while
+// leaving the quiet ambient field governed by projected-size opacity.
+const INTERACTION_LABEL_MINIMUM_PIXELS = Object.freeze({
+    selected: 16,
+    contextual: 14,
+});
 // The reference graph keeps the complete topology available, but deliberately
 // limits the amount of concurrently readable text. These are renderer-local
 // presentation budgets: they never remove data, search targets, or keyboard
@@ -148,6 +155,12 @@ function labelPerspectiveReadability(cameraDistance, labelWorldHeight, projectio
         / (LABEL_PROJECTED_READABILITY.fullyReadableAtPixels - LABEL_PROJECTED_READABILITY.startsAtPixels)));
     return LABEL_PROJECTED_READABILITY.minimum
         + ((1 - LABEL_PROJECTED_READABILITY.minimum) * smoothstep(progress));
+}
+function labelScaleForMinimumPixels(cameraDistance, baseLabelHeight, nodeScale, projection, viewportHeight, minimumPixels) {
+    const halfFovRadians = (projection.fovDegrees * Math.PI) / 360;
+    const minimumWorldHeight = (minimumPixels * 2 * Math.tan(halfFovRadians)
+        * Math.max(1, cameraDistance)) / Math.max(1, viewportHeight);
+    return minimumWorldHeight / Math.max(1, baseLabelHeight * nodeScale);
 }
 function themePalette(theme) {
     return theme === "light" ? THEME_PALETTES.light : THEME_PALETTES.dark;
@@ -1845,12 +1858,20 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 ? 0.62 + (near * 0.38)
                 : IDLE_LABEL_SCALE.far + (near * IDLE_LABEL_SCALE.nearRange));
             const labelDistance = Math.hypot(state.renderedX - camera.position.x, state.renderedY - camera.position.y, state.renderedZ - camera.position.z);
+            const interactionLabelMinimumPixels = selected
+                ? INTERACTION_LABEL_MINIMUM_PIXELS.selected
+                : interactionVisible
+                    ? INTERACTION_LABEL_MINIMUM_PIXELS.contextual
+                    : 0;
+            const readableLabelScale = interactionLabelMinimumPixels > 0
+                ? Math.max(labelScale, labelScaleForMinimumPixels(labelDistance, state.defaultVisual?.baseLabelScale.y ?? 8, scale, projection, data.selection.viewport.height, interactionLabelMinimumPixels))
+                : labelScale;
             const labelPerspectiveVisibility = labelAlwaysReadable
                 ? 1
                 : labelPerspectiveReadability(labelDistance, (state.defaultVisual?.baseLabelScale.y ?? 8) * scale * labelScale, projection, data.selection.viewport.height);
             const readableLabelOpacity = contextLabelOpacity * labelPerspectiveVisibility;
             const density = densityVisibilityForNode(node.id);
-            applyAmbientDefaultNodeVisual(state, density.bodyVisible ? opacity : 0, scale, density.bodyVisible, density.labelVisible && labelVisible, density.labelVisible && labelVisible ? readableLabelOpacity : 0, density.labelVisible && labelVisible ? labelScale : 0);
+            applyAmbientDefaultNodeVisual(state, density.bodyVisible ? opacity : 0, scale, density.bodyVisible, density.labelVisible && labelVisible, density.labelVisible && labelVisible ? readableLabelOpacity : 0, density.labelVisible && labelVisible ? readableLabelScale : 0);
         }
     }
     function renderedState(id) {

@@ -29,6 +29,7 @@ vi.mock("3d-force-graph", () => ({
 import { createRenderGraphData } from "../src/layout.js";
 import { createDefaultGraphNodeObject, createThreeForceGraphRenderer } from "../src/renderer.js";
 import type { GraphInput } from "../src/contract.js";
+import type { GraphRenderNodeObservation } from "../src/renderer-contract.js";
 import { graphFixture } from "./fixtures.js";
 
 interface Coordinates {
@@ -331,6 +332,22 @@ function expectAllNodeBoundsWithinViewport(
       }
     }
   });
+}
+
+function projectedLabelHeightInPixels(
+  node: GraphRenderNodeObservation,
+  camera: { readonly position: Coordinates },
+  viewport: { readonly height: number; readonly width: number },
+): number {
+  if (!node.label.scale || !node.worldScale) return 0;
+  const distance = Math.hypot(
+    node.worldPosition.x - camera.position.x,
+    node.worldPosition.y - camera.position.y,
+    node.worldPosition.z - camera.position.z,
+  );
+  const worldHeight = node.label.scale.y * node.worldScale.y;
+  return (worldHeight * viewport.height)
+    / (2 * Math.tan((50 * Math.PI) / 360) * Math.max(1, distance));
 }
 
 function projectedEndpointInBodyCoordinates(
@@ -2162,6 +2179,79 @@ describe("Three.js camera transitions", () => {
       selectedNodeId,
       { height: 540, width: 720 },
     );
+  });
+
+  it("keeps selected interaction labels readable when a wide one-hop preserves a distant camera", () => {
+    const viewport = { height: 420, width: 820 };
+    graph.cameraProjection = { aspect: viewport.width / viewport.height, fov: 50 };
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: {
+        onBackgroundClick() {},
+        onNodeClick() {},
+        onNodeHover() {},
+      },
+      container: { clientHeight: viewport.height, clientWidth: viewport.width } as HTMLElement,
+    });
+    const input: GraphInput = {
+      schemaVersion: 1,
+      layout: { seed: "distant-interaction-labels" },
+      nodes: [
+        {
+          id: "component:selected",
+          type: "component",
+          kind: "agent",
+          label: "Component author",
+          layoutHint: { pinned: true, x: 0, y: 0, z: 0 },
+        },
+        {
+          id: "component:neighbor",
+          type: "component",
+          kind: "workflow",
+          label: "Harness creation",
+          layoutHint: { pinned: true, x: 900, y: 0, z: 0 },
+        },
+        ...Array.from({ length: 62 }, (_unused, index) => ({
+          id: `component:context-${index + 1}`,
+          type: "component" as const,
+          kind: "skill",
+          label: `Context ${index + 1}`,
+          layoutHint: {
+            pinned: true as const,
+            x: -1_800 - ((index % 8) * 30),
+            y: (Math.floor(index / 8) * 24) - 84,
+            z: ((index % 5) - 2) * 16,
+          },
+        })),
+      ],
+      links: [{
+        id: "selected-neighbor",
+        source: "component:selected",
+        target: "component:neighbor",
+        relationKind: "relates-to",
+      }],
+    };
+    graph.pose = {
+      lookAt: { x: 0, y: 0, z: 0 },
+      position: { x: 0, y: 0, z: 1_200 },
+    };
+    const data = createRenderGraphData(input, {
+      ambientMotion: false,
+      labelVisibility: {
+        byType: { component: "interaction" },
+        default: "hidden",
+      },
+      reducedMotion: true,
+      selectedNodeIds: ["component:selected"],
+    }, { viewport });
+    renderer.setData(data);
+    renderer.transitionToNode!("component:selected", { reducedMotion: true });
+
+    const camera = graph.cameraSetters.at(-1)!;
+    const observation = renderer.getRenderObservation!();
+    const selected = observation.nodes.find((node) => node.id === "component:selected")!;
+    const neighbor = observation.nodes.find((node) => node.id === "component:neighbor")!;
+    expect(projectedLabelHeightInPixels(selected, camera, viewport)).toBeGreaterThanOrEqual(16);
+    expect(projectedLabelHeightInPixels(neighbor, camera, viewport)).toBeGreaterThanOrEqual(14);
   });
 
   it("applies semantic default colors across theme and input updates while preserving descriptor overrides", () => {
