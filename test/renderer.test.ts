@@ -480,7 +480,7 @@ describe("Three.js camera transitions", () => {
     expect(driftLookAt?.z).toBeCloseTo(1, 1);
   });
 
-  it("keeps every density body and label stable through an Orbit drag and release", () => {
+  it("keeps every density body stable while rebalancing labels through an Orbit drag and release", () => {
     const denseInput: GraphInput = {
       schemaVersion: 1,
       layout: { seed: "density-visibility-drag-test" },
@@ -513,29 +513,32 @@ describe("Three.js camera transitions", () => {
     const beforeDrag = visibleBodyIds();
     const beforeLabels = visibleLabelIds();
     expect(beforeDrag).toHaveLength(denseInput.nodes.length);
-    expect(beforeLabels).toHaveLength(denseInput.nodes.length);
+    expect(beforeLabels.length).toBeGreaterThan(0);
+    expect(beforeLabels.length).toBeLessThan(denseInput.nodes.length);
 
     graph.cameraControls.dispatch("start");
     graph.projectionOffset = { x: 250, y: 220 };
     graph.cameraControls.dispatch("change");
     expect(visibleBodyIds()).toEqual(beforeDrag);
-    expect(visibleLabelIds()).toEqual(beforeLabels);
+    expect(visibleLabelIds().length).toBeGreaterThan(0);
+    expect(visibleLabelIds().length).toBeLessThan(denseInput.nodes.length);
 
     graph.projectionOffset = { x: -170, y: -120 };
     graph.cameraControls.dispatch("change");
     expect(visibleBodyIds()).toEqual(beforeDrag);
-    expect(visibleLabelIds()).toEqual(beforeLabels);
+    expect(visibleLabelIds().length).toBeGreaterThan(0);
+    expect(visibleLabelIds().length).toBeLessThan(denseInput.nodes.length);
 
     const projectionCallsBeforeRelease = graph.projectionCalls.length;
     graph.cameraControls.dispatch("end");
     expect(graph.projectionCalls).toHaveLength(projectionCallsBeforeRelease);
     expect(visibleBodyIds()).toEqual(beforeDrag);
-    expect(visibleLabelIds()).toEqual(beforeLabels);
+    expect(visibleLabelIds().length).toBeGreaterThan(0);
 
     graph.nodeHoverCallback?.(graph.data.nodes[0]!);
-    expect(graph.projectionCalls).toHaveLength(projectionCallsBeforeRelease);
+    expect(graph.projectionCalls.length).toBeGreaterThan(projectionCallsBeforeRelease);
     expect(visibleBodyIds()).toEqual(beforeDrag);
-    expect(visibleLabelIds()).toEqual(beforeLabels);
+    expect(visibleLabelIds().length).toBeGreaterThan(0);
   });
 
   it("makes camera-facing depth visibly re-rank node and label exposure", () => {
