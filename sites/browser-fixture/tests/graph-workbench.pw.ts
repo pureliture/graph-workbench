@@ -1281,7 +1281,8 @@ test("keeps a 150-node density graph gently moving at idle and isolates its sele
       && (minimumVisibleMaterialOpacity ?? null) === null
   ))).toBe(true);
   const idleReadableLabels = idle.nodes.filter(({ label }) => label.objectVisible === true);
-  expect(idleReadableLabels.length).toBe(densityNodeCount);
+  expect(idleReadableLabels.length).toBeGreaterThan(0);
+  expect(idleReadableLabels.length).toBeLessThan(densityNodeCount);
   expect(idleReadableLabels.every(({ label }) => label.objectVisible === true)).toBe(true);
   const idleVisibleBodies = idle.nodes.filter((node) => requiredNodeBody(node).objectVisible === true);
   expect(idleVisibleBodies.length).toBe(densityNodeCount);
@@ -1393,11 +1394,10 @@ test("keeps a 150-node density graph gently moving at idle and isolates its sele
 
   const selectedReadableLabels = selected.nodes.filter(({ label }) => label.objectVisible === true);
   const selectedVisibleBodies = selected.nodes.filter((node) => requiredNodeBody(node).objectVisible === true);
-  expect(selectedReadableLabels.length).toBe(densityNodeCount);
+  expect(selectedReadableLabels.length).toBeGreaterThan(focusNodeIds.length);
+  expect(selectedReadableLabels.length).toBeLessThan(densityNodeCount);
   expect(selectedVisibleBodies.length).toBe(densityNodeCount);
-  expect(selected.nodes.every((node) => (
-    node.label.objectVisible === true && requiredNodeBody(node).objectVisible === true
-  ))).toBe(true);
+  expect(selected.nodes.every((node) => requiredNodeBody(node).objectVisible === true)).toBe(true);
 
   const visibleLinks = selected.links.filter(({ objectVisible }) => objectVisible === true);
   expect(visibleLinks.map(({ id }) => id)).toEqual([

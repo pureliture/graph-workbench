@@ -64,7 +64,7 @@ const THEME_PALETTES = {
     },
 };
 // Selection still carries the strongest readability tier. Ambient depth may
-// intentionally hide unrelated far labels below this former static floor.
+// intentionally soften unrelated far labels below this static floor.
 const STATIC_LABEL_OPACITY = Object.freeze({
     far: 0.18,
     neighbor: 0.72,
@@ -78,11 +78,15 @@ const LABEL_PROJECTED_READABILITY = Object.freeze({
     minimum: 0.18,
     startsAtPixels: 3,
 });
-// The reference graph keeps the complete topology and label set available. The
-// dense selection camera still uses a threshold to decide when a focused
-// one-hop framing is preferable to a full-graph fit, but visibility is never
-// used to remove labels or bodies from the scene.
+// The reference graph keeps the complete topology and body set available. A
+// dense scene gets a bounded, projected label budget so the graph remains
+// navigable without turning every low-priority label into a collision. Bodies
+// stay visible and selection/relationship labels always win that budget.
 const DENSITY_VISIBILITY = Object.freeze({
+    labelMinimumHorizontalGap: 64,
+    labelMinimumVerticalGap: 26,
+    labelCullingAtNodeCount: 64,
+    maximumContextLabels: 42,
     selectionFramingAtNodeCount: 64,
 });
 const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 4.8, y: 3.6, z: 1.25 });
@@ -1122,16 +1126,91 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const data = currentData;
         if (!data)
             return;
-        // Keep the complete body and label set available. The reference graph
-        // reduces visual weight through depth, opacity, and projected scale; it
-        // never re-ranks nodes into an arbitrary visibility budget while the user
-        // orbits the camera. Retaining this map seam lets scene transitions and
-        // host observations share one stable visibility contract.
+        // Small graphs retain the established all-label contract. Once a scene is
+        // dense enough to make labels compete, keep every body but choose labels
+        // in the current camera projection so an orbit or resize can redistribute
+        // the readable context without changing graph topology.
         const visibilityMapComplete = densityVisibilityByNodeId.size === data.nodes.length
             && data.nodes.every((node) => densityVisibilityByNodeId.has(node.id));
-        if (!force && visibilityMapComplete)
+        if (data.nodes.length < DENSITY_VISIBILITY.labelCullingAtNodeCount) {
+            if (!force && visibilityMapComplete)
+                return;
+            densityVisibilityByNodeId = new Map(data.nodes.map((node) => [node.id, FULL_NODE_DENSITY_VISIBILITY]));
             return;
-        densityVisibilityByNodeId = new Map(data.nodes.map((node) => [node.id, FULL_NODE_DENSITY_VISIBILITY]));
+        }
+        const viewport = rendererViewport ?? data.selection.viewport;
+        const degreeByNodeId = nodeDegrees(data.links);
+        const selectedNodeId = data.selection.nodeId;
+        const forcedNodeIds = new Set([
+            selectedNodeId,
+            data.presentation.focusNodeId,
+            currentPresentation.focusNodeId,
+            hoverNodeId,
+            ...data.selection.neighborNodeIds,
+        ].filter((nodeId) => typeof nodeId === "string"));
+        const candidates = data.nodes.flatMap((node) => {
+            const state = ambientNodes.get(node.id);
+            const position = state
+                ? { x: state.renderedX, y: state.renderedY, z: state.renderedZ }
+                : nodePosition(node);
+            if (!position)
+                return [];
+            const projected = graph.graph2ScreenCoords(position.x, position.y, position.z);
+            if (![projected.x, projected.y].every(Number.isFinite))
+                return [];
+            const densityRole = typeof node.metadata?.densityRole === "string"
+                ? node.metadata.densityRole
+                : null;
+            const visualTier = typeof node.metadata?.visualTier === "string"
+                ? node.metadata.visualTier
+                : null;
+            const alwaysVisible = forcedNodeIds.has(node.id)
+                || node.roles?.includes("master") === true
+                || node.type === "relation"
+                || densityRole === "focus";
+            const priority = (alwaysVisible ? 100_000 : 0)
+                + (node.roles?.includes("master") === true ? 8_000 : 0)
+                + (node.type === "relation" ? 6_000 : 0)
+                + (densityRole === "focus" ? 5_000 : densityRole === "direct-neighbor" ? 3_000 : 0)
+                + (node.visual.labelCue === "primary" ? 1_200 : node.visual.labelCue === "visible" ? 500 : 0)
+                + (visualTier === "near" ? 250 : visualTier === "mid" ? 120 : 0)
+                + ((degreeByNodeId.get(node.id) ?? 0) * 20)
+                + stableUnit(`${node.id}:label`);
+            return [{
+                    alwaysVisible,
+                    id: node.id,
+                    priority,
+                    x: projected.x,
+                    y: projected.y,
+                }];
+        }).sort((left, right) => (right.priority - left.priority || left.id.localeCompare(right.id)));
+        const nextVisibility = new Map(data.nodes.map((node) => [node.id, { bodyVisible: true, labelVisible: false }]));
+        const occupiedLabels = [];
+        const nearOccupiedLabel = (x, y) => occupiedLabels.some((occupied) => (Math.abs(occupied.x - x) < DENSITY_VISIBILITY.labelMinimumHorizontalGap
+            && Math.abs(occupied.y - y) < DENSITY_VISIBILITY.labelMinimumVerticalGap));
+        const reserveLabel = (x, y) => {
+            occupiedLabels.push({ x, y });
+        };
+        const viewportMargin = DENSITY_VISIBILITY.labelMinimumHorizontalGap;
+        let contextLabelCount = 0;
+        for (const candidate of candidates) {
+            const insideViewport = candidate.x >= -viewportMargin
+                && candidate.x <= viewport.width + viewportMargin
+                && candidate.y >= -viewportMargin
+                && candidate.y <= viewport.height + viewportMargin;
+            if (!insideViewport && !candidate.alwaysVisible)
+                continue;
+            if (!candidate.alwaysVisible) {
+                if (contextLabelCount >= DENSITY_VISIBILITY.maximumContextLabels || nearOccupiedLabel(candidate.x, candidate.y)) {
+                    continue;
+                }
+                contextLabelCount += 1;
+            }
+            nextVisibility.set(candidate.id, { bodyVisible: true, labelVisible: true });
+            if (insideViewport)
+                reserveLabel(candidate.x, candidate.y);
+        }
+        densityVisibilityByNodeId = nextVisibility;
     }
     graph
         .backgroundColor("#08111f")
