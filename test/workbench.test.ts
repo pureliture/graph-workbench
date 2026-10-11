@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createGraphWorkbench,
   type GraphAmbientMotionLinkEndpointObservation,
+  type GraphActivityState,
   type GraphPresentation,
+  type GraphRecoveryCapsule,
   type GraphRenderObservation,
   type GraphRenderer,
   type GraphRendererFactoryOptions,
@@ -39,8 +41,19 @@ class FakeElement {
 }
 
 class FakeRenderer implements GraphRenderer {
+  activityStates: GraphActivityState[] = [];
+  capturedRecoveryCapsule: GraphRecoveryCapsule | null = {
+    camera: {
+      lookAt: { x: 0, y: 0, z: 0 },
+      position: { x: 0, y: 0, z: 160 },
+    },
+    recoveryKey: "snapshot:1",
+    restoreBaseline: null,
+    schemaVersion: 1,
+  };
   data: RenderGraphData | null = null;
   presentation: GraphPresentation | null = null;
+  restoredCapsules: GraphRecoveryCapsule[] = [];
   destroyed = false;
   focused: string | null = null;
   fitCalls: number[] = [];
@@ -51,9 +64,19 @@ class FakeRenderer implements GraphRenderer {
   fit(durationMs?: number): void { this.fitCalls.push(durationMs ?? 250); }
   focus(nodeId: string): void { this.focused = nodeId; }
   resize(width?: number, height?: number): void { this.resizeCalls.push([width, height]); }
+  resumeCalls = 0;
   restoreCamera(): void {}
+  restoreRecoveryCapsule(capsule: GraphRecoveryCapsule): boolean {
+    this.restoredCapsules.push(capsule);
+    return capsule.recoveryKey === this.capturedRecoveryCapsule?.recoveryKey;
+  }
+  captureRecoveryCapsule(): GraphRecoveryCapsule | null { return this.capturedRecoveryCapsule; }
+  setActivityState(state: GraphActivityState): void { this.activityStates.push(state); }
   setData(data: RenderGraphData): void { this.data = data; }
   setPresentation(presentation: GraphPresentation): void { this.presentation = presentation; }
+  suspendCalls = 0;
+  suspend(): void { this.suspendCalls += 1; }
+  resume(): void { this.resumeCalls += 1; }
   zoom(scale: number): void { this.zoomCalls.push(scale); }
 }
 
@@ -114,6 +137,43 @@ class ObservationRenderer extends FakeRenderer {
 }
 
 describe("GraphWorkbench", () => {
+  it("safely exposes optional lifecycle and recovery seams", () => {
+    const legacyWorkbench = createGraphWorkbench({ input: graphFixture });
+    const capsule: GraphRecoveryCapsule = {
+      camera: {
+        lookAt: { x: 0, y: 0, z: 0 },
+        position: { x: 0, y: 0, z: 160 },
+      },
+      recoveryKey: "snapshot:1",
+      restoreBaseline: null,
+      schemaVersion: 1,
+    };
+
+    expect(legacyWorkbench.captureRecoveryCapsule()).toBeNull();
+    expect(legacyWorkbench.restoreRecoveryCapsule(capsule)).toBe(false);
+    legacyWorkbench.setActivityState({ foreground: false });
+    legacyWorkbench.suspend();
+    legacyWorkbench.resume();
+
+    const renderer = new FakeRenderer();
+    const workbench = createGraphWorkbench({
+      input: graphFixture,
+      rendererFactory: () => renderer,
+    });
+    workbench.mount(new FakeElement() as unknown as HTMLElement);
+    const captured = workbench.captureRecoveryCapsule();
+    workbench.setActivityState({ expanded: false, foreground: true, intersecting: false });
+    workbench.suspend();
+    workbench.resume();
+
+    expect(captured).toBe(renderer.capturedRecoveryCapsule);
+    expect(workbench.restoreRecoveryCapsule(captured!)).toBe(true);
+    expect(renderer.restoredCapsules).toEqual([captured]);
+    expect(renderer.activityStates).toEqual([{ expanded: false, foreground: true, intersecting: false }]);
+    expect(renderer.suspendCalls).toBe(1);
+    expect(renderer.resumeCalls).toBe(1);
+  });
+
   it("keeps ambient endpoint observations source-compatible when boundary evidence is unavailable", () => {
     const legacyEndpoint: GraphAmbientMotionLinkEndpointObservation = {
       end: { x: 12, y: 8, z: 0 },

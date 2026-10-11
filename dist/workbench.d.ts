@@ -1,6 +1,6 @@
 import { type GraphInput, type GraphNode } from "./contract.js";
 import { type GraphSelectionState } from "./layout.js";
-import { type GraphRendererFactory, type GraphAmbientMotionObservation, type GraphRenderObservation, type GraphScreenPosition, type GraphTransitionObservation } from "./renderer-contract.js";
+import { type GraphRendererFactory, type GraphActivityState, type GraphAmbientMotionObservation, type GraphRecoveryCapsule, type GraphRenderObservation, type GraphScreenPosition, type GraphTransitionObservation } from "./renderer-contract.js";
 import { type GraphPresentation } from "./presentation.js";
 export interface GraphEvent {
     readonly input: GraphInput;
@@ -20,6 +20,30 @@ export interface GraphSelectionEvent extends GraphEvent {
     readonly settled: true;
     readonly source: GraphSelectionSource;
 }
+/**
+ * The complete, immutable selection candidate offered to a host before the
+ * workbench changes its presentation, graph data, camera, or callbacks.
+ */
+export interface GraphSelectionIntent extends GraphEvent {
+    /** The original GraphInput node object, never a renderer-local copy. */
+    readonly node: GraphNode | null;
+    readonly neighborNodeIds: readonly string[];
+    readonly nodeId: string | null;
+    readonly source: GraphSelectionSource;
+}
+export type GraphSelectionCameraAcceptance = {
+    readonly kind: "none";
+} | {
+    readonly durationMs?: number;
+    readonly kind: "contextual";
+} | {
+    readonly durationMs?: number;
+    readonly kind: "restore";
+};
+export interface GraphSelectionAcceptance {
+    readonly camera?: GraphSelectionCameraAcceptance;
+    readonly layout?: "constellation" | "preserve";
+}
 export interface GraphRendererState {
     readonly reason?: string;
     readonly status: "failed" | "mounted" | "unmounted";
@@ -32,9 +56,13 @@ export interface GraphWorkbenchOptions {
     readonly onNodeHover?: (event: GraphHoverEvent) => void;
     readonly onRendererStateChange?: (state: GraphRendererState) => void;
     readonly onSelectionChange?: (event: GraphSelectionEvent) => void;
+    /** Synchronously accepts, customizes, or rejects a candidate selection. */
+    readonly resolveSelection?: (intent: GraphSelectionIntent) => GraphSelectionAcceptance | false | void;
     readonly rendererFactory?: GraphRendererFactory;
 }
 export interface GraphWorkbench {
+    /** Captures optional renderer-local recovery state, or null for legacy renderers. */
+    captureRecoveryCapsule(): GraphRecoveryCapsule | null;
     destroy(): void;
     fit(durationMs?: number): void;
     focusNode(nodeId: string | null): void;
@@ -48,11 +76,19 @@ export interface GraphWorkbench {
     getSelectionState(): GraphSelectionState;
     mount(container: HTMLElement): void;
     resize(width?: number, height?: number): void;
+    /** Attempts to restore an optional renderer-local recovery capsule. */
+    restoreRecoveryCapsule(capsule: GraphRecoveryCapsule): boolean;
     restoreCamera(): void;
+    /** Resumes optional renderer-owned activity without remounting. */
+    resume(): void;
     selectNode(nodeId: string | null, source?: GraphSelectionSource): void;
     setInput(input: GraphInput): void;
+    /** Passes host visibility/activity hints to enhanced renderers. */
+    setActivityState(state: GraphActivityState): void;
     setPresentation(presentation: GraphPresentation): void;
     setReducedMotion(reducedMotion: boolean): void;
+    /** Suspends optional renderer-owned activity without disposing scene state. */
+    suspend(): void;
     unmount(): void;
     zoom(scale: number): void;
 }

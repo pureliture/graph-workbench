@@ -10,7 +10,17 @@ export interface GraphRendererCallbacks {
 }
 
 export interface GraphCameraTransitionOptions {
+  readonly durationMs?: number;
   readonly reducedMotion: boolean;
+}
+
+/** Host activity signals that can pause renderer-owned animation work. */
+export interface GraphActivityState {
+  readonly expanded?: boolean;
+  readonly foreground?: boolean;
+  readonly intersecting?: boolean;
+  /** Overrides the current presentation hint while this activity state is active. */
+  readonly reducedMotion?: boolean;
 }
 
 export interface GraphScreenPosition {
@@ -122,6 +132,18 @@ export interface GraphTransitionCameraPoseObservation {
 }
 
 /**
+ * Opaque renderer recovery state. `recoveryKey` contains only an immutable
+ * host-supplied projection key. It remains null when the host supplied none;
+ * renderer-internal compatibility state is never exposed through the capsule.
+ */
+export interface GraphRecoveryCapsule {
+  readonly camera: GraphTransitionCameraPoseObservation;
+  readonly recoveryKey: string | null;
+  readonly restoreBaseline: GraphTransitionCameraPoseObservation | null;
+  readonly schemaVersion: 1;
+}
+
+/**
  * Read-only evidence of the renderer-owned selection transaction. Positions
  * and camera pose are live values, so callers can distinguish an actual
  * intermediate frame from a final layout snapshot.
@@ -214,6 +236,8 @@ export interface GraphRenderObservation {
 export interface GraphRenderer {
   /** Optional enhanced seam. Legacy custom renderers only need the members below. */
   cancelCameraTransition?(): void;
+  /** Optional state capsule for renderer-local camera recovery. */
+  captureRecoveryCapsule?(): GraphRecoveryCapsule | null;
   destroy(): void;
   fit(durationMs?: number): void;
   focus(nodeId: string): void;
@@ -226,9 +250,19 @@ export interface GraphRenderer {
   /** Optional live selection-transition observation seam. */
   getTransitionObservation?(): GraphTransitionObservation | null;
   resize(width?: number, height?: number): void;
+  /** Resumes renderer-owned animation when host and viewport activity allow it. */
+  resume?(): void;
   restoreCamera(): void;
+  /** Restores the camera pose captured before the first focus in a focus chain. */
+  restoreFocusCamera?(options: GraphCameraTransitionOptions): void;
+  /** Applies a matching renderer-local recovery capsule without replacing the container. */
+  restoreRecoveryCapsule?(capsule: GraphRecoveryCapsule): boolean;
+  /** Optional host activity seam. Omitted booleans default to active. */
+  setActivityState?(state: GraphActivityState): void;
   setData(data: RenderGraphData): void;
   setPresentation(presentation: GraphPresentation): void;
+  /** Explicitly pauses renderer-owned animation without disposing scene state. */
+  suspend?(): void;
   /** Optional enhanced seam for a cancellable selection camera transition. */
   transitionToNode?(nodeId: string, options: GraphCameraTransitionOptions): void;
   zoom(scale: number): void;
