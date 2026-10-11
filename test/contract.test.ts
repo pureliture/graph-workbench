@@ -5,6 +5,7 @@ import {
   createRenderGraphData,
   graphInputJsonSchema,
   validateGraphInput,
+  type GraphInput,
 } from "../src/index.js";
 import { graphFixture } from "./fixtures.js";
 
@@ -38,5 +39,24 @@ describe("GraphInput", () => {
       second.nodes.map(({ id, x, y, z }) => ({ id, x, y, z })),
     );
     expect(graphFixture.nodes[0]).not.toHaveProperty("x");
+  });
+
+  it("spreads a large semantic kind across multiple organic pockets", () => {
+    const denseInput: GraphInput = {
+      schemaVersion: 1,
+      layout: { seed: "same-kind-spread" },
+      nodes: Array.from({ length: 30 }, (_unused, index) => ({
+        id: `component:dense-${index + 1}`,
+        type: "component",
+        kind: "skill",
+        label: `Skill ${index + 1}`,
+      })),
+      links: [],
+    };
+
+    const nodes = createRenderGraphData(denseInput, {}).nodes;
+    const xValues = nodes.map((node) => node.x);
+
+    expect(Math.max(...xValues) - Math.min(...xValues)).toBeGreaterThan(120);
   });
 });

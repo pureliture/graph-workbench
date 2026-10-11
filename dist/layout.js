@@ -26,16 +26,17 @@ function organicPosition(node, seed, index, total) {
     }
     // A uniform sphere makes a small graph read as a diagram projected onto a
     // balloon. The workbench instead starts as a few vertically biased pockets:
-    // nodes in the same semantic lane have a coherent anchor, while a stable
-    // per-node offset keeps the composition organic and legible in perspective.
-    const clusterCount = Math.max(2, Math.min(5, Math.ceil(Math.sqrt(Math.max(1, total)) / 1.35)));
-    const clusterIndex = hash(`${seed}:${node.kind ?? node.type}:cluster`) % clusterCount;
+    // nodes in the same semantic lane have related anchors, while a stable
+    // per-node cluster bucket and offset keep the composition organic and
+    // legible in perspective without collapsing a large kind into one pocket.
+    const clusterCount = Math.max(2, Math.min(12, Math.ceil(Math.sqrt(Math.max(1, total)) / 1.1)));
+    const clusterIndex = hash(`${seed}:${node.kind ?? node.type}:${node.id}:cluster`) % clusterCount;
     const clusterAngle = ((clusterIndex / clusterCount) * Math.PI * 2)
         + ((unit(`${seed}:${node.id}:cluster-angle`) - 0.5) * 0.54);
     const clusterRadius = 52 + (unit(`${seed}:${node.id}:cluster-radius`) * 34);
     const pocketX = Math.cos(clusterAngle) * clusterRadius;
     const pocketY = Math.sin(clusterAngle) * clusterRadius * 0.72;
-    const verticalBand = (((index / Math.max(1, total - 1)) - 0.5) * 128)
+    const verticalBand = (((index / Math.max(1, total - 1)) - 0.5) * 144)
         + ((unit(`${seed}:${node.id}:vertical`) - 0.5) * 28);
     const localRadius = 12 + (unit(`${seed}:${node.id}:local-radius`) * 32);
     const localAngle = unit(`${seed}:${node.id}:local-angle`) * Math.PI * 2;

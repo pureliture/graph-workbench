@@ -522,8 +522,7 @@ kbd {
 .detail-panel {
   position: fixed;
   z-index: 14;
-  /* Keep the global command controls in the exposed top rail reachable while
-     a selected node's details are open. */
+  /* Keep the graph controls reachable while selected-node details are open. */
   top: 4.15rem;
   right: 0;
   bottom: 0;
@@ -554,9 +553,8 @@ kbd {
 }
 
 .density-fixture[data-detail-open="true"] .graph-stage {
-  /* AI Coding Dictionary keeps a full-width WebGL field behind its drawer.
-     Translating that field by half the drawer width puts the camera centre in
-     the centre of the exposed canvas without shrinking or refitting it. */
+  /* Keep a full-width WebGL field behind the selected-node rail. Translating
+     by half the rail width centers the exposed graph without refitting it. */
   padding-inline-end: 0;
 }
 
@@ -1114,6 +1112,239 @@ dd {
   font-weight: 700;
 }
 
+/* Keep the density fixture on the existing workbench surface. Reference-only
+   styling is limited to graph interactions and selected-node content. */
+.density-fixture {
+  --density-ink: var(--text);
+  --density-muted: var(--muted);
+  --density-paper: var(--bg);
+  --density-paper-strong: var(--surface-0);
+  --density-rule: var(--line);
+  color: var(--density-ink);
+  background: var(--density-paper);
+}
+
+.semantic-fallback {
+  position: absolute;
+  z-index: -1;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.density-fixture[data-renderer-failed="true"] .semantic-fallback {
+  position: absolute;
+  z-index: 20;
+  inset: 5rem 1rem 1rem;
+  width: auto;
+  height: auto;
+  overflow: auto;
+  clip: auto;
+  clip-path: none;
+  padding: 1rem;
+  border: 1px solid var(--density-rule);
+  background: var(--density-paper-strong);
+  white-space: normal;
+}
+
+.semantic-fallback ul {
+  display: grid;
+  gap: 0.36rem;
+  padding-left: 1.2rem;
+}
+
+.semantic-fallback li {
+  display: grid;
+  gap: 0.12rem;
+}
+
+.semantic-fallback li span {
+  color: var(--density-muted);
+}
+
+.density-detail-heading {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: block;
+  padding: 1.25rem 1.25rem 1.1rem;
+  background: color-mix(in srgb, var(--density-paper-strong) 96%, transparent);
+}
+
+.density-detail-heading .drawer-close {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+}
+
+.density-detail-meta {
+  display: flex;
+  gap: 0.8rem;
+  align-items: baseline;
+  justify-content: space-between;
+  padding-right: 3.3rem;
+}
+
+.density-detail-meta > span {
+  color: var(--density-muted);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+}
+
+.density-detail-heading h2 {
+  margin-top: 0.25rem;
+  font-family: var(--font-mono);
+  font-size: clamp(1.35rem, 2.8vw, 2.1rem);
+  font-weight: 500;
+  letter-spacing: -0.06em;
+}
+
+.density-detail-heading .detail-summary {
+  max-width: 31rem;
+  margin: 0.6rem 0 0;
+}
+
+.density-detail-panel {
+  overflow: hidden;
+  color: var(--density-ink);
+  background: var(--density-paper-strong);
+  border-left-color: var(--density-rule);
+}
+
+.density-detail-panel .detail-content {
+  overflow: auto;
+  padding: 0 1.25rem 1.25rem;
+  overscroll-behavior: contain;
+}
+
+.density-detail-panel dl div {
+  border-bottom-color: var(--density-rule);
+}
+
+.density-content-block {
+  margin-top: 1.15rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--density-rule);
+}
+
+.density-content-block > p:not(.panel-kicker),
+.density-content-block li {
+  color: var(--density-ink);
+  line-height: 1.6;
+}
+
+.heard-block {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.heard-question {
+  margin: 0;
+  font-weight: 650;
+}
+
+.heard-block blockquote {
+  margin: 0;
+  border-left: 2px solid var(--density-ink);
+  padding-left: 0.8rem;
+  color: var(--density-muted);
+}
+
+.density-bullet-list {
+  display: grid;
+  gap: 0.4rem;
+  padding-left: 1.2rem;
+}
+
+.density-detail-table {
+  width: 100%;
+  margin-top: 0.8rem;
+  border-collapse: collapse;
+  font-size: 0.72rem;
+}
+
+.density-detail-table caption {
+  margin-bottom: 0.35rem;
+  color: var(--density-muted);
+  text-align: left;
+}
+
+.density-detail-table th,
+.density-detail-table td {
+  border: 1px solid var(--density-rule);
+  padding: 0.42rem 0.48rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.density-detail-table th {
+  font-weight: 700;
+}
+
+.read-more-button,
+.inline-term-link,
+.density-source-link {
+  color: var(--density-ink);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  text-decoration: underline;
+  text-underline-offset: 0.16em;
+}
+
+.read-more-button,
+.inline-term-link {
+  width: fit-content;
+  border: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.detail-usage {
+  margin-top: 0.8rem;
+}
+
+.density-surfaces > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.34rem;
+}
+
+.density-surfaces > div span {
+  border: 1px solid var(--density-rule);
+  border-radius: 999px;
+  padding: 0.26rem 0.48rem;
+  color: var(--density-muted);
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+}
+
+.density-avoid {
+  border-color: color-mix(in srgb, #d56b4e 46%, var(--density-rule));
+}
+
+.density-source-link {
+  display: inline-block;
+  margin-top: 1.2rem;
+}
+
+.density-detail-panel .detail-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.density-detail-panel .detail-navigation {
+  position: sticky;
+  bottom: 0;
+  z-index: 3;
+  margin-inline: -1.25rem;
+  margin-bottom: -1.25rem;
+  padding: 0.75rem 1.25rem 1.25rem;
+  border-top: 1px solid var(--density-rule);
+  background: color-mix(in srgb, var(--density-paper-strong) 96%, transparent);
+}
+
 @media (max-width: 62rem) {
   :root {
     --drawer-width: min(20rem, 39vw);
@@ -1288,6 +1519,8 @@ dd {
   *::before,
   *::after {
     scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
 }
