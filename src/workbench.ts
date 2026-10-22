@@ -448,6 +448,11 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
         renderer.resize();
         transitionToSelection(selectionState.nodeId);
         frameSearchMatches();
+        // An idle load plays the reference sweep home; selections, shared
+        // search links, and reduced motion skip straight to their own frame.
+        if (!selectionState.nodeId && !searchFramedCamera && presentation.reducedMotion !== true) {
+          renderer.playIntroSweep?.();
+        }
         options.onRendererStateChange?.({ status: "mounted" });
       } catch (error) {
         container.removeEventListener("keydown", onKeyDown);

@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  BackSide,
   BoxGeometry,
   Color,
   Group,
@@ -32,6 +31,12 @@ import { createDefaultGraphNodeObject, createThreeForceGraphRenderer } from "../
 import type { GraphInput } from "../src/contract.js";
 import { graphFixture } from "./fixtures.js";
 
+// Reference node radius from the connection degree:
+// 2.2 + log1p(inDegree)/log1p(37)*6.5. Label anchors keep their kind offset.
+function degreeRadius(degree: number): number {
+  return 2.2 + ((Math.log1p(Math.max(0, degree)) / Math.log1p(37)) * 6.5);
+}
+
 interface Coordinates {
   x: number;
   y: number;
@@ -44,6 +49,7 @@ class FakeCameraControls {
   readonly listeners = new Map<CameraControlEvent, Set<() => void>>();
   dampingFactor = 0.05;
   enableDamping = false;
+  rotateSpeed = 1;
   target = { x: 0, y: 0, z: 0 };
   zoomToCursor = false;
 
@@ -505,7 +511,8 @@ describe("Three.js camera transitions", () => {
     });
     expect(graph.nodeDragEnabled).toBe(false);
     expect(graph.cameraControls.enableDamping).toBe(true);
-    expect(graph.cameraControls.dampingFactor).toBe(0.08);
+    expect(graph.cameraControls.dampingFactor).toBe(0.05);
+    expect(graph.cameraControls.rotateSpeed).toBe(0.6);
     expect(graph.cameraControls.zoomToCursor).toBe(true);
     renderer.setData(createRenderGraphData(graphFixture, { selectedNodeIds: ["component:api"] }));
 
@@ -540,11 +547,18 @@ describe("Three.js camera transitions", () => {
 
     expect(renderer.getTransitionObservation!()?.camera.lookAt).toEqual({ x: 3, y: -2, z: 1 });
     runLatestFrame(0);
-    runLatestFrame(16);
-    const driftLookAt = graph.cameraSetters.at(-1)?.lookAt;
-    expect(driftLookAt?.x).toBeCloseTo(3, 1);
-    expect(driftLookAt?.y).toBeCloseTo(-2, 1);
-    expect(driftLookAt?.z).toBeCloseTo(1, 1);
+    runLatestFrame(300);
+    const settled = { ...graph.pose.position };
+    // The idle camera drifts by rotating around the live Orbit target after a
+    // quiet half second, so the target must stay fixed while the position
+    // swings around it.
+    runLatestFrame(600);
+    runLatestFrame(1200);
+    const drift = graph.cameraSetters.at(-1)!;
+    expect(drift.lookAt).toEqual({ x: 3, y: -2, z: 1 });
+    expect(drift.position.y).toBeCloseTo(settled.y, 1);
+    const swung = Math.hypot(drift.position.x - settled.x, drift.position.z - settled.z);
+    expect(swung).toBeGreaterThan(1);
   });
 
   it("keeps every density body stable while rebalancing labels through an Orbit drag and release", () => {
@@ -1056,9 +1070,7 @@ describe("Three.js camera transitions", () => {
       const body = source.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
       expect(body.userData.graphDefaultNodeSilhouette).toBe(silhouette);
       expect(body.geometry.type).toBe("SphereGeometry");
-      const outline = source.children.find((child) => child.userData.graphVisualRole === "outline") as Mesh;
       const rim = source.children.find((child) => child.userData.graphVisualRole === "focus-rim") as Mesh;
-      expect(outline.geometry).toBe(body.geometry);
       expect(rim.geometry).toBe(body.geometry);
       expect(new Vector3(endpoint.start.x, endpoint.start.y, endpoint.start.z)
         .distanceTo(source.getWorldPosition(new Vector3()))).toBeGreaterThan(0.1);
@@ -1472,12 +1484,12 @@ describe("Three.js camera transitions", () => {
     const body = nodeObject.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
     const label = nodeObject.children.find((child) => child.userData.graphVisualRole === "node-label") as Sprite;
     expect(linkObject).toBeInstanceOf(Line);
-    expect(body.material).toBeInstanceOf(MeshStandardMaterial);
+    expect(body.material).toBeInstanceOf(MeshBasicMaterial);
     expect(label.material).toBeInstanceOf(SpriteMaterial);
     const link = linkObject as Line;
     expect(link.material).toBeInstanceOf(LineBasicMaterial);
 
-    const bodyMaterial = body.material as MeshStandardMaterial;
+    const bodyMaterial = body.material as MeshBasicMaterial;
     const labelMaterial = label.material as SpriteMaterial;
     const linkMaterial = link.material as LineBasicMaterial;
     const particleGroup = graph.sceneRoot.children.find((child) => child.name === "graph-workbench-flow-particles")!;
@@ -1586,10 +1598,15 @@ describe("Three.js camera transitions", () => {
     const idleFar = idle.nodes.find((node) => node.id === "component:web")!;
     const idleLink = idle.links.find((link) => link.id === "api-web")!;
 
-    // Renderer observations, rather than color constants alone, protect the
-    // actual default material opacity that reaches the dark field.
-    expect(idleNear.bodyMaterialColor).toBe("#60a5fa");
-    expect(idleFar.bodyMaterialColor).toBe("#f59e0b");
+    // Bodies stay opaque and dim by mixing toward the background: the near
+    // node keeps most of its skill blue while the far node drops toward the
+    // dark field, which is what makes the quiet graph readable.
+    const expectedIdleColor = (base: string, nodeId: string) => {
+      const node = idle.nodes.find((candidate) => candidate.id === nodeId)!;
+      return `#${new Color(base).lerp(new Color("#19192b"), 1 - (node.body!.minimumVisibleMaterialOpacity ?? 1)).getHexString()}`;
+    };
+    expect(idleNear.bodyMaterialColor).toBe(expectedIdleColor("#60a5fa", "component:api"));
+    expect(idleFar.bodyMaterialColor).toBe(expectedIdleColor("#f59e0b", "component:web"));
     expect(idleNear.minimumVisibleMaterialOpacity).toBeGreaterThanOrEqual(0.5);
     expect(idleFar.minimumVisibleMaterialOpacity).toBeGreaterThan(0);
     expect(idleNear.minimumVisibleMaterialOpacity).toBeGreaterThan(idleFar.minimumVisibleMaterialOpacity!);
@@ -1720,17 +1737,18 @@ describe("Three.js camera transitions", () => {
       objectTracked: true,
       objectVisible: true,
       sceneAttached: true,
-      position: { id: "component:web", x: 0, y: 4.8, z: 0 },
+      position: { id: "component:web", x: 0, y: degreeRadius(1) + 3.2, z: 0 },
       transparent: true,
     });
     expect(selected?.label.scale?.x).toBeGreaterThan(0);
 
     const selectedBody = initialWebObject?.children.find((child) => child instanceof Mesh) as Mesh | undefined;
-    const selectedMaterial = selectedBody?.material as MeshStandardMaterial;
-    expect(selectedMaterial).toBeInstanceOf(MeshStandardMaterial);
-    expect("emissive" in selectedMaterial).toBe(true);
-    expect(selectedMaterial.metalness).toBeCloseTo(0.22);
-    expect(selectedMaterial.roughness).toBeCloseTo(0.58);
+    const selectedMaterial = selectedBody?.material as MeshBasicMaterial;
+    expect(selectedMaterial).toBeInstanceOf(MeshBasicMaterial);
+    expect("metalness" in selectedMaterial).toBe(false);
+    expect("roughness" in selectedMaterial).toBe(false);
+    expect(selectedMaterial.transparent).toBe(false);
+    expect(selectedMaterial.depthWrite).toBe(true);
   });
 
   it("keeps quiet light-mode bodies readable while hiding nonincident links", () => {
@@ -2405,7 +2423,10 @@ describe("Three.js camera transitions", () => {
     );
 
     renderer.setData(createRenderGraphData(semanticFixture, { theme: "dark" }));
-    expect(nodeColors()).toMatchObject({
+    // Bodies stay opaque and dim by mixing toward the background, so the
+    // assertion checks the dimmed tone against the observed body opacity
+    // instead of the raw palette hex.
+    const darkBases: Record<string, string> = {
       "component:agent": "#c4b5fd",
       "component:command": "#22d3ee",
       "component:composite": "#facc15",
@@ -2417,19 +2438,8 @@ describe("Three.js camera transitions", () => {
       "profile:ops": "#a5b4fc",
       "relation:release": "#fb7185",
       "relation:unknown": "#cbd5e1",
-    });
-    // The renderer owns this semantic-to-silhouette mapping. A custom factory
-    // reports null instead, so a host never has to reproduce this visual rule.
-    expect(defaultBodies()).toMatchObject({
-      "component:leaf": { kind: "flat-2.5d", silhouette: "dot" },
-      "profile:ops": { kind: "flat-2.5d", silhouette: "circle" },
-      "relation:release": { kind: "flat-2.5d", silhouette: "capsule" },
-      "relation:unknown": { kind: "flat-2.5d", silhouette: "disk" },
-    });
-    const darkFallback = nodeColors()["concept:hub"];
-
-    renderer.setPresentation({ theme: "light" });
-    expect(nodeColors()).toMatchObject({
+    };
+    const lightBases: Record<string, string> = {
       "component:agent": "#6d28d9",
       "component:command": "#0e7490",
       "component:composite": "#a16207",
@@ -2441,20 +2451,46 @@ describe("Three.js camera transitions", () => {
       "profile:ops": "#4338ca",
       "relation:release": "#be123c",
       "relation:unknown": "#334155",
-    });
-    const lightFallback = nodeColors()["concept:hub"];
-    const luminance = (color: string) => {
-      const rgb = new Color(color);
-      return (0.2126 * rgb.r) + (0.7152 * rgb.g) + (0.0722 * rgb.b);
     };
-    expect(luminance(darkFallback ?? "#000000"))
-      .toBeGreaterThan(luminance(lightFallback ?? "#ffffff"));
+    const expectDimmedBodyColor = (bases: Record<string, string>, background: string) => {
+      const nodes = renderer.getRenderObservation!()!.nodes;
+      for (const [id, base] of Object.entries(bases)) {
+        const node = nodes.find((candidate) => candidate.id === id)!;
+        const expected = `#${new Color(base).lerp(new Color(background), 1 - (node.body!.minimumVisibleMaterialOpacity ?? 1)).getHexString()}`;
+        expect(node.bodyMaterialColor).toBe(expected);
+      }
+    };
+    expectDimmedBodyColor(darkBases, "#19192b");
+    // The renderer owns this semantic-to-silhouette mapping. A custom factory
+    // reports null instead, so a host never has to reproduce this visual rule.
+    expect(defaultBodies()).toMatchObject({
+      "component:leaf": { kind: "flat-2.5d", silhouette: "dot" },
+      "profile:ops": { kind: "flat-2.5d", silhouette: "circle" },
+      "relation:release": { kind: "flat-2.5d", silhouette: "capsule" },
+      "relation:unknown": { kind: "flat-2.5d", silhouette: "disk" },
+    });
+    const darkFallback = nodeColors()["concept:hub"];
+
+    renderer.setPresentation({ theme: "light" });
+    expectDimmedBodyColor(lightBases, "#f6f9fe");
+    const lightFallback = nodeColors()["concept:hub"];
+    // Both themes dim toward their own background, so the test pins the tone
+    // switch itself rather than a brightness ordering.
+    expect(darkFallback).toMatch(/^#[0-9a-f]{6}$/);
+    expect(lightFallback).toMatch(/^#[0-9a-f]{6}$/);
+    expect(darkFallback).not.toBe(lightFallback);
 
     renderer.setData(createRenderGraphData(semanticFixture, {
       theme: "light",
       nodeDescriptors: { "component:skill": { color: "#f0abfc" } },
     }));
-    expect(nodeColors()["component:skill"]).toBe("#f0abfc");
+    // The descriptor override wins over the semantic kind color; the rendered
+    // tone is still dimmed toward the background like any other body.
+    {
+      const node = renderer.getRenderObservation!()!.nodes.find((candidate) => candidate.id === "component:skill")!;
+      const expected = `#${new Color("#f0abfc").lerp(new Color("#f6f9fe"), 1 - (node.body!.minimumVisibleMaterialOpacity ?? 1)).getHexString()}`;
+      expect(node.bodyMaterialColor).toBe(expected);
+    }
 
     renderer.setData(createRenderGraphData({
       ...semanticFixture,
@@ -2465,7 +2501,11 @@ describe("Three.js camera transitions", () => {
     }, { theme: "light" }));
     // The input update gives the former leaf degree two, so it falls back to
     // its routine semantic kind instead of retaining the leaf amber.
-    expect(nodeColors()["component:leaf"]).toBe("#1d4ed8");
+    {
+      const node = renderer.getRenderObservation!()!.nodes.find((candidate) => candidate.id === "component:leaf")!;
+      const expected = `#${new Color("#1d4ed8").lerp(new Color("#f6f9fe"), 1 - (node.body!.minimumVisibleMaterialOpacity ?? 1)).getHexString()}`;
+      expect(node.bodyMaterialColor).toBe(expected);
+    }
   });
 
   it("refreshes cached default silhouettes and shape-dependent label bases after topology or type changes", () => {
@@ -2510,11 +2550,11 @@ describe("Three.js camera transitions", () => {
     const profileBefore = bodyAndLabel("profile");
     expect(leafBefore.body.userData.graphDefaultNodeSilhouette).toBe("dot");
     expect(relationBefore.body.userData.graphDefaultNodeSilhouette).toBe("disk");
-    expect(relationBefore.label.position.y).toBe(10.6);
+    expect(relationBefore.label.position.y).toBeCloseTo(degreeRadius(2) + 3.8, 5);
     expect((relationBefore.label.userData.graphBaseLabelScale as Coordinates).y).toBe(10);
     expect(profileBefore.body.userData.graphDefaultNodeSilhouette).toBe("circle");
     profileBefore.body.geometry.computeBoundingBox();
-    expect(profileBefore.body.geometry.boundingBox?.max.x).toBeCloseTo(3.8);
+    expect(profileBefore.body.geometry.boundingBox?.max.x).toBeCloseTo(degreeRadius(2), 5);
 
     renderer.setData(createRenderGraphData({
       ...initial,
@@ -2535,18 +2575,18 @@ describe("Three.js camera transitions", () => {
     expect(leafAfter.object).toBe(leafBefore.object);
     expect(leafAfter.body).toBe(leafBefore.body);
     expect(leafAfter.body.userData.graphDefaultNodeSilhouette).toBe("circle");
-    expect(leafAfter.label.position.y).toBe(6.6);
+    expect(leafAfter.label.position.y).toBeCloseTo(degreeRadius(2) + 3.8, 5);
     expect((leafAfter.label.userData.graphBaseLabelScale as Coordinates).y).toBe(8);
     expect(relationAfter.object).toBe(relationBefore.object);
     expect(relationAfter.body.userData.graphDefaultNodeSilhouette).toBe("circle");
-    expect(relationAfter.label.position.y).toBe(6.6);
+    expect(relationAfter.label.position.y).toBeCloseTo(degreeRadius(2) + 3.8, 5);
     expect((relationAfter.label.userData.graphBaseLabelScale as Coordinates).y).toBe(8);
-    expect(relationAfter.label.userData.graphBaseLabelAnchorY).toBe(6.6);
+    expect(relationAfter.label.userData.graphBaseLabelAnchorY).toBeCloseTo(degreeRadius(2) + 3.8, 5);
     expect((relationAfter.label.userData.graphBaseLabelScale as Coordinates).y).toBe(8);
     expect(profileAfter.object).toBe(profileBefore.object);
     expect(profileAfter.body.userData.graphDefaultNodeSilhouette).toBe("circle");
     profileAfter.body.geometry.computeBoundingBox();
-    expect(profileAfter.body.geometry.boundingBox?.max.x).toBeCloseTo(2.8);
+    expect(profileAfter.body.geometry.boundingBox?.max.x).toBeCloseTo(degreeRadius(2), 5);
 
     const observation = renderer.getAmbientMotionObservation!()!;
     const leafBoundary = observation.linkEndpoints.find((endpoint) => endpoint.id === "leaf-target")?.sourceBoundary;
@@ -2558,7 +2598,7 @@ describe("Three.js camera transitions", () => {
     });
   });
 
-  it("uses spherical lit node materials with a restrained shell and selection ring", () => {
+  it("uses flat matte node materials with a halo-backed label and selection ring", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -2572,28 +2612,63 @@ describe("Three.js camera transitions", () => {
     const object = graph.nodeObjects.get("component:api")!;
     const body = object.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
     const label = object.children.find((child) => child.userData.graphVisualRole === "node-label") as Mesh;
-    expect(body.material).toBeInstanceOf(MeshStandardMaterial);
-    expect((body.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
-    expect((body.material as MeshStandardMaterial).depthWrite).toBe(false);
-    expect((body.material as MeshStandardMaterial).metalness).toBeCloseTo(0.22);
-    expect((body.material as MeshStandardMaterial).roughness).toBeCloseTo(0.58);
+    // Reference discs are unlit and opaque: no metalness/roughness/emissive
+    // response, no depth-write gaps, no outline shell.
+    expect(body.material).toBeInstanceOf(MeshBasicMaterial);
+    // Idle bodies dim by mixing toward the background instead of fading
+    // opacity, so the tone is the dimmed skill color, not the raw palette hex.
+    {
+      const observed = renderer.getRenderObservation!()!.nodes.find((node) => node.id === "component:api")!;
+      const expected = new Color("#334155").lerp(new Color("#f6f9fe"), 1 - (observed.body!.minimumVisibleMaterialOpacity ?? 1)).getHexString();
+      expect((body.material as MeshBasicMaterial).color.getHexString()).toBe(expected);
+    }
+    expect((body.material as MeshBasicMaterial).depthWrite).toBe(true);
+    expect((body.material as MeshBasicMaterial).transparent).toBe(false);
+    expect("metalness" in body.material).toBe(false);
+    expect("roughness" in body.material).toBe(false);
     expect(body.geometry.type).toBe("SphereGeometry");
     expect((label.material as MeshStandardMaterial).color.getHexString()).toBe("334155");
     expect((label.material as MeshStandardMaterial).transparent).toBe(true);
-    const outline = object.children.find((child) => child.userData.graphVisualRole === "outline") as Mesh;
+    // The halo needs a real canvas, so it is covered with a stubbed document
+    // below; in a DOM-less host the factory skips it like the glyph texture.
+    expect(object.children.find((child) => child.userData.graphVisualRole === "node-label-halo")).toBeUndefined();
     const rim = object.children.find((child) => child.userData.graphVisualRole === "focus-rim") as Mesh;
-    expect(outline).toBeInstanceOf(Mesh);
-    expect(outline.geometry).toBe(body.geometry);
-    expect(outline.scale.x).toBeCloseTo(1.08);
-    expect(outline.material).toBeInstanceOf(MeshBasicMaterial);
-    expect((outline.material as MeshBasicMaterial).side).toBe(BackSide);
-    expect((outline.material as MeshBasicMaterial).opacity).toBeCloseTo(
-      (body.material as MeshStandardMaterial).opacity * 0.72,
-    );
     expect(rim).toBeInstanceOf(Mesh);
     expect(rim.geometry).toBe(body.geometry);
     expect(rim.scale.x).toBeCloseTo(1.16);
     expect(rim.visible).toBe(false);
+  });
+
+  it("backs labels with a background halo when a canvas is available", () => {
+    const context = {
+      fillStyle: "",
+      font: "",
+      textAlign: "start",
+      textBaseline: "alphabetic",
+      fillText: vi.fn(),
+      measureText: () => ({ width: 120 }),
+    };
+    vi.stubGlobal("document", {
+      createElement: vi.fn(() => ({
+        getContext: () => context,
+        height: 0,
+        width: 0,
+      })),
+    });
+    const renderer = createThreeForceGraphRenderer({
+      callbacks: { onBackgroundClick() {}, onNodeClick() {}, onNodeHover() {} },
+      container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
+    });
+    renderer.setData(createRenderGraphData(graphFixture, { theme: "dark" }));
+
+    const object = graph.nodeObjects.get("component:api")!;
+    const halo = object.children.find((child) => child.userData.graphVisualRole === "node-label-halo") as Sprite;
+    const label = object.children.find((child) => child.userData.graphVisualRole === "node-label") as Sprite;
+    expect(halo).toBeInstanceOf(Sprite);
+    expect((halo.material as SpriteMaterial).color.getHexString())
+      .toBe(new Color("#19192b").getHexString());
+    expect(halo.renderOrder).toBe(41);
+    expect((halo.scale.x / label.scale.x)).toBeCloseTo(1.14, 1);
   });
 
   it("keeps renderer-owned volumetric bodies depth-capable through nested transforms", () => {
@@ -2641,7 +2716,7 @@ describe("Three.js camera transitions", () => {
       .toEqual({ kind: "flat-2.5d", silhouette: "circle" });
   });
 
-  it("keeps lit body colors synchronized across palette updates", () => {
+  it("keeps flat matte body colors synchronized across palette updates", () => {
     const renderer = createThreeForceGraphRenderer({
       callbacks: {
         onBackgroundClick() {},
@@ -2650,42 +2725,45 @@ describe("Three.js camera transitions", () => {
       },
       container: { clientHeight: 540, clientWidth: 720 } as HTMLElement,
     });
-    const bodyMaterial = (nodeId: string): MeshStandardMaterial => {
+    const bodyMaterial = (nodeId: string): MeshBasicMaterial => {
       const object = graph.nodeObjects.get(nodeId)!;
       const body = object.children.find((child) => child.userData.graphVisualRole === "body") as Mesh;
-      expect(body.material).toBeInstanceOf(MeshStandardMaterial);
-      return body.material as MeshStandardMaterial;
+      expect(body.material).toBeInstanceOf(MeshBasicMaterial);
+      return body.material as MeshBasicMaterial;
     };
-    const expectLitColor = (material: MeshStandardMaterial, color: string) => {
-      expect(material.color.getHexString()).toBe(new Color(color).getHexString());
-      expect("clearcoat" in material).toBe(false);
-      expect("emissive" in material).toBe(true);
-      const relation = color === "#fb7185";
-      expect(material.metalness).toBeCloseTo(relation ? 0.36 : 0.22);
-      expect(material.roughness).toBeCloseTo(relation ? 0.4 : 0.58);
+    // Dimming mixes the palette tone toward the background instead of fading
+    // opacity, so the synchronized color is the dimmed tone of the exact base.
+    const expectFlatColor = (nodeId: string, color: string, background: string) => {
+      const material = bodyMaterial(nodeId);
+      const body = renderer.getRenderObservation!()!.nodes.find((node) => node.id === nodeId)!.body!;
+      const expected = new Color(color).lerp(new Color(background), 1 - (body.minimumVisibleMaterialOpacity ?? 1)).getHexString();
+      expect(material.color.getHexString()).toBe(expected);
+      expect("metalness" in material).toBe(false);
+      expect(material.transparent).toBe(false);
+      expect(material.depthWrite).toBe(true);
     };
 
     renderer.setData(createRenderGraphData(graphFixture, { theme: "dark" }));
     const darkWeb = bodyMaterial("component:web");
-    expectLitColor(darkWeb, "#f59e0b");
-    expectLitColor(bodyMaterial("relation:release"), "#fb7185");
+    expectFlatColor("component:web", "#f59e0b", "#19192b");
+    expectFlatColor("relation:release", "#fb7185", "#19192b");
 
     renderer.setPresentation({ theme: "light" });
     expect(bodyMaterial("component:web")).toBe(darkWeb);
-    expectLitColor(darkWeb, "#92400e");
+    expectFlatColor("component:web", "#92400e", "#f6f9fe");
 
     renderer.setData(createRenderGraphData(graphFixture, {
       theme: "light",
       nodeDescriptors: { "component:web": { color: "#f0abfc" } },
     }));
     expect(bodyMaterial("component:web")).toBe(darkWeb);
-    expectLitColor(darkWeb, "#f0abfc");
+    expectFlatColor("component:web", "#f0abfc", "#f6f9fe");
 
     renderer.setData(createRenderGraphData(graphFixture, {
       theme: "light",
       nodeDescriptors: { "component:web": { color: "#60a5fa" } },
     }));
-    expectLitColor(darkWeb, "#60a5fa");
+    expectFlatColor("component:web", "#60a5fa", "#f6f9fe");
   });
 
   it("disposes each CanvasTexture glyph mask once with its SpriteMaterial", () => {

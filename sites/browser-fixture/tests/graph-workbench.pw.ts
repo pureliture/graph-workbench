@@ -1332,19 +1332,31 @@ test("keeps a 150-node density graph gently moving at idle and isolates its sele
 
   const queryProjection = idleTelemetry.screenProjection.positions.find(({ id }) => id === "relation:query");
   if (!queryProjection) throw new Error("The density query node did not have a screen projection.");
-  await page.mouse.move(canvas.x + queryProjection.x, canvas.y + queryProjection.y);
-  await expect.poll(async () => {
-    const hovered = await readTelemetry<ObservedDensityRenderTelemetry>(page, "graph-render-observation");
-    if (hovered.availability !== "observed") return [];
-    return hovered.observation.links.filter(({ objectVisible }) => objectVisible).map(({ id }) => id).sort();
-  }).toEqual([
+  // The idle camera keeps drifting, so re-resolve the live query projection and
+  // re-aim the pointer on every attempt: a single pre-read position goes
+  // stale before the hover registers. Once the pointer lands, hover pauses
+  // the drift and the incident links stay readable.
+  const expectedHoverLinks = [
     "query-context",
     "query-evidence",
     "query-index",
     "query-model",
     "query-provider",
     "query-vector",
-  ]);
+  ];
+  await expect.poll(async () => {
+    const live = await readTelemetry<{ readonly x: number; readonly y: number } | {
+      readonly availability: string;
+    }>(page, "graph-density-live-query-projection");
+    if (!("x" in live) || !Number.isFinite(live.x) || !Number.isFinite(live.y)) return [];
+    const box = await page.getByTestId("graph-canvas").boundingBox();
+    if (!box) return [];
+    await page.mouse.move(box.x + live.x, box.y + live.y);
+    await page.waitForTimeout(150);
+    const hovered = await readTelemetry<ObservedDensityRenderTelemetry>(page, "graph-render-observation");
+    if (hovered.availability !== "observed") return [];
+    return hovered.observation.links.filter(({ objectVisible }) => objectVisible).map(({ id }) => id).sort();
+  }).toEqual(expectedHoverLinks);
   const hoveredTelemetry = await waitForDensityRenderObservation(page, null);
   const hoveredLinks = hoveredTelemetry.observation.links.filter(({ objectVisible }) => objectVisible);
   expect(hoveredLinks.every(({ visual, visibleMaterialOpacities }) => (
@@ -1546,11 +1558,44 @@ test("actual WebGL scene exposes semantic default node colors across system them
 
   const darkRender = (await waitForRenderObservation(page)).observation;
   const dark = darkRender.nodes;
-  const darkColor = (nodeId: string) => dark.find(({ id }) => id === nodeId)?.bodyMaterialColor;
-  expect(darkColor("relation:release")).toBe("#fb7185");
-  expect(darkColor("profile:platform")).toBe("#a5b4fc");
-  expect(darkColor("component:web")).toBe("#f59e0b");
-  expect(darkColor("relation:ingest")).toBe("#cbd5e1");
+  // Bodies stay opaque and dim by mixing toward the background, so the test
+  // reproduces three.js sRGB transfer and checks the dimmed tone against the
+  // body's own observed opacity instead of the raw palette hex.
+  const srgbToLinear = (channel: number) => {
+    const c = channel / 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  const linearToSrgb = (channel: number) => {
+    const v = channel <= 0.0031308 ? 12.92 * channel : 1.055 * channel ** (1 / 2.4) - 0.055;
+    return Math.round(Math.min(1, Math.max(0, v)) * 255);
+  };
+  const hexToRgb = (hex: string) => [
+    Number.parseInt(hex.slice(1, 3), 16),
+    Number.parseInt(hex.slice(3, 5), 16),
+    Number.parseInt(hex.slice(5, 7), 16),
+  ];
+  const expectedDimmedBodyColor = (base: string, background: string, bodyOpacity: number | null) => {
+    const factor = 1 - (bodyOpacity ?? 1);
+    const [br, bg, bb] = hexToRgb(base).map(srgbToLinear);
+    const [gr, gg, gb] = hexToRgb(background).map(srgbToLinear);
+    const mixed = [br, bg, bb].map((channel, index) => linearToSrgb(channel + ([gr, gg, gb][index]! - channel) * factor));
+    return `#${mixed.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
+  };
+  const darkColor = (nodeId: string) => {
+    const node = dark.find(({ id }) => id === nodeId)!;
+    return {
+      actual: node.bodyMaterialColor,
+      expected: expectedDimmedBodyColor(
+        { "relation:release": "#fb7185", "profile:platform": "#a5b4fc", "component:web": "#f59e0b", "relation:ingest": "#cbd5e1" }[nodeId]!,
+        "#19192b",
+        node.body?.minimumVisibleMaterialOpacity ?? null,
+      ),
+    };
+  };
+  for (const nodeId of ["relation:release", "profile:platform", "component:web", "relation:ingest"]) {
+    const { actual, expected } = darkColor(nodeId);
+    expect(actual).toBe(expected);
+  }
 
   await selectMatrixNode(page, "relation:release");
   await waitForSelection(page, "matrix");
@@ -1565,17 +1610,31 @@ test("actual WebGL scene exposes semantic default node colors across system them
   );
 
   await page.emulateMedia({ colorScheme: "light" });
+  // The theme switch re-palettes the same live objects; the profile tone must
+  // leave its dark value once the light background applies.
+  const darkProfile = dark.find(({ id }) => id === "profile:platform")?.bodyMaterialColor ?? null;
   await expect.poll(async () => {
     const telemetry = await readTelemetry<ObservedRenderTelemetry>(page, "graph-render-observation");
     if (telemetry.availability !== "observed") return null;
     return telemetry.observation.nodes.find(({ id }) => id === "profile:platform")?.bodyMaterialColor ?? null;
-  }).toBe("#4338ca");
+  }).not.toBe(darkProfile);
 
   const lightRender = await waitForRenderObservation(page);
-  const lightColor = (nodeId: string) => lightRender.observation.nodes.find(({ id }) => id === nodeId)?.bodyMaterialColor;
-  expect(lightColor("relation:release")).toBe("#be123c");
-  expect(lightColor("component:web")).toBe("#92400e");
-  expect(lightColor("relation:ingest")).toBe("#334155");
+  const lightColor = (nodeId: string) => {
+    const node = lightRender.observation.nodes.find(({ id }) => id === nodeId)!;
+    return {
+      actual: node.bodyMaterialColor,
+      expected: expectedDimmedBodyColor(
+        { "relation:release": "#be123c", "profile:platform": "#4338ca", "component:web": "#92400e", "relation:ingest": "#334155" }[nodeId]!,
+        "#f6f9fe",
+        node.body?.minimumVisibleMaterialOpacity ?? null,
+      ),
+    };
+  };
+  for (const nodeId of ["relation:release", "component:web", "relation:ingest"]) {
+    const { actual, expected } = lightColor(nodeId);
+    expect(actual).toBe(expected);
+  }
   const lightSelection = await waitForAmbientMotion(page, (motion) => (
     motion.focusNodeId === "relation:release" && motion.visibleLinkFlow.length > 0
   ));

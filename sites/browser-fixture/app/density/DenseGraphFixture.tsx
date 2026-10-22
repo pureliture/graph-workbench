@@ -644,6 +644,13 @@ export function DenseGraphFixture() {
   });
   const [renderRevision, setRenderRevision] = useState(0);
   const [expandedNodeId, setExpandedNodeId] = useState<string | null>(null);
+  // Live query projection sampled on an interval. The idle camera keeps
+  // drifting, so the settled observation snapshot goes stale within a second
+  // and pointer tests must aim from a fresh reading instead.
+  const [liveQueryProjection, setLiveQueryProjection] = useState<{
+    readonly x: number;
+    readonly y: number;
+  } | null>(null);
   const rendererReady = rendererStatus === "mounted" && webglStatus === "mounted";
   const {
     apply: applySearch,
@@ -655,6 +662,27 @@ export function DenseGraphFixture() {
     setQuery: setSearchQuery,
   } = useGraphSearch(densityInput, workbenchRef, densitySearchOptions);
   const matchedNodeIds = new Set(searchMatches.map((match) => match.nodeId));
+
+  useEffect(() => {
+    if (!rendererReady) return undefined;
+    const sample = window.setInterval(() => {
+      const position = workbenchRef.current?.getNodeScreenPosition(densityFocusNodeId) ?? null;
+      setLiveQueryProjection((current) => {
+        if (!position || !Number.isFinite(position.x) || !Number.isFinite(position.y)) {
+          return current === null ? current : null;
+        }
+        if (
+          current
+          && Math.abs(current.x - position.x) < 0.5
+          && Math.abs(current.y - position.y) < 0.5
+        ) {
+          return current;
+        }
+        return { x: position.x, y: position.y };
+      });
+    }, 200);
+    return () => window.clearInterval(sample);
+  }, [rendererReady]);
 
   const selectNode = useCallback((nodeId: string | null, source: GraphSelectionSource) => {
     if (!rendererReady) return;
@@ -1300,6 +1328,10 @@ export function DenseGraphFixture() {
           target,
         }))} />
         <Telemetry testId="graph-render-observation" value={renderTelemetry} />
+        <Telemetry testId="graph-density-live-query-projection" value={liveQueryProjection ?? {
+          availability: "pending",
+          reason: "Waiting for the first live query projection sample.",
+        }} />
         <Telemetry testId="graph-density-screen-projection" value={renderTelemetry.availability === "observed"
           ? renderTelemetry.screenProjection
           : renderTelemetry} />
