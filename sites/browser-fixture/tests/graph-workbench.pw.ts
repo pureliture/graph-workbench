@@ -2685,3 +2685,75 @@ test("reports forced WebGL context failure without selection or camera success t
   await expect(page.getByTestId("matrix-row-component-api")).toBeDisabled();
   await expect(page.getByTestId("host-set-input")).toBeDisabled();
 });
+
+test("the persistent search field focuses with the slash shortcut and emphasizes the matched node", async ({ page }) => {
+  await openFixture(page);
+
+  await page.keyboard.press("/");
+  const searchInput = page.getByTestId("graph-search-input");
+  await expect(searchInput).toBeFocused();
+
+  await searchInput.fill("Web console");
+  await expect.poll(() => new URL(page.url()).searchParams.get("q")).toBe("Web console");
+
+  // The matched node keeps the readable tier while the rest of the graph
+  // drops to the quiet context tier.
+  await expect.poll(async () => {
+    const observation = await readTelemetry<{
+      readonly nodeOpacities: Readonly<Record<string, number>> | null;
+    }>(page, "graph-search-observation");
+    const opacities = observation.nodeOpacities;
+    if (!opacities) return false;
+    return (opacities["component:web"] ?? 0) > (opacities["profile:platform"] ?? 1);
+  }).toBe(true);
+
+  // The reference reports the number of matched terms in a live region.
+  await expect(page.locator(".graph-search-hint")).toHaveText("1 term");
+});
+
+test("a shared search link restores the same reading mode", async ({ page }) => {
+  await page.goto("/?q=ingest");
+  await waitForFixtureReady(page);
+
+  await expect(page.getByTestId("graph-search-input")).toHaveValue("ingest");
+  await expect.poll(() => new URL(page.url()).searchParams.get("q")).toBe("ingest");
+  await expect(page.locator(".graph-search-hint")).toContainText("term");
+});
+
+test("the search field submits the best match and clears the running query", async ({ page }) => {
+  await openFixture(page);
+
+  await page.keyboard.press("/");
+  const searchInput = page.getByTestId("graph-search-input");
+  await searchInput.fill("platform profile");
+  await searchInput.press("Enter");
+
+  await expectTermUrl(page, "profile:platform");
+  await expect(page.getByTestId("graph-detail-panel")).toContainText("profile:platform");
+  // The reference clears the query once a term is chosen.
+  await expect.poll(() => new URL(page.url()).searchParams.get("q")).toBeNull();
+});
+
+test("the search field recovers a term from a misspelled query", async ({ page }) => {
+  await openFixture(page);
+
+  await page.keyboard.press("/");
+  const searchInput = page.getByTestId("graph-search-input");
+  await searchInput.fill("cosole");
+
+  await expect(page.locator(".graph-search-hint")).toContainText("term");
+  await expect(page.getByTestId("graph-search-input")).toHaveValue("cosole");
+});
+
+test("the density route searches the 150-term dictionary and filters the semantic fallback", async ({ page }) => {
+  await openDensityFixture(page);
+
+  await page.keyboard.press("/");
+  const searchInput = page.getByTestId("graph-density-search-input");
+  await searchInput.fill("retrieval index");
+
+  await expect.poll(() => new URL(page.url()).searchParams.get("q")).toBe("retrieval index");
+  // The no-WebGL reading surface follows the same query as the graph.
+  await expect(page.locator(".semantic-fallback li")).toHaveCount(1);
+  await expect(page.locator(".semantic-fallback li")).toContainText("Index");
+});

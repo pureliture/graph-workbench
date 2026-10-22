@@ -1,6 +1,6 @@
 # 레퍼런스 정렬 그래프 UX milestones
 
-- requirements/design: [graph-reference-ux-spec.md](./graph-reference-ux-spec.md)
+- requirements/design: [graph-reference-ux-spec.md](./graph-reference-ux-spec.md), [graph-search-reference-spec.md](./graph-search-reference-spec.md)
 - execution contract: `agentic-execution`
 - overall status: completed
 - approved amendments: none
@@ -54,4 +54,19 @@
   - Playwright는 실제 WebGL canvas에서 150-node density idle/selection, semantic depth bodies, hidden relationship curves, selection transition intermediate frames, direct-neighbor-only movement with stable context anchors, drawer/mobile resize, deep-link/history, keyboard and reduced-motion flows를 검증했다.
   - skipped 1건은 CDP visibility control을 제공하지 않는 실행 환경에서만 건너뛰는 기존 조건부 테스트이며 실패가 아니다.
   - `git diff --check` PASS.
+- next action: 승인된 구현 slice의 로컬 검증이 끝났으므로 사용자에게 결과를 인계한다. commit/deploy는 별도 승인 범위다.
+
+## Slice S5 — 레퍼런스 검색 읽기 모드
+
+- status: completed
+- observable result: 쿼리가 그래프를 읽기 모드로 전환한다. 매칭 노드가 강조되고 하나의 클러스터로 묶여 카메라가 그 클러스터를 프레임하며, `?q=` 주소로 같은 상태를 공유할 수 있다.
+- requirements/design: [graph-search-reference-spec.md](./graph-search-reference-spec.md)
+- owned seams: `src/search.ts`, `src/presentation.ts`, `src/layout.ts`, `src/renderer.ts`, `src/workbench.ts`, `sites/browser-fixture/app/graph-search/`, 두 라우트 픽스처, unit/browser tests
+- evidence:
+  - 레퍼런스 역분석으로 MiniSearch 설정(필드 가중치, `prefix: true`, `fuzzy: 0.2`, `combineWith: "OR"`), 상대 점수 임계값 30%, 15건 상한, 250ms 디바운스 후 매칭 서브그래프 재패킹, `?q=` replace/throttle 주소 계약, `/`·`⌘K`·`⌘F`·`Enter`·`Escape` 키보드 계약, 좌상단 확장형 필드와 `aria-live` 개수 힌드를 확인했다.
+  - `src/search.ts` 를 추가해 라이브러리 수준의 검색 인덱스·랭킹·퍼지·메타데이터 검색을 제공한다. `GraphPresentation.matchedNodeIds` 강조 채널, `layout.ts` 의 결정론적 매칭 클러스터, `renderer.ts` 의 매칭 티어와 클러스터 프레이밍, `workbench.ts` 의 `search`/`setSearchQuery`/`getSearchState`/`clearSearch` 를 함께 구현했다.
+  - `npm run check` PASS — 6 test files, 89 tests (`test/search.test.ts` 29건).
+  - `npm run check:browser` PASS — unit 6 files/89 tests, fixture lint, site build, rendered-html 3 tests, Playwright 32 passed/1 skipped. 신규 5건이 슬래시 단축키, `?q=` 공유 링크, Enter 제출과 쿼리 초기화, 오타 복원, 150-node density 검색과 semantic fallback 필터를 검증했다.
+  - skipped 1건은 CDP visibility control을 제공하지 않는 실행 환경에서만 건너뛰는 기존 조건부 테스트이며 실패가 아니다.
+  - 저장소 자체 결함 수정: `sites/browser-fixture/.openai/hosting.json` 이 `661e06c` 에서 삭제되었으나 빌드 플러그인이 여전히 요구해 `npm run site:build` 가 `ENOENT` 로 실패했다. 식별자를 노출하지 않는 값으로 복원했다.
 - next action: 승인된 구현 slice의 로컬 검증이 끝났으므로 사용자에게 결과를 인계한다. commit/deploy는 별도 승인 범위다.

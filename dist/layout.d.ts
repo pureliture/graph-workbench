@@ -31,6 +31,18 @@ export interface GraphSelectionState {
 export interface GraphLayoutOptions {
     readonly viewport?: GraphViewport;
 }
+/**
+ * Describes the active search reading mode so the renderer can frame the
+ * matched cluster and keep the rest of the graph as quiet context.
+ */
+export interface GraphSearchLayoutState {
+    /** True when a search is running, even when it matched nothing. */
+    readonly active: boolean;
+    /** Radius of the matched cluster in world units. */
+    readonly fitRadius: number;
+    /** Matched node ids ordered by descending relevance. */
+    readonly matchedNodeIds: readonly string[];
+}
 export interface RenderNode extends GraphNode {
     readonly fx?: number;
     readonly fy?: number;
@@ -49,6 +61,7 @@ export interface RenderGraphData {
     readonly links: readonly RenderLink[];
     readonly nodes: readonly RenderNode[];
     readonly presentation: GraphPresentation;
+    readonly search: GraphSearchLayoutState;
     readonly selection: GraphSelectionState;
 }
 /**

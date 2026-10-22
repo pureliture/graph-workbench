@@ -1,6 +1,7 @@
 import { validateGraphInput } from "./contract.js";
 import { createRenderGraphData, } from "./layout.js";
 import { EMPTY_GRAPH_PRESENTATION } from "./presentation.js";
+import { createGraphSearchIndex, } from "./search.js";
 function knownNodeIds(input) {
     return new Set(input.nodes.map((node) => node.id));
 }
@@ -13,10 +14,14 @@ function normalizedPresentation(input, supplied) {
     const focusNodeId = supplied.focusNodeId && known.has(supplied.focusNodeId)
         ? supplied.focusNodeId
         : null;
+    const matchedNodeIds = supplied.matchedNodeIds === undefined || supplied.matchedNodeIds === null
+        ? null
+        : [...new Set(supplied.matchedNodeIds)].filter((id) => known.has(id));
     return {
         ambientMotion: supplied.ambientMotion !== false,
         selectedNodeIds,
         focusNodeId,
+        matchedNodeIds,
         reducedMotion: supplied.reducedMotion === true,
         theme: supplied.theme === "light" ? "light" : "dark",
         labelVisibility: supplied.labelVisibility,
@@ -68,6 +73,14 @@ export function createGraphWorkbench(options) {
     let selectionState = createRenderGraphData(input, presentation, { viewport }).selection;
     let destroyed = false;
     const rendererFactory = options.rendererFactory;
+    // The search index is rebuilt only when the graph itself changes, so a host
+    // can run a query on every keystroke without paying for a re-index.
+    let searchIndex = createGraphSearchIndex(input, options.searchOptions);
+    let searchQuery = "";
+    let searchMatches = [];
+    let searchNodeIds = [];
+    let searchFramedCamera = false;
+    const searchActive = () => searchQuery.trim().length > 0;
     const sync = () => {
         const data = createRenderGraphData(input, presentation, { viewport });
         selectionState = data.selection;
@@ -75,6 +88,33 @@ export function createGraphWorkbench(options) {
             return;
         renderer.setData(data);
         renderer.setPresentation(presentation);
+    };
+    const applySearchReadingMode = () => {
+        presentation = normalizedPresentation(input, {
+            ...presentation,
+            matchedNodeIds: searchActive() ? searchNodeIds : null,
+        });
+        sync();
+    };
+    const frameSearchMatches = () => {
+        if (!renderer)
+            return;
+        if (!searchActive() || searchNodeIds.length === 0) {
+            if (searchFramedCamera) {
+                // The matched cluster returns to the canonical layout, so the camera
+                // returns to the whole graph instead of hovering over an empty area.
+                searchFramedCamera = false;
+                if (!selectionState.nodeId)
+                    renderer.restoreCamera();
+            }
+            return;
+        }
+        if (selectionState.nodeId)
+            return;
+        if (!renderer.focusNodeSet)
+            return;
+        searchFramedCamera = true;
+        renderer.focusNodeSet(searchNodeIds, { reducedMotion: presentation.reducedMotion === true });
     };
     const transitionToSelection = (nodeId, durationMs) => {
         if (!renderer || !nodeId)
@@ -124,6 +164,10 @@ export function createGraphWorkbench(options) {
         });
         if (acceptance === false)
             return false;
+        // A selection owns the reading layout, so the camera leaves the matched
+        // cluster framing and follows the selected node instead.
+        if (nextNodeId)
+            searchFramedCamera = false;
         const camera = acceptance?.camera;
         presentation = normalizedPresentation(input, {
             ...candidatePresentation,
@@ -196,6 +240,13 @@ export function createGraphWorkbench(options) {
         captureRecoveryCapsule() {
             return renderer?.captureRecoveryCapsule?.() ?? null;
         },
+        clearSearch() {
+            searchQuery = "";
+            searchMatches = [];
+            searchNodeIds = [];
+            applySearchReadingMode();
+            frameSearchMatches();
+        },
         destroy() {
             if (destroyed)
                 return;
@@ -227,6 +278,14 @@ export function createGraphWorkbench(options) {
         getTransitionObservation() {
             return renderer?.getTransitionObservation?.() ?? null;
         },
+        getSearchState() {
+            return {
+                active: searchActive(),
+                matches: searchMatches,
+                nodeIds: searchNodeIds,
+                query: searchQuery,
+            };
+        },
         getSelectionState() {
             return selectionState;
         },
@@ -251,6 +310,7 @@ export function createGraphWorkbench(options) {
                 sync();
                 renderer.resize();
                 transitionToSelection(selectionState.nodeId);
+                frameSearchMatches();
                 options.onRendererStateChange?.({ status: "mounted" });
             }
             catch (error) {
@@ -281,6 +341,9 @@ export function createGraphWorkbench(options) {
         resume() {
             renderer?.resume?.();
         },
+        search(query, searchOptions) {
+            return searchIndex.search(query, searchOptions);
+        },
         selectNode(nodeId, source = "programmatic") {
             selectNode(nodeId, source);
         },
@@ -293,7 +356,19 @@ export function createGraphWorkbench(options) {
             if (previousNodeId && !nextNodeId)
                 renderer?.cancelCameraTransition?.();
             input = validatedInput;
+            searchIndex = createGraphSearchIndex(input, options.searchOptions);
             presentation = nextPresentation;
+            // Keep the running query meaningful after a host update instead of
+            // leaving stale match ids behind.
+            if (searchActive()) {
+                const result = searchIndex.search(searchQuery);
+                searchMatches = result.matches;
+                searchNodeIds = result.nodeIds;
+                presentation = normalizedPresentation(input, {
+                    ...presentation,
+                    matchedNodeIds: searchNodeIds,
+                });
+            }
             sync();
             const selectionChanged = selectionState.nodeId !== previousNodeId;
             const relationshipLayoutChanged = selectionState.nodeId !== null
@@ -319,7 +394,12 @@ export function createGraphWorkbench(options) {
             const nextNodeId = selectedNodeId(normalized);
             if (previousNodeId && !nextNodeId)
                 renderer?.cancelCameraTransition?.();
-            presentation = normalized;
+            // The workbench owns the search reading mode, so a host presentation
+            // update cannot silently drop the matched nodes.
+            presentation = normalizedPresentation(input, {
+                ...normalized,
+                matchedNodeIds: searchActive() ? searchNodeIds : null,
+            });
             sync();
             if (selectionState.nodeId !== previousNodeId) {
                 if (selectionState.nodeId)
@@ -334,6 +414,14 @@ export function createGraphWorkbench(options) {
         },
         suspend() {
             renderer?.suspend?.();
+        },
+        setSearchQuery(query, searchOptions) {
+            const result = searchIndex.search(query, searchOptions);
+            searchQuery = result.query;
+            searchMatches = result.matches;
+            searchNodeIds = result.nodeIds;
+            applySearchReadingMode();
+            frameSearchMatches();
         },
         unmount() {
             if (!container && !renderer)

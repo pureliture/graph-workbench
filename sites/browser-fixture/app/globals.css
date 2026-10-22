@@ -921,6 +921,138 @@ dd {
   color: var(--quiet);
 }
 
+/* Persistent search field. The reference keeps it collapsed to a single glyph
+   until it is focused or holds a query, then expands it in place. */
+.graph-search {
+  position: absolute;
+  top: 3.9rem;
+  left: 1rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+  min-width: 0;
+  pointer-events: none;
+}
+
+.graph-search-field {
+  position: relative;
+  display: flex;
+  width: 2.3rem;
+  height: 2.3rem;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--line-strong) 64%, transparent);
+  border-radius: 999px;
+  padding: 0;
+  color: var(--quiet);
+  background: color-mix(in srgb, var(--surface-0) 88%, transparent);
+  backdrop-filter: blur(8px);
+  pointer-events: auto;
+  transition: width 260ms cubic-bezier(0.16, 1, 0.3, 1),
+    padding 260ms cubic-bezier(0.16, 1, 0.3, 1),
+    color 200ms ease,
+    border-color 250ms ease,
+    box-shadow 300ms ease;
+}
+
+.graph-search-field:hover {
+  color: var(--text);
+}
+
+.graph-search-field:focus-within,
+.graph-search-field[data-active="true"] {
+  width: min(22rem, 60vw);
+  border-color: var(--accent-border);
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface-0) 96%, transparent);
+  box-shadow: 0 0 0 0.12rem var(--accent-soft);
+  padding: 0 0.55rem 0 0;
+}
+
+.graph-search-trigger {
+  width: 2.3rem;
+  height: 2.3rem;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.graph-search-icon {
+  width: 1.05rem;
+  height: 1.05rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.graph-search-field input {
+  min-width: 0;
+  flex: auto;
+  border: 0;
+  outline: 0;
+  color: inherit;
+  background: transparent;
+  font-family: inherit;
+  font-size: 0.85rem;
+  opacity: 0;
+  transition: opacity 180ms 60ms;
+}
+
+.graph-search-field:focus-within input,
+.graph-search-field[data-active="true"] input {
+  opacity: 1;
+}
+
+.graph-search-field input::placeholder {
+  color: var(--quiet);
+}
+
+.graph-search-field input::-webkit-search-cancel-button {
+  appearance: none;
+}
+
+.graph-search-clear {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  padding: 2px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  opacity: 0.6;
+}
+
+.graph-search-clear:hover {
+  opacity: 1;
+}
+
+.graph-search-hint {
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  letter-spacing: 0.04em;
+  color: var(--quiet);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 250ms ease;
+  white-space: nowrap;
+}
+
+.graph-search-hint[data-show="true"] {
+  opacity: 1;
+}
+
 .matrix-meta {
   min-width: 0;
   justify-content: space-between;

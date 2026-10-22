@@ -44,6 +44,7 @@
   ],
   "dependencies": {
     "3d-force-graph": "1.80.0",
+    "minisearch": "7.2.0",
     "three": "0.185.0"
   },
   "devDependencies": {

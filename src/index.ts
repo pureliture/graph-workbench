@@ -15,6 +15,7 @@ export {
   type GraphLayoutOptions,
   type GraphLinkVisualCue,
   type GraphNodeVisualCue,
+  type GraphSearchLayoutState,
   type GraphSelectionState,
   type GraphTargetNodePosition,
   type GraphViewport,
@@ -61,6 +62,20 @@ export {
   type GraphTransitionObservation,
 } from "./renderer-contract.js";
 export {
+  createGraphSearchIndex,
+  searchGraph,
+  toGraphSearchText,
+  GRAPH_SEARCH_FIELDS,
+  GRAPH_SEARCH_FIELD_BOOSTS,
+  type GraphSearchCombineWith,
+  type GraphSearchDocument,
+  type GraphSearchField,
+  type GraphSearchIndex,
+  type GraphSearchMatch,
+  type GraphSearchOptions,
+  type GraphSearchResult,
+} from "./search.js";
+export {
   createGraphWorkbench,
   type GraphEvent,
   type GraphHoverEvent,
@@ -68,6 +83,7 @@ export {
   type GraphRendererState,
   type GraphSelectionAcceptance,
   type GraphSelectionCameraAcceptance,
+  type GraphSearchState,
   type GraphSelectionEvent,
   type GraphSelectionIntent,
   type GraphSelectionSource,

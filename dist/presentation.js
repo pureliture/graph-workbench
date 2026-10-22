@@ -5,6 +5,7 @@ export const EMPTY_GRAPH_PRESENTATION = Object.freeze({
     selectionLayout: "constellation",
     focusNodeId: null,
     recoveryKey: undefined,
+    matchedNodeIds: null,
     reducedMotion: false,
     theme: "dark",
     nodeDescriptors: Object.freeze({}),
