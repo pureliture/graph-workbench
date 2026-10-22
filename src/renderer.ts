@@ -226,9 +226,18 @@ const ORBIT_ROTATE_SPEED = 0.6;
 // Idle camera drift mirrors the reference: after half a second without
 // interaction the camera keeps circling the graph very slowly (0.045 rad/s),
 // eased in over 1.6s. It pauses for hover, selection, search, and transitions.
+const LINK_FADE_NEAR_OFFSET = 35;
+const LINK_FADE_FAR_OFFSET = 200;
+const LINK_FADE_STRENGTH = 0.98;
 const IDLE_DRIFT_DELAY_MS = 500;
 const IDLE_DRIFT_EASE_MS = 1600;
 const IDLE_DRIFT_RATE_RAD_PER_MS = 0.000045;
+// Intro sweep mirrors the reference load choreography: start one full turn
+// behind and slightly above the fitted pose, then sweep home over 4.2s with
+// the same exponential ease as every other camera move.
+const INTRO_SWEEP_DURATION_MS = 4200;
+const INTRO_SWEEP_AZIMUTH_RAD = 6.6;
+const INTRO_SWEEP_LIFT_RATIO = 0.35;
 const HOVER_ATTRACTION_RADIUS = 180;
 const HOVER_ATTRACTION_STRENGTH = 0.32;
 const HOVER_PROXIMITY_STRENGTH = 0.12;
@@ -389,23 +398,32 @@ interface DefaultNodeSilhouetteSpec {
   readonly width: number;
 }
 
+function degreeBodyRadius(degree: number): number {
+  // Reference node radius from the connection degree:
+  // 2.2 + log1p(inDegree)/log1p(37)*6.5, ranging 2.2 to 8.7. Hubs read larger
+  // and leaves stay small while every kind keeps its own silhouette shape.
+  return 2.2 + ((Math.log1p(Math.max(0, degree)) / Math.log1p(37)) * 6.5);
+}
+
 function defaultNodeSilhouette(
   node: RenderNode,
   visualKind = resolvedNodeVisualKind(node),
+  degree = 0,
 ): DefaultNodeSilhouetteSpec {
+  const radius = degreeBodyRadius(degree);
   if (visualKind === "profile") {
-    return { cameraRadius: 3.8, height: 7.6, kind: "circle", labelAnchorY: 7.6, width: 7.6 };
+    return { cameraRadius: radius, height: radius * 2, kind: "circle", labelAnchorY: radius + 3.8, width: radius * 2 };
   }
   if (visualKind === "workflow") {
-    return { cameraRadius: 7, height: 5.8, kind: "capsule", labelAnchorY: 6.8, width: 14 };
+    return { cameraRadius: radius, height: radius * 0.83, kind: "capsule", labelAnchorY: radius - 0.2, width: radius * 2 };
   }
   if (visualKind === "leaf") {
-    return { cameraRadius: 1.6, height: 3.2, kind: "dot", labelAnchorY: 4.8, width: 3.2 };
+    return { cameraRadius: radius, height: radius * 2, kind: "dot", labelAnchorY: radius + 3.2, width: radius * 2 };
   }
   if (node.type === "relation") {
-    return { cameraRadius: 6.8, height: 13.6, kind: "disk", labelAnchorY: 10.6, width: 13.6 };
+    return { cameraRadius: radius, height: radius * 2, kind: "disk", labelAnchorY: radius + 3.8, width: radius * 2 };
   }
-  return { cameraRadius: 2.8, height: 5.6, kind: "circle", labelAnchorY: 6.6, width: 5.6 };
+  return { cameraRadius: radius, height: radius * 2, kind: "circle", labelAnchorY: radius + 3.8, width: radius * 2 };
 }
 
 function defaultNodeSilhouetteSignature(silhouette: DefaultNodeSilhouetteSpec): string {
@@ -423,7 +441,7 @@ function defaultNodeVisualInputs(data: RenderGraphData): ReadonlyMap<string, Def
   return new Map(data.nodes.map((node) => {
     const degree = degrees.get(node.id) ?? 0;
     const visualKind = resolvedNodeVisualKind(node, degree);
-    return [node.id, { degree, silhouette: defaultNodeSilhouette(node, visualKind), visualKind }];
+    return [node.id, { degree, silhouette: defaultNodeSilhouette(node, visualKind, degree), visualKind }];
   }));
 }
 
@@ -807,11 +825,12 @@ function createNodeLabelSprite(
 export function createDefaultGraphNodeObject(
   node: RenderNode,
   descriptor: GraphNodeDescriptor | undefined,
+  degree = 0,
 ): Object3D {
   const color = new Color(defaultNodeColor(node, descriptor));
   const opacity = boundedOpacity(descriptor?.opacity, 1);
   const group = new Group();
-  const silhouette = defaultNodeSilhouette(node);
+  const silhouette = defaultNodeSilhouette(node, resolvedNodeVisualKind(node), degree);
   // Reference bodies are flat matte discs with a hard edge and no shading:
   // an unlit opaque material reads as one solid tone from every angle and
   // occludes correctly, so overlapping context no longer flashes or muddies.
@@ -3203,6 +3222,27 @@ export function createThreeForceGraphRenderer({
     };
   }
 
+  // Reference edges fade with view depth: 1 - smoothstep(near, far)^2, with
+  // the fade window riding on the camera distance (near = cam - 17.5,
+  // far = cam + 100, strength 0.98). Far segments wash out so the front web
+  // reads clearest instead of tangling across the whole cloud.
+  function linkDistanceFade(midpoint: Coordinates): number {
+    const camera = cameraPose();
+    const offsetX = camera.position.x - camera.lookAt.x;
+    const offsetY = camera.position.y - camera.lookAt.y;
+    const offsetZ = camera.position.z - camera.lookAt.z;
+    const cameraDistance = Math.max(1, Math.hypot(offsetX, offsetY, offsetZ));
+    const near = cameraDistance - (LINK_FADE_NEAR_OFFSET / 2);
+    const far = cameraDistance + (LINK_FADE_FAR_OFFSET / 2);
+    const directionLength = Math.hypot(offsetX, offsetY, offsetZ) || 1;
+    const depth = (((midpoint.x - camera.lookAt.x) * offsetX)
+      + ((midpoint.y - camera.lookAt.y) * offsetY)
+      + ((midpoint.z - camera.lookAt.z) * offsetZ)) / directionLength;
+    const progress = Math.max(0, Math.min(1, (depth - near) / Math.max(1, far - near)));
+    const fade = 1 - (progress * progress);
+    return Math.max(0, Math.min(1, 1 - ((1 - fade) * LINK_FADE_STRENGTH)));
+  }
+
   function applyFocusedLinkFlow(): void {
     const focusNodeId = ambientFocusNodeId();
     const hasFocus = focusNodeId !== null;
@@ -3274,6 +3314,13 @@ export function createThreeForceGraphRenderer({
       if (incident) {
         opacity = Math.max(selectedFocus ? 0.58 : 0.46, state.baseOpacity);
         width = Math.max(selectedFocus ? 1.18 : 1.02, state.baseWidth);
+        // Far incident edges wash out so the front of the constellation reads
+        // clearest instead of tangling across the whole cloud.
+        opacity *= linkDistanceFade({
+          x: (source.renderedX + target.renderedX) / 2,
+          y: (source.renderedY + target.renderedY) / 2,
+          z: (source.renderedZ + target.renderedZ) / 2,
+        });
       } else if (idleFlow) {
         opacity = Math.min(
           IDLE_LINK_OPACITY.maximum,
@@ -3981,6 +4028,39 @@ export function createThreeForceGraphRenderer({
     });
   }
 
+  function playIntroSweep(): void {
+    if (activeTransition) cancelCameraTransition();
+    const targetCamera = fullGraphCameraTarget();
+    if (!targetCamera) return;
+    const distance = Math.max(
+      1,
+      Math.hypot(
+        targetCamera.position.x - targetCamera.lookAt.x,
+        targetCamera.position.y - targetCamera.lookAt.y,
+        targetCamera.position.z - targetCamera.lookAt.z,
+      ),
+    );
+    const deltaX = targetCamera.position.x - targetCamera.lookAt.x;
+    const deltaZ = targetCamera.position.z - targetCamera.lookAt.z;
+    const cos = Math.cos(-INTRO_SWEEP_AZIMUTH_RAD);
+    const sin = Math.sin(-INTRO_SWEEP_AZIMUTH_RAD);
+    const start: CameraPose = {
+      position: {
+        x: targetCamera.lookAt.x + (deltaX * cos) - (deltaZ * sin),
+        y: targetCamera.position.y + (distance * INTRO_SWEEP_LIFT_RATIO),
+        z: targetCamera.lookAt.z + (deltaX * sin) + (deltaZ * cos),
+      },
+      lookAt: { ...targetCamera.lookAt },
+    };
+    setCameraPose(start);
+    startTransition({
+      durationMs: INTRO_SWEEP_DURATION_MS,
+      reducedMotion: false,
+      scene: null,
+      targetCamera,
+    });
+  }
+
   function fullGraphCameraTarget(): CameraPose | null {
     const data = currentData;
     if (!data) return null;
@@ -4377,6 +4457,7 @@ export function createThreeForceGraphRenderer({
       refreshMotionPauseState();
     },
     focusNodeSet,
+    playIntroSweep,
     transitionToNode,
     zoom(scale) {
       const boundedScale = Math.max(0.25, Math.min(8, scale));

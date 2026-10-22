@@ -216,6 +216,12 @@ export interface GraphRenderer {
     fit(durationMs?: number): void;
     focus(nodeId: string): void;
     /**
+     * Optional enhanced seam that plays the load choreography: start behind the
+     * fitted pose and sweep home. Hosts skip it for deep links and reduced
+     * motion; a user drag cancels it like any other camera transition.
+     */
+    playIntroSweep?(): void;
+    /**
      * Optional enhanced seam that frames a set of nodes as one subject. A search
      * uses it to bring the matched cluster into view.
      */

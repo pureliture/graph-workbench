@@ -1332,19 +1332,31 @@ test("keeps a 150-node density graph gently moving at idle and isolates its sele
 
   const queryProjection = idleTelemetry.screenProjection.positions.find(({ id }) => id === "relation:query");
   if (!queryProjection) throw new Error("The density query node did not have a screen projection.");
-  await page.mouse.move(canvas.x + queryProjection.x, canvas.y + queryProjection.y);
-  await expect.poll(async () => {
-    const hovered = await readTelemetry<ObservedDensityRenderTelemetry>(page, "graph-render-observation");
-    if (hovered.availability !== "observed") return [];
-    return hovered.observation.links.filter(({ objectVisible }) => objectVisible).map(({ id }) => id).sort();
-  }).toEqual([
+  // The idle camera keeps drifting, so re-resolve the live query projection and
+  // re-aim the pointer on every attempt: a single pre-read position goes
+  // stale before the hover registers. Once the pointer lands, hover pauses
+  // the drift and the incident links stay readable.
+  const expectedHoverLinks = [
     "query-context",
     "query-evidence",
     "query-index",
     "query-model",
     "query-provider",
     "query-vector",
-  ]);
+  ];
+  await expect.poll(async () => {
+    const live = await readTelemetry<{ readonly x: number; readonly y: number } | {
+      readonly availability: string;
+    }>(page, "graph-density-live-query-projection");
+    if (!("x" in live) || !Number.isFinite(live.x) || !Number.isFinite(live.y)) return [];
+    const box = await page.getByTestId("graph-canvas").boundingBox();
+    if (!box) return [];
+    await page.mouse.move(box.x + live.x, box.y + live.y);
+    await page.waitForTimeout(150);
+    const hovered = await readTelemetry<ObservedDensityRenderTelemetry>(page, "graph-render-observation");
+    if (hovered.availability !== "observed") return [];
+    return hovered.observation.links.filter(({ objectVisible }) => objectVisible).map(({ id }) => id).sort();
+  }).toEqual(expectedHoverLinks);
   const hoveredTelemetry = await waitForDensityRenderObservation(page, null);
   const hoveredLinks = hoveredTelemetry.observation.links.filter(({ objectVisible }) => objectVisible);
   expect(hoveredLinks.every(({ visual, visibleMaterialOpacities }) => (

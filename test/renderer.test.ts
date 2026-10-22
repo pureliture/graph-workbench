@@ -31,6 +31,12 @@ import { createDefaultGraphNodeObject, createThreeForceGraphRenderer } from "../
 import type { GraphInput } from "../src/contract.js";
 import { graphFixture } from "./fixtures.js";
 
+// Reference node radius from the connection degree:
+// 2.2 + log1p(inDegree)/log1p(37)*6.5. Label anchors keep their kind offset.
+function degreeRadius(degree: number): number {
+  return 2.2 + ((Math.log1p(Math.max(0, degree)) / Math.log1p(37)) * 6.5);
+}
+
 interface Coordinates {
   x: number;
   y: number;
@@ -1731,7 +1737,7 @@ describe("Three.js camera transitions", () => {
       objectTracked: true,
       objectVisible: true,
       sceneAttached: true,
-      position: { id: "component:web", x: 0, y: 4.8, z: 0 },
+      position: { id: "component:web", x: 0, y: degreeRadius(1) + 3.2, z: 0 },
       transparent: true,
     });
     expect(selected?.label.scale?.x).toBeGreaterThan(0);
@@ -2544,11 +2550,11 @@ describe("Three.js camera transitions", () => {
     const profileBefore = bodyAndLabel("profile");
     expect(leafBefore.body.userData.graphDefaultNodeSilhouette).toBe("dot");
     expect(relationBefore.body.userData.graphDefaultNodeSilhouette).toBe("disk");
-    expect(relationBefore.label.position.y).toBe(10.6);
+    expect(relationBefore.label.position.y).toBeCloseTo(degreeRadius(2) + 3.8, 5);
     expect((relationBefore.label.userData.graphBaseLabelScale as Coordinates).y).toBe(10);
     expect(profileBefore.body.userData.graphDefaultNodeSilhouette).toBe("circle");
     profileBefore.body.geometry.computeBoundingBox();
-    expect(profileBefore.body.geometry.boundingBox?.max.x).toBeCloseTo(3.8);
+    expect(profileBefore.body.geometry.boundingBox?.max.x).toBeCloseTo(degreeRadius(2), 5);
 
     renderer.setData(createRenderGraphData({
       ...initial,
@@ -2569,18 +2575,18 @@ describe("Three.js camera transitions", () => {
     expect(leafAfter.object).toBe(leafBefore.object);
     expect(leafAfter.body).toBe(leafBefore.body);
     expect(leafAfter.body.userData.graphDefaultNodeSilhouette).toBe("circle");
-    expect(leafAfter.label.position.y).toBe(6.6);
+    expect(leafAfter.label.position.y).toBeCloseTo(degreeRadius(2) + 3.8, 5);
     expect((leafAfter.label.userData.graphBaseLabelScale as Coordinates).y).toBe(8);
     expect(relationAfter.object).toBe(relationBefore.object);
     expect(relationAfter.body.userData.graphDefaultNodeSilhouette).toBe("circle");
-    expect(relationAfter.label.position.y).toBe(6.6);
+    expect(relationAfter.label.position.y).toBeCloseTo(degreeRadius(2) + 3.8, 5);
     expect((relationAfter.label.userData.graphBaseLabelScale as Coordinates).y).toBe(8);
-    expect(relationAfter.label.userData.graphBaseLabelAnchorY).toBe(6.6);
+    expect(relationAfter.label.userData.graphBaseLabelAnchorY).toBeCloseTo(degreeRadius(2) + 3.8, 5);
     expect((relationAfter.label.userData.graphBaseLabelScale as Coordinates).y).toBe(8);
     expect(profileAfter.object).toBe(profileBefore.object);
     expect(profileAfter.body.userData.graphDefaultNodeSilhouette).toBe("circle");
     profileAfter.body.geometry.computeBoundingBox();
-    expect(profileAfter.body.geometry.boundingBox?.max.x).toBeCloseTo(2.8);
+    expect(profileAfter.body.geometry.boundingBox?.max.x).toBeCloseTo(degreeRadius(2), 5);
 
     const observation = renderer.getAmbientMotionObservation!()!;
     const leafBoundary = observation.linkEndpoints.find((endpoint) => endpoint.id === "leaf-target")?.sourceBoundary;
