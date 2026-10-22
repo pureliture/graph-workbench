@@ -6,7 +6,6 @@ import {
   CanvasTexture,
   CircleGeometry,
   Color,
-  DoubleSide,
   DirectionalLight,
   Float32BufferAttribute,
   Group,
@@ -22,6 +21,7 @@ import {
   SphereGeometry,
   Sprite,
   SpriteMaterial,
+  Texture,
   Vector3,
 } from "three";
 
@@ -218,11 +218,17 @@ const DENSITY_VISIBILITY = Object.freeze({
 
 const AMBIENT_COMMON_FLOAT = Object.freeze({ x: 4.8, y: 3.6, z: 1.25 });
 const AMBIENT_NODE_BREATHING = Object.freeze({ x: 1.55, y: 1.85, z: 0.72 });
-const AMBIENT_CAMERA_DRIFT = Object.freeze({ x: 1.1, y: 0.82, z: 0.34 });
 // Covers the largest common-plus-individual planar displacement (6.35).
 const AMBIENT_MAX_OFFSET = 7;
 const AMBIENT_RADIANS_PER_SECOND = 0.24;
-const ORBIT_DAMPING_FACTOR = 0.08;
+const ORBIT_DAMPING_FACTOR = 0.05;
+const ORBIT_ROTATE_SPEED = 0.6;
+// Idle camera drift mirrors the reference: after half a second without
+// interaction the camera keeps circling the graph very slowly (0.045 rad/s),
+// eased in over 1.6s. It pauses for hover, selection, search, and transitions.
+const IDLE_DRIFT_DELAY_MS = 500;
+const IDLE_DRIFT_EASE_MS = 1600;
+const IDLE_DRIFT_RATE_RAD_PER_MS = 0.000045;
 const HOVER_ATTRACTION_RADIUS = 180;
 const HOVER_ATTRACTION_STRENGTH = 0.32;
 const HOVER_PROXIMITY_STRENGTH = 0.12;
@@ -275,8 +281,6 @@ const IDLE_LABEL_SCALE = Object.freeze({ far: 0.54, nearRange: 0.44 });
 // HarnessKit's visual envelope is a softly lit sphere with a restrained shell
 // around it. Keep the shell subordinate to the current AIHero-inspired body
 // colors and leave all label/interaction policy in the existing renderer path.
-const DEFAULT_NODE_OUTLINE_OPACITY_RATIO = 0.72;
-const DEFAULT_NODE_OUTLINE_SCALE = 1.08;
 const DEFAULT_NODE_FOCUS_RIM_SCALE = 1.16;
 
 function smoothstep(progress: number): number {
@@ -608,12 +612,16 @@ function updateObjectMaterials(object: Object3D, update: MaterialVisualUpdate): 
   object.traverse((candidate) => {
     materialsForObject(candidate).forEach((material) => {
       if (!material || typeof material !== "object") return;
+      // Default bodies stay opaque: dimming is expressed by mixing their tone
+      // toward the background, so the opacity value only feeds observations.
+      const isDefaultBody = candidate.userData.graphVisualRole === "body"
+        && object.userData.graphDefaultNodeObject === true;
       if ("opacity" in material && typeof material.opacity === "number") {
         if (Math.abs(material.opacity - update.opacity) > AMBIENT_VISUAL_EPSILON) {
           material.opacity = update.opacity;
         }
       }
-      if ("transparent" in material && typeof material.transparent === "boolean") {
+      if ("transparent" in material && typeof material.transparent === "boolean" && !isDefaultBody) {
         // Sprite labels carry their glyph mask in texture alpha. They must
         // remain transparent even at opacity 1 or WebGL treats the empty canvas
         // pixels as an opaque black rectangle.
@@ -675,6 +683,81 @@ function observeGraphObject(
   };
 }
 
+const NODE_LABEL_HALO_SCALE = 1.14;
+
+function drawLabelGlyphCanvas(label: string): HTMLCanvasElement | null {
+  if (typeof document === "undefined") return null;
+  const text = label.trim() || "Untitled";
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  if (!context) return null;
+  const fontSize = 56;
+  context.font = `600 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  const horizontalPadding = 34;
+  canvas.width = Math.ceil(context.measureText(text).width + (horizontalPadding * 2));
+  canvas.height = 96;
+  context.font = `600 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  context.fillStyle = "#ffffff";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(text, canvas.width / 2, canvas.height / 2 + 2);
+  return canvas;
+}
+
+function trackLabelTextureDisposal(material: SpriteMaterial, texture: Texture): void {
+  // Three.js materials do not dispose maps they reference. The label is
+  // recreated when graphData changes, so retain this exact texture in the
+  // material lifecycle and release it once when the SpriteMaterial goes
+  // away. The guard matters because Material.dispose() dispatches on every
+  // call rather than making disposal idempotent itself.
+  let textureDisposed = false;
+  material.addEventListener("dispose", () => {
+    if (textureDisposed) return;
+    textureDisposed = true;
+    texture.dispose();
+  });
+}
+
+function createNodeLabelHaloSprite(
+  label: string,
+  silhouette: DefaultNodeSilhouetteSpec,
+  opacity: number,
+): Sprite | null {
+  // The reference sets its labels in a paper-colored halo so small type stays
+  // readable over nodes behind it. The halo reuses the glyph mask at a
+  // slightly larger scale, tinted with the background tone.
+  const canvas = drawLabelGlyphCanvas(label);
+  if (!canvas) return null;
+  const haloMaterial = new SpriteMaterial({
+    color: THEME_PALETTES.dark.background,
+    depthTest: true,
+    depthWrite: false,
+    alphaTest: 0.001,
+    opacity,
+    sizeAttenuation: true,
+    transparent: true,
+  });
+  const texture = new CanvasTexture(canvas);
+  texture.colorSpace = NoColorSpace;
+  haloMaterial.alphaMap = texture;
+  trackLabelTextureDisposal(haloMaterial, texture);
+  const halo = new Sprite(haloMaterial);
+  halo.center.set(0.5, 0);
+  halo.position.set(0, silhouette.labelAnchorY, 0);
+  // Derive from the same text measure as the label so the halo stays a fixed
+  // margin around the glyphs regardless of wording.
+  const haloBaseWidth = Math.max(17, Math.min(58, label.trim().length * 3.05));
+  halo.scale.set(
+    haloBaseWidth * NODE_LABEL_HALO_SCALE,
+    (silhouette.kind === "disk" ? 10 : 8) * NODE_LABEL_HALO_SCALE,
+    1,
+  );
+  halo.userData.graphBaseLabelScale = { x: halo.scale.x, y: halo.scale.y, z: halo.scale.z };
+  halo.renderOrder = 41;
+  halo.userData.graphVisualRole = "node-label-halo";
+  return halo;
+}
+
 function createNodeLabelSprite(
   label: string,
   silhouette: DefaultNodeSilhouetteSpec,
@@ -694,36 +777,15 @@ function createNodeLabelSprite(
     transparent: true,
   });
   if (typeof document !== "undefined") {
-    const canvas = document.createElement("canvas");
-    const context = canvas.getContext("2d");
-    if (context) {
-      const fontSize = 56;
-      context.font = `600 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-      const horizontalPadding = 34;
-      canvas.width = Math.ceil(context.measureText(text).width + (horizontalPadding * 2));
-      canvas.height = 96;
-      context.font = `600 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-      context.fillStyle = "#ffffff";
-      context.textAlign = "center";
-      context.textBaseline = "middle";
-      context.fillText(text, canvas.width / 2, canvas.height / 2 + 2);
+    const canvas = drawLabelGlyphCanvas(label);
+    if (canvas) {
       const texture = new CanvasTexture(canvas);
       // Treat the canvas as a glyph mask. Using alphaMap, rather than a color
       // map with transparent pixels, prevents opaque dark canvas rectangles
       // when a selected label reaches material opacity 1.
       texture.colorSpace = NoColorSpace;
       spriteMaterial.alphaMap = texture;
-      // Three.js materials do not dispose maps they reference. The label is
-      // recreated when graphData changes, so retain this exact texture in the
-      // material lifecycle and release it once when the SpriteMaterial goes
-      // away. The guard matters because Material.dispose() dispatches on every
-      // call rather than making disposal idempotent itself.
-      let textureDisposed = false;
-      spriteMaterial.addEventListener("dispose", () => {
-        if (textureDisposed) return;
-        textureDisposed = true;
-        texture.dispose();
-      });
+      trackLabelTextureDisposal(spriteMaterial, texture);
       spriteMaterial.needsUpdate = true;
     }
   }
@@ -750,41 +812,25 @@ export function createDefaultGraphNodeObject(
   const opacity = boundedOpacity(descriptor?.opacity, 1);
   const group = new Group();
   const silhouette = defaultNodeSilhouette(node);
-  const relationTier = silhouette.cameraRadius >= 6;
-  const bodyMaterial = new MeshStandardMaterial({
+  // Reference bodies are flat matte discs with a hard edge and no shading:
+  // an unlit opaque material reads as one solid tone from every angle and
+  // occludes correctly, so overlapping context no longer flashes or muddies.
+  const bodyMaterial = new MeshBasicMaterial({
     color,
-    // Bodies are intentionally rendered as translucent depth cues. Writing
-    // each faded sphere into the depth buffer makes the draw order unstable
-    // while OrbitControls changes the camera, so overlapping nodes can flash
-    // as transparent fragments occlude one another from frame to frame.
-    depthWrite: false,
-    metalness: relationTier ? 0.36 : 0.22,
-    opacity,
-    roughness: relationTier ? 0.4 : 0.58,
-    side: DoubleSide,
-    transparent: opacity < 1,
+    transparent: false,
+    depthWrite: true,
   });
   const geometry = createDefaultNodeGeometry(silhouette);
   const body = new Mesh(geometry, bodyMaterial);
   body.userData.graphVisualRole = "body";
   body.userData.graphDefaultNodeSilhouette = silhouette.kind;
   body.userData.graphDefaultNodeSilhouetteSignature = defaultNodeSilhouetteSignature(silhouette);
+  body.userData.graphDefaultBodyBaseColor = `#${color.getHexString()}`;
   makeCameraFacingMesh(body);
   group.add(body);
 
-  const outlineMaterial = new MeshBasicMaterial({
-    color: THEME_PALETTES.dark.outline,
-    depthWrite: false,
-    opacity: opacity * DEFAULT_NODE_OUTLINE_OPACITY_RATIO,
-    side: BackSide,
-    transparent: true,
-  });
-  const outline = new Mesh(geometry, outlineMaterial);
-  outline.scale.setScalar(DEFAULT_NODE_OUTLINE_SCALE);
-  outline.renderOrder = 1;
-  outline.userData.graphVisualRole = "outline";
-  group.add(outline);
-
+  // The reference draws no outline shell around its discs, so the factory no
+  // longer creates one.
   const focusRimMaterial = new MeshBasicMaterial({
     color: THEME_PALETTES.dark.rim,
     depthWrite: false,
@@ -799,10 +845,12 @@ export function createDefaultGraphNodeObject(
   focusRim.visible = false;
   group.add(focusRim);
 
-  // Default bodies use volumetric geometry and restrained lighting. Depth is
-  // still reinforced by the renderer's scale/opacity hierarchy, while the
-  // light rig gives orbiting and occlusion a visible surface response.
+  // Default bodies are flat matte discs with a hard edge and no shading. Depth
+  // is reinforced by mixing the body tone toward the background instead of
+  // fading opacity, so overlapping context occludes cleanly.
   group.add(createNodeLabelSprite(descriptor?.label ?? node.label, silhouette, opacity));
+  const halo = createNodeLabelHaloSprite(descriptor?.label ?? node.label, silhouette, opacity);
+  if (halo) group.add(halo);
   group.userData.graphNodeId = node.id;
   group.userData.graphDefaultNodeObject = true;
   return group;
@@ -978,6 +1026,7 @@ interface CursorZoomControls extends CameraInteractionControls {
 interface DampedCameraControls extends CameraInteractionControls {
   dampingFactor: number;
   enableDamping: boolean;
+  rotateSpeed?: number;
 }
 
 interface TargetCameraControls extends CameraInteractionControls {
@@ -1066,8 +1115,15 @@ function easeOutCubic(progress: number): number {
   return 1 - ((1 - bounded) ** 3);
 }
 
+// Exponential ease-out mirrors the reference controller: a fast attack that
+// settles gently instead of the slow start of a cubic in-out.
+function easeOutExpo(progress: number): number {
+  const bounded = Math.min(1, Math.max(0, progress));
+  return bounded >= 1 ? 1 : 1 - (2 ** (-10 * bounded));
+}
+
 function interpolatePose(start: CameraPose, end: CameraPose, progress: number): CameraPose {
-  const eased = easeInOutCubic(progress);
+  const eased = easeOutExpo(progress);
   return {
     position: {
       x: interpolate(start.position.x, end.position.x, eased),
@@ -1330,15 +1386,15 @@ interface CachedDefaultLinkBoundaryEvidence {
 interface AmbientDefaultNodeVisual {
   readonly baseLabelScale: Coordinates;
   readonly body: Mesh;
-  readonly bodyMaterial: MeshStandardMaterial;
-  readonly outline: Mesh | null;
-  readonly outlineMaterial: MeshBasicMaterial | null;
+  readonly bodyMaterial: MeshBasicMaterial;
+  readonly halo: Sprite | null;
+  readonly haloMaterial: SpriteMaterial | null;
   readonly label: Sprite;
   readonly labelMaterial: SpriteMaterial;
   lastBodyOpacity: number;
   lastBodyVisible: boolean | null;
-  lastOutlineOpacity: number;
-  lastOutlineVisible: boolean | null;
+  lastHaloOpacity: number;
+  lastHaloVisible: boolean | null;
   lastLabelOpacity: number;
   lastLabelScale: number;
   lastLabelVisible: boolean | null;
@@ -1525,6 +1581,16 @@ function setObjectMaterialColor(object: Object3D | null, color: string): void {
   });
 }
 
+/**
+ * Mixes a body tone toward the background the way the reference fades its
+ * discs: dimmed context keeps full opacity but reads as a quieter tone, so
+ * overlapping nodes occlude instead of blending into mud.
+ */
+function dimmedBodyColor(base: Color, background: string, factor: number): Color {
+  const bounded = Math.max(0, Math.min(1, factor));
+  return new Color(base).lerp(new Color(background), 1 - bounded);
+}
+
 function objectMaterialColor(object: Object3D | null): string | null {
   if (!object) return null;
   return materialsForObject(object)
@@ -1580,6 +1646,9 @@ export function createThreeForceGraphRenderer({
   let destroyed = false;
   const renderedLinkObjects = new Map<string, Object3D>();
   const renderedNodeObjects = new Map<string, Object3D>();
+  // Palette-fresh body tones per node. Dimming mixes from this base toward the
+  // background every frame, so repeated visual passes never compound.
+  const bodyBaseColors = new Map<string, Color>();
   const frameScheduler = cameraFrameScheduler(container);
   let transitionGeneration = 0;
   let motionFrame: number | null = null;
@@ -1603,8 +1672,9 @@ export function createThreeForceGraphRenderer({
   let ambientPaused = false;
   let ambientVisualsDirty = false;
   let ambientCameraAnchor: CameraPose | null = null;
-  let ambientCameraAnchorElapsedMs = 0;
   let ambientCameraLastPose: CameraPose | null = null;
+  let lastCameraActivityMs = 0;
+  let lastDriftFrameMs = 0;
   let focusCameraBaseline: CameraPose | null = null;
   let activityState: GraphActivityState = {};
   let explicitlySuspended = false;
@@ -1674,11 +1744,14 @@ export function createThreeForceGraphRenderer({
   const targetCameraControls = isTargetCameraControls(controls) ? controls : null;
   if (cursorZoomControls) cursorZoomControls.zoomToCursor = true;
   if (dampedCameraControls) {
-    // The reference keeps a small amount of angular momentum after pointer-up
-    // instead of stopping the camera on one abrupt frame. Three.js only
-    // applies that continuation when OrbitControls damping is explicitly on.
+    // Match the reference controller feel: gentle damping with a slower
+    // orbit rate. Three.js applies the damping continuation after pointer-up,
+    // which gives the release glide the reference gets from its own decay.
     dampedCameraControls.enableDamping = true;
     dampedCameraControls.dampingFactor = ORBIT_DAMPING_FACTOR;
+    if (typeof dampedCameraControls.rotateSpeed === "number") {
+      dampedCameraControls.rotateSpeed = ORBIT_ROTATE_SPEED;
+    }
   }
   let cameraControlInteractionActive = false;
 
@@ -1948,13 +2021,16 @@ export function createThreeForceGraphRenderer({
       currentPresentation.theme,
       defaultVisualInputForNode(node).visualKind,
     );
+    bodyBaseColors.set(node.id, new Color(bodyColor));
     setObjectMaterialColor(
       graphChildWithRole(object, "body"),
       bodyColor,
     );
-    setObjectMaterialColor(graphChildWithRole(object, "outline"), palette.outline);
     setObjectMaterialColor(graphChildWithRole(object, "focus-rim"), palette.rim);
     setObjectMaterialColor(graphChildWithRole(object, "node-label"), palette.outline);
+    // The label halo always matches the canvas background so type stays
+    // readable over nodes behind it.
+    setObjectMaterialColor(graphChildWithRole(object, "node-label-halo"), palette.background);
   }
 
   function applyLinkPalette(link: RenderLink): void {
@@ -1991,26 +2067,26 @@ export function createThreeForceGraphRenderer({
     const object = state.object;
     if (state.defaultVisual || object?.userData.graphDefaultNodeObject !== true) return;
     const body = graphChildWithRole(object, "body");
-    const outline = graphChildWithRole(object, "outline");
+    const halo = graphChildWithRole(object, "node-label-halo");
     const label = graphChildWithRole(object, "node-label");
-    if (!(body instanceof Mesh) || !(body.material instanceof MeshStandardMaterial)) return;
+    if (!(body instanceof Mesh) || !(body.material instanceof MeshBasicMaterial)) return;
     if (!(label instanceof Sprite) || !(label.material instanceof SpriteMaterial)) return;
-    const outlineMesh = outline instanceof Mesh ? outline : null;
-    const outlineMaterial = outlineMesh?.material instanceof MeshBasicMaterial
-      ? outlineMesh.material
+    const haloSprite = halo instanceof Sprite ? halo : null;
+    const haloMaterial = haloSprite?.material instanceof SpriteMaterial
+      ? haloSprite.material
       : null;
     state.defaultVisual = {
       baseLabelScale: staticLabelBaseScale(label),
       body,
       bodyMaterial: body.material,
-      outline: outlineMesh,
-      outlineMaterial,
+      halo: haloSprite,
+      haloMaterial,
       label,
       labelMaterial: label.material,
       lastBodyOpacity: Number.NaN,
       lastBodyVisible: null,
-      lastOutlineOpacity: Number.NaN,
-      lastOutlineVisible: null,
+      lastHaloOpacity: Number.NaN,
+      lastHaloVisible: null,
       lastLabelOpacity: Number.NaN,
       lastLabelScale: Number.NaN,
       lastLabelVisible: null,
@@ -2062,8 +2138,8 @@ export function createThreeForceGraphRenderer({
     if (!visual) return;
     visual.lastBodyOpacity = Number.NaN;
     visual.lastBodyVisible = null;
-    visual.lastOutlineOpacity = Number.NaN;
-    visual.lastOutlineVisible = null;
+    visual.lastHaloOpacity = Number.NaN;
+    visual.lastHaloVisible = null;
     visual.lastLabelOpacity = Number.NaN;
     visual.lastLabelScale = Number.NaN;
     visual.lastLabelVisible = null;
@@ -2104,25 +2180,36 @@ export function createThreeForceGraphRenderer({
     const visual = state.defaultVisual;
     const object = state.object;
     if (!visual || !object) return;
+    // Bodies stay opaque: dimming mixes the palette tone toward the
+    // background, so the opacity value only feeds observations.
     if (changedAmbientVisualValue(visual.lastBodyOpacity, opacity)) {
       visual.bodyMaterial.opacity = opacity;
+      const base = bodyBaseColors.get(state.id);
+      if (base) {
+        const background = themePalette(currentPresentation.theme).background;
+        visual.bodyMaterial.color.copy(dimmedBodyColor(base, background, opacity));
+      }
       visual.lastBodyOpacity = opacity;
     }
-    ensureAmbientTransparency(visual.bodyMaterial, true);
     if (visual.lastBodyVisible !== bodyVisible) {
       visual.body.visible = bodyVisible;
       visual.lastBodyVisible = bodyVisible;
     }
-    if (visual.outline && visual.outlineMaterial) {
-      const outlineOpacity = opacity * DEFAULT_NODE_OUTLINE_OPACITY_RATIO;
-      if (changedAmbientVisualValue(visual.lastOutlineOpacity, outlineOpacity)) {
-        visual.outlineMaterial.opacity = outlineOpacity;
-        visual.lastOutlineOpacity = outlineOpacity;
+    if (visual.halo && visual.haloMaterial) {
+      if (visual.lastHaloVisible !== labelVisible) {
+        visual.halo.visible = labelVisible;
+        visual.lastHaloVisible = labelVisible;
       }
-      ensureAmbientTransparency(visual.outlineMaterial, true);
-      if (visual.lastOutlineVisible !== bodyVisible) {
-        visual.outline.visible = bodyVisible;
-        visual.lastOutlineVisible = bodyVisible;
+      if (changedAmbientVisualValue(visual.lastHaloOpacity, labelOpacity)) {
+        visual.haloMaterial.opacity = labelOpacity;
+        visual.lastHaloOpacity = labelOpacity;
+      }
+      if (changedAmbientVisualValue(visual.lastLabelScale, labelScale)) {
+        visual.halo.scale.set(
+          visual.baseLabelScale.x * NODE_LABEL_HALO_SCALE * labelScale,
+          visual.baseLabelScale.y * NODE_LABEL_HALO_SCALE * labelScale,
+          visual.baseLabelScale.z * NODE_LABEL_HALO_SCALE * labelScale,
+        );
       }
     }
     if (changedAmbientVisualValue(visual.lastScale, scale)) {
@@ -2208,11 +2295,15 @@ export function createThreeForceGraphRenderer({
     if (object.userData.graphDefaultNodeObject === true) {
       object.scale.setScalar(scale);
       const body = graphChildWithRole(object, "body");
-      if (body) body.visible = bodyVisible;
-      const outline = graphChildWithRole(object, "outline");
-      if (outline) {
-        outline.visible = bodyVisible;
-        setObjectMaterialOpacity(outline, opacity * DEFAULT_NODE_OUTLINE_OPACITY_RATIO);
+      if (body) {
+        body.visible = bodyVisible;
+        // Dimming mixes the palette tone toward the background instead of
+        // lowering opacity, so bodies stay opaque and occlude cleanly.
+        const base = bodyBaseColors.get(node.id);
+        if (base) {
+          const background = themePalette(currentPresentation.theme).background;
+          setObjectMaterialColor(body, `#${dimmedBodyColor(base, background, opacity).getHexString()}`);
+        }
       }
     }
     const rim = graphChildWithRole(object, "focus-rim");
@@ -2226,6 +2317,13 @@ export function createThreeForceGraphRenderer({
       setObjectMaterialOpacity(label, labelOpacity);
       const base = staticLabelBaseScale(label);
       label.scale.set(base.x * labelScale, base.y * labelScale, base.z * labelScale);
+    }
+    const halo = graphChildWithRole(object, "node-label-halo");
+    if (halo) {
+      halo.visible = labelVisible;
+      setObjectMaterialOpacity(halo, labelOpacity);
+      const base = staticLabelBaseScale(halo);
+      halo.scale.set(base.x * labelScale, base.y * labelScale, base.z * labelScale);
     }
     invalidateAmbientDefaultNodeVisual(node.id);
   }
@@ -2474,34 +2572,51 @@ export function createThreeForceGraphRenderer({
     ) {
       ambientCameraAnchor = null;
       ambientCameraLastPose = null;
+      lastCameraActivityMs = ambientElapsedMs;
+      lastDriftFrameMs = ambientElapsedMs;
       return;
     }
+    const data = currentData;
+    // Hover, selection, and search own the reading focus, so the idle camera
+    // holds still while they are active. The idle clock keeps running so the
+    // drift resumes at full ease once the focus clears.
+    if (
+      hoverNodeId !== null
+      || (data?.selection.nodeId ?? null) !== null
+      || data?.search.active === true
+    ) {
+      ambientCameraAnchor = null;
+      ambientCameraLastPose = null;
+      lastDriftFrameMs = ambientElapsedMs;
+      return;
+    }
+    const idleMs = ambientElapsedMs - lastCameraActivityMs;
+    if (idleMs < IDLE_DRIFT_DELAY_MS) {
+      lastDriftFrameMs = ambientElapsedMs;
+      return;
+    }
+    // Ease the drift in over ~1.6s so it never starts with a visible step.
+    const easeProgress = Math.max(0, Math.min(1, (idleMs - IDLE_DRIFT_DELAY_MS) / IDLE_DRIFT_EASE_MS));
+    const eased = easeProgress * easeProgress * (3 - (2 * easeProgress));
+    const deltaMs = Math.max(0, ambientElapsedMs - lastDriftFrameMs);
+    lastDriftFrameMs = ambientElapsedMs;
+    const angle = IDLE_DRIFT_RATE_RAD_PER_MS * deltaMs * eased;
+    if (angle <= 0) return;
     const current = cameraPose();
-    if (!ambientCameraAnchor || (ambientCameraLastPose && !sameCameraPose(current, ambientCameraLastPose))) {
-      ambientCameraAnchor = current;
-      ambientCameraAnchorElapsedMs = ambientElapsedMs;
-      ambientCameraLastPose = current;
-      return;
-    }
-    const phase = ((ambientElapsedMs - ambientCameraAnchorElapsedMs) / 1000) * AMBIENT_RADIANS_PER_SECOND;
-    const offset = {
-      x: Math.sin(phase) * AMBIENT_CAMERA_DRIFT.x,
-      y: (Math.cos(phase * 0.91) - 1) * AMBIENT_CAMERA_DRIFT.y,
-      z: Math.sin(phase * 0.67) * AMBIENT_CAMERA_DRIFT.z,
-    };
+    const deltaX = current.position.x - current.lookAt.x;
+    const deltaZ = current.position.z - current.lookAt.z;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
     const next: CameraPose = {
       position: {
-        x: ambientCameraAnchor.position.x + offset.x,
-        y: ambientCameraAnchor.position.y + offset.y,
-        z: ambientCameraAnchor.position.z + offset.z,
+        x: current.lookAt.x + (deltaX * cos) - (deltaZ * sin),
+        y: current.position.y,
+        z: current.lookAt.z + (deltaX * sin) + (deltaZ * cos),
       },
-      lookAt: {
-        x: ambientCameraAnchor.lookAt.x + (offset.x * 0.34),
-        y: ambientCameraAnchor.lookAt.y + (offset.y * 0.34),
-        z: ambientCameraAnchor.lookAt.z + (offset.z * 0.34),
-      },
+      lookAt: { ...current.lookAt },
     };
     if (ambientCameraLastPose && sameCameraPose(next, ambientCameraLastPose)) return;
+    ambientCameraAnchor = next;
     graph.cameraPosition(next.position, next.lookAt, 0);
     ambientCameraLastPose = next;
   }
@@ -3403,7 +3518,7 @@ export function createThreeForceGraphRenderer({
   }
 
   function applySceneFrame(scene: SceneTransition, progress: number, final = false): void {
-    const eased = easeInOutCubic(progress);
+    const eased = easeOutExpo(progress);
     const data = graph.graphData();
     const liveNodeById = new Map(data.nodes.map((node) => [node.id, node]));
     const targetNodeById = new Map(currentData?.nodes.map((node) => [node.id, node]) ?? []);
