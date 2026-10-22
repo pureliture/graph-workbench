@@ -5,10 +5,13 @@ import {
   type GraphNode,
   type GraphInput,
   type GraphRenderObservation,
+  type GraphSearchOptions,
   type GraphSelectionEvent,
   type GraphSelectionSource,
   type GraphWorkbench,
 } from "@pureliture/graph-workbench";
+import { GraphSearchField } from "../graph-search/GraphSearchField";
+import { useGraphSearch } from "../graph-search/useGraphSearch";
 
 const densityNodeCount = 150;
 const densityFocusNodeId = "relation:query";
@@ -534,7 +537,6 @@ function densityTermPath(nodeId: string | null): string {
     location.searchParams.set("term", node?.id === densityFocusNodeId ? densitySlugForNode(node) : nodeId);
   }
   else location.searchParams.delete("term");
-  location.searchParams.delete("q");
   return `${location.pathname}${location.search}${location.hash}`;
 }
 
@@ -602,6 +604,23 @@ function densityScreenProjection(workbench: GraphWorkbench, nodes: readonly Grap
   };
 }
 
+// The dense fixture keeps its reference prose outside the graph contract, so
+// the search index resolves it from the same source the detail panel reads.
+const densitySearchOptions: GraphSearchOptions = {
+  resolveDocument: (node) => {
+    const rich = densityRichDetailsForNode(node);
+    return {
+      aliases: rich.usage,
+      avoid: rich.avoid ?? "",
+      body: [rich.definition, ...rich.longDefinition, ...rich.bullets].join(" "),
+      description: rich.summary,
+      identity: `${node.id} ${node.kind} ${node.type} ${rich.section} ${rich.category}`,
+      title: node.label,
+      usage: [rich.usage, ...(rich.surfaces ?? [])].join(" "),
+    };
+  },
+};
+
 export function DenseGraphFixture() {
   const detailPanelRef = useRef<HTMLElement | null>(null);
   const graphHostRef = useRef<HTMLDivElement | null>(null);
@@ -626,6 +645,16 @@ export function DenseGraphFixture() {
   const [renderRevision, setRenderRevision] = useState(0);
   const [expandedNodeId, setExpandedNodeId] = useState<string | null>(null);
   const rendererReady = rendererStatus === "mounted" && webglStatus === "mounted";
+  const {
+    apply: applySearch,
+    focus: focusSearch,
+    matchCount: searchMatchCount,
+    matches: searchMatches,
+    query: searchQuery,
+    searchInputRef,
+    setQuery: setSearchQuery,
+  } = useGraphSearch(densityInput, workbenchRef, densitySearchOptions);
+  const matchedNodeIds = new Set(searchMatches.map((match) => match.nodeId));
 
   const selectNode = useCallback((nodeId: string | null, source: GraphSelectionSource) => {
     if (!rendererReady) return;
@@ -635,6 +664,47 @@ export function DenseGraphFixture() {
   const selectFocus = useCallback(() => {
     selectNode(densityFocusNodeId, "density-control");
   }, [selectNode]);
+
+  const submitSearch = useCallback(() => {
+    const topMatch = searchMatches[0];
+    if (!topMatch) return;
+    selectNode(topMatch.nodeId, "search");
+    // The reference clears the running query once a term is chosen, so the
+    // graph returns to its normal reading mode.
+    setSearchQuery("");
+  }, [searchMatches, selectNode, setSearchQuery]);
+
+  useEffect(() => {
+    const onFocusShortcut = (event: KeyboardEvent) => {
+      const target = event.target;
+      const isTextInput = target instanceof HTMLInputElement
+        || target instanceof HTMLTextAreaElement
+        || (target instanceof HTMLElement && target.isContentEditable);
+      const findShortcut = (event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === "f";
+      const slashShortcut = event.key === "/" && !isTextInput && !event.metaKey && !event.ctrlKey && !event.altKey;
+      if (!findShortcut && !slashShortcut) return;
+      event.preventDefault();
+      focusSearch();
+    };
+    const onClearShortcut = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (searchQuery.trim().length === 0) return;
+      const target = event.target;
+      const isTextInput = target instanceof HTMLInputElement
+        || target instanceof HTMLTextAreaElement
+        || (target instanceof HTMLElement && target.isContentEditable);
+      if (!isTextInput) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setSearchQuery("");
+    };
+    document.addEventListener("keydown", onFocusShortcut);
+    document.addEventListener("keydown", onClearShortcut, true);
+    return () => {
+      document.removeEventListener("keydown", onFocusShortcut);
+      document.removeEventListener("keydown", onClearShortcut, true);
+    };
+  }, [focusSearch, searchQuery, setSearchQuery]);
 
   useEffect(() => {
     const host = graphHostRef.current;
@@ -663,6 +733,7 @@ export function DenseGraphFixture() {
         if (disposed) return;
         const workbench = createBrowserGraphWorkbench({
           input: densityInput,
+          searchOptions: densitySearchOptions,
           onRendererStateChange: ({ reason, status }) => {
             if (status === "failed") markUnavailable(reason ?? "The density renderer failed to mount.");
             if (status === "mounted") {
@@ -707,7 +778,9 @@ export function DenseGraphFixture() {
         });
         workbenchRef.current = workbench;
         workbench.mount(host);
-        workbench.setPresentation({ ambientMotion: true, theme: "dark" });
+        // A shared link can carry a running query. Apply it once the renderer
+        // exists so the matched cluster is framed on the first paint.
+        applySearch();        workbench.setPresentation({ ambientMotion: true, theme: "dark" });
         workbench.resize(host.clientWidth, host.clientHeight);
         resizeObserver = new ResizeObserver(([entry]) => {
           workbench.resize(entry.contentRect.width, entry.contentRect.height);
@@ -785,19 +858,14 @@ export function DenseGraphFixture() {
       workbenchRef.current?.destroy();
       workbenchRef.current = null;
     };
-  }, []);
+  }, [applySearch]);
 
   useEffect(() => {
     if (!rendererReady || initialTermAppliedRef.current) return;
     initialTermAppliedRef.current = true;
     const location = new URL(window.location.href);
     const rawTerm = location.searchParams.get("term");
-    if (rawTerm === null) {
-      if (location.searchParams.has("q")) {
-        window.history.replaceState(window.history.state, "", densityTermPath(null));
-      }
-      return;
-    }
+    if (rawTerm === null) return;
     const node = densityNodeForTerm(rawTerm);
     if (node) {
       window.setTimeout(() => selectNode(node.id, "deep-link"), 0);
@@ -987,6 +1055,14 @@ export function DenseGraphFixture() {
       data-renderer-failed={rendererStatus === "failed" ? "true" : "false"}
     >
       <h1 className="sr-only">Graph Workbench Density Fixture</h1>
+      <GraphSearchField
+        inputRef={searchInputRef}
+        matchCount={searchMatchCount}
+        onChange={setSearchQuery}
+        onSubmit={submitSearch}
+        query={searchQuery}
+        testId="graph-density-search-input"
+      />
       <div className="density-controls">
         <span>{rendererReady ? "Density renderer ready" : rendererStatus === "failed" ? "Renderer unavailable" : "Preparing density renderer"}</span>
         <button
@@ -1016,7 +1092,11 @@ export function DenseGraphFixture() {
       <section className="semantic-fallback" aria-label="Dictionary terms">
         <h2>Dictionary terms</h2>
         {densitySections.map((section) => {
-          const sectionNodes = densitySectionNodes(densityInput.nodes, section);
+          const sectionNodes = densitySectionNodes(densityInput.nodes, section)
+            // The semantic fallback is the no-WebGL reading surface, so it has
+            // to follow the same query as the graph.
+            .filter((node) => matchedNodeIds.size === 0 || matchedNodeIds.has(node.id));
+          if (sectionNodes.length === 0) return null;
           return (
             <section key={section}>
               <h3>{section}</h3>
@@ -1031,6 +1111,11 @@ export function DenseGraphFixture() {
             </section>
           );
         })}
+        {matchedNodeIds.size > 0 && (
+          <p className="semantic-fallback-empty">
+            {searchMatchCount} of {densityInput.nodes.length} terms match “{searchQuery}”.
+          </p>
+        )}
       </section>
 
       <aside

@@ -36,6 +36,15 @@ export interface GraphPresentation {
   readonly focusNodeId?: string | null;
   /** Immutable host projection/snapshot identity used by optional recovery seams. */
   readonly recoveryKey?: string;
+  /**
+   * Node ids matched by an active search, ordered by descending relevance.
+   *
+   * `undefined` or `null` means no search is running and the graph keeps its
+   * normal reading tiers. An empty array means a search is running but matched
+   * nothing, so the whole graph reads as context. The renderer highlights the
+   * listed ids and dims everything else.
+   */
+  readonly matchedNodeIds?: readonly string[] | null;
   /** Keeps selection targets unchanged while requesting an immediate camera move. */
   readonly reducedMotion?: boolean;
   readonly theme?: "dark" | "light";
@@ -50,6 +59,7 @@ export const EMPTY_GRAPH_PRESENTATION: GraphPresentation = Object.freeze({
   selectionLayout: "constellation",
   focusNodeId: null,
   recoveryKey: undefined,
+  matchedNodeIds: null,
   reducedMotion: false,
   theme: "dark",
   nodeDescriptors: Object.freeze({}),

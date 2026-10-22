@@ -16,6 +16,12 @@ import {
   type GraphTransitionObservation,
 } from "./renderer-contract.js";
 import { EMPTY_GRAPH_PRESENTATION, type GraphPresentation } from "./presentation.js";
+import {
+  createGraphSearchIndex,
+  type GraphSearchMatch,
+  type GraphSearchOptions,
+  type GraphSearchResult,
+} from "./search.js";
 
 export interface GraphEvent {
   readonly input: GraphInput;
@@ -72,6 +78,17 @@ export interface GraphRendererState {
   readonly status: "failed" | "mounted" | "unmounted";
 }
 
+export interface GraphSearchState {
+  /** True while a non-empty query is running. */
+  readonly active: boolean;
+  /** Matches ordered by descending relevance. */
+  readonly matches: readonly GraphSearchMatch[];
+  /** Matched node ids ordered by descending relevance. */
+  readonly nodeIds: readonly string[];
+  /** The trimmed query that produced this state. */
+  readonly query: string;
+}
+
 export interface GraphWorkbenchOptions {
   readonly input: GraphInput;
   readonly onBackgroundClick?: () => void;
@@ -83,11 +100,14 @@ export interface GraphWorkbenchOptions {
   /** Synchronously accepts, customizes, or rejects a candidate selection. */
   readonly resolveSelection?: (intent: GraphSelectionIntent) => GraphSelectionAcceptance | false | void;
   readonly rendererFactory?: GraphRendererFactory;
+  /** Field weights and document rules used by the built-in search index. */
+  readonly searchOptions?: GraphSearchOptions;
 }
 
 export interface GraphWorkbench {
   /** Captures optional renderer-local recovery state, or null for legacy renderers. */
   captureRecoveryCapsule(): GraphRecoveryCapsule | null;
+  clearSearch(): void;
   destroy(): void;
   fit(durationMs?: number): void;
   focusNode(nodeId: string | null): void;
@@ -98,6 +118,7 @@ export interface GraphWorkbench {
   getRenderObservation(): GraphRenderObservation | null;
   /** Live renderer-owned selection transition evidence, when supported. */
   getTransitionObservation(): GraphTransitionObservation | null;
+  getSearchState(): GraphSearchState;
   getSelectionState(): GraphSelectionState;
   mount(container: HTMLElement): void;
   resize(width?: number, height?: number): void;
@@ -106,6 +127,8 @@ export interface GraphWorkbench {
   restoreCamera(): void;
   /** Resumes optional renderer-owned activity without remounting. */
   resume(): void;
+  /** Runs a query without changing the graph reading mode. */
+  search(query: string, options?: GraphSearchOptions): GraphSearchResult;
   selectNode(nodeId: string | null, source?: GraphSelectionSource): void;
   setInput(input: GraphInput): void;
   /** Passes host visibility/activity hints to enhanced renderers. */
@@ -114,6 +137,11 @@ export interface GraphWorkbench {
   setReducedMotion(reducedMotion: boolean): void;
   /** Suspends optional renderer-owned activity without disposing scene state. */
   suspend(): void;
+  /**
+   * Runs a query and applies it as the graph reading mode: matched nodes are
+   * emphasized and clustered, and the camera frames the matched set.
+   */
+  setSearchQuery(query: string, options?: GraphSearchOptions): void;
   unmount(): void;
   zoom(scale: number): void;
 }
@@ -132,10 +160,14 @@ function normalizedPresentation(input: GraphInput, supplied: GraphPresentation):
   const focusNodeId = supplied.focusNodeId && known.has(supplied.focusNodeId)
     ? supplied.focusNodeId
     : null;
+  const matchedNodeIds = supplied.matchedNodeIds === undefined || supplied.matchedNodeIds === null
+    ? null
+    : [...new Set(supplied.matchedNodeIds)].filter((id) => known.has(id));
   return {
     ambientMotion: supplied.ambientMotion !== false,
     selectedNodeIds,
     focusNodeId,
+    matchedNodeIds,
     reducedMotion: supplied.reducedMotion === true,
     theme: supplied.theme === "light" ? "light" : "dark",
     labelVisibility: supplied.labelVisibility,
@@ -192,6 +224,15 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
   let selectionState = createRenderGraphData(input, presentation, { viewport }).selection;
   let destroyed = false;
   const rendererFactory = options.rendererFactory;
+  // The search index is rebuilt only when the graph itself changes, so a host
+  // can run a query on every keystroke without paying for a re-index.
+  let searchIndex = createGraphSearchIndex(input, options.searchOptions);
+  let searchQuery = "";
+  let searchMatches: readonly GraphSearchMatch[] = [];
+  let searchNodeIds: readonly string[] = [];
+  let searchFramedCamera = false;
+
+  const searchActive = () => searchQuery.trim().length > 0;
 
   const sync = () => {
     const data = createRenderGraphData(input, presentation, { viewport });
@@ -199,6 +240,31 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
     if (!renderer) return;
     renderer.setData(data);
     renderer.setPresentation(presentation);
+  };
+
+  const applySearchReadingMode = () => {
+    presentation = normalizedPresentation(input, {
+      ...presentation,
+      matchedNodeIds: searchActive() ? searchNodeIds : null,
+    });
+    sync();
+  };
+
+  const frameSearchMatches = () => {
+    if (!renderer) return;
+    if (!searchActive() || searchNodeIds.length === 0) {
+      if (searchFramedCamera) {
+        // The matched cluster returns to the canonical layout, so the camera
+        // returns to the whole graph instead of hovering over an empty area.
+        searchFramedCamera = false;
+        if (!selectionState.nodeId) renderer.restoreCamera();
+      }
+      return;
+    }
+    if (selectionState.nodeId) return;
+    if (!renderer.focusNodeSet) return;
+    searchFramedCamera = true;
+    renderer.focusNodeSet(searchNodeIds, { reducedMotion: presentation.reducedMotion === true });
   };
 
   const transitionToSelection = (nodeId: string | null, durationMs?: number) => {
@@ -250,6 +316,9 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
       source,
     });
     if (acceptance === false) return false;
+    // A selection owns the reading layout, so the camera leaves the matched
+    // cluster framing and follows the selected node instead.
+    if (nextNodeId) searchFramedCamera = false;
     const camera = acceptance?.camera;
     presentation = normalizedPresentation(input, {
       ...candidatePresentation,
@@ -314,6 +383,13 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
     captureRecoveryCapsule() {
       return renderer?.captureRecoveryCapsule?.() ?? null;
     },
+    clearSearch() {
+      searchQuery = "";
+      searchMatches = [];
+      searchNodeIds = [];
+      applySearchReadingMode();
+      frameSearchMatches();
+    },
     destroy() {
       if (destroyed) return;
       this.unmount();
@@ -342,6 +418,14 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
     getTransitionObservation() {
       return renderer?.getTransitionObservation?.() ?? null;
     },
+    getSearchState() {
+      return {
+        active: searchActive(),
+        matches: searchMatches,
+        nodeIds: searchNodeIds,
+        query: searchQuery,
+      };
+    },
     getSelectionState() {
       return selectionState;
     },
@@ -363,6 +447,7 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
         sync();
         renderer.resize();
         transitionToSelection(selectionState.nodeId);
+        frameSearchMatches();
         options.onRendererStateChange?.({ status: "mounted" });
       } catch (error) {
         container.removeEventListener("keydown", onKeyDown);
@@ -392,6 +477,9 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
     resume() {
       renderer?.resume?.();
     },
+    search(query, searchOptions) {
+      return searchIndex.search(query, searchOptions);
+    },
     selectNode(nodeId, source = "programmatic") {
       selectNode(nodeId, source);
     },
@@ -403,7 +491,19 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
       const nextNodeId = selectedNodeId(nextPresentation);
       if (previousNodeId && !nextNodeId) renderer?.cancelCameraTransition?.();
       input = validatedInput;
+      searchIndex = createGraphSearchIndex(input, options.searchOptions);
       presentation = nextPresentation;
+      // Keep the running query meaningful after a host update instead of
+      // leaving stale match ids behind.
+      if (searchActive()) {
+        const result = searchIndex.search(searchQuery);
+        searchMatches = result.matches;
+        searchNodeIds = result.nodeIds;
+        presentation = normalizedPresentation(input, {
+          ...presentation,
+          matchedNodeIds: searchNodeIds,
+        });
+      }
       sync();
       const selectionChanged = selectionState.nodeId !== previousNodeId;
       const relationshipLayoutChanged = selectionState.nodeId !== null
@@ -427,7 +527,12 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
       const normalized = normalizedPresentation(input, nextPresentation);
       const nextNodeId = selectedNodeId(normalized);
       if (previousNodeId && !nextNodeId) renderer?.cancelCameraTransition?.();
-      presentation = normalized;
+      // The workbench owns the search reading mode, so a host presentation
+      // update cannot silently drop the matched nodes.
+      presentation = normalizedPresentation(input, {
+        ...normalized,
+        matchedNodeIds: searchActive() ? searchNodeIds : null,
+      });
       sync();
       if (selectionState.nodeId !== previousNodeId) {
         if (selectionState.nodeId) transitionToSelection(selectionState.nodeId);
@@ -441,6 +546,14 @@ export function createGraphWorkbench(options: GraphWorkbenchOptions): GraphWorkb
     },
     suspend() {
       renderer?.suspend?.();
+    },
+    setSearchQuery(query, searchOptions) {
+      const result = searchIndex.search(query, searchOptions);
+      searchQuery = result.query;
+      searchMatches = result.matches;
+      searchNodeIds = result.nodeIds;
+      applySearchReadingMode();
+      frameSearchMatches();
     },
     unmount() {
       if (!container && !renderer) return;

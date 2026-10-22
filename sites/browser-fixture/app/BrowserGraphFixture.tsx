@@ -15,6 +15,9 @@ import {
   type GraphWorkbench,
 } from "@pureliture/graph-workbench";
 
+import { GraphSearchField } from "./graph-search/GraphSearchField";
+import { useGraphSearch } from "./graph-search/useGraphSearch";
+
 const graphInput = {
   schemaVersion: 1,
   layout: { seed: "browser-fixture-selection-v2" },
@@ -930,6 +933,9 @@ export function BrowserGraphFixture() {
     reason: "Waiting for live ambient renderer evidence.",
   });
   const [renderObservationRevision, setRenderObservationRevision] = useState(0);
+  const [searchRenderEvidence, setSearchRenderEvidence] = useState<
+    Readonly<Record<string, number>> | null
+  >(null);
   const [renderer, setRenderer] = useState<RendererState>({ status: "pending", reason: null });
   const [webglState, setWebglState] = useState("pending");
   const [resolvedMode, setResolvedMode] = useState<ResolvedMode | null>(null);
@@ -937,7 +943,6 @@ export function BrowserGraphFixture() {
   const [collapsed, setCollapsed] = useState(false);
   const [detailActionStatus, setDetailActionStatus] = useState<string | null>(null);
   const [matrixOpen, setMatrixOpen] = useState(false);
-  const [matrixQuery, setMatrixQuery] = useState("");
   const [hostUpdate, setHostUpdate] = useState({
     setInputSafe: false,
     collapseSafe: false,
@@ -945,11 +950,22 @@ export function BrowserGraphFixture() {
   });
   const rendererAvailable = renderer.status === "mounted" && webglState === "mounted";
   const observedSelection = selectionTelemetry.availability === "observed" ? selectionTelemetry : null;
-  const filteredNodes = graphInput.nodes.filter((node) => {
-    const query = matrixQuery.trim().toLocaleLowerCase();
-    return query.length === 0 || [node.label, node.id, node.kind, node.type]
-      .some((value) => value.toLocaleLowerCase().includes(query));
-  });
+  const graphSearch = useGraphSearch(graphInput, workbenchRef);
+  const {
+    apply: applySearch,
+    focus: focusSearch,
+    matchCount: searchMatchCount,
+    matches: searchMatches,
+    query: searchQuery,
+    searchInputRef,
+    setQuery: setSearchQuery,
+  } = graphSearch;
+  // The search engine owns the ranking. An empty query keeps the full list so
+  // the palette still reads as a complete identity browser.
+  const rankedNodes = searchMatches
+    .map((match) => graphInput.nodes.find((node) => node.id === match.nodeId))
+    .filter((node): node is GraphNode => Boolean(node));
+  const filteredNodes = searchQuery.trim().length === 0 ? graphInput.nodes : rankedNodes;
 
   const selectNode = useCallback((nodeId: string | null, source: GraphSelectionSource) => {
     if (!rendererReadyRef.current) return;
@@ -973,6 +989,34 @@ export function BrowserGraphFixture() {
     setHostUpdate((current) => ({ ...current, collapseSafe: true }));
     selectNode(null, source);
   }, [selectNode]);
+
+  useEffect(() => {
+    const workbench = workbenchRef.current;
+    if (!workbench || searchQuery.trim().length === 0) {
+      setSearchRenderEvidence(null);
+      return undefined;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const observation = workbench.getRenderObservation();
+      if (!observation) return;
+      const opacities: Record<string, number> = {};
+      observation.nodes.forEach((node) => {
+        const values = node.visibleMaterialOpacities;
+        opacities[node.id] = values.length > 0 ? Math.max(...values) : 0;
+      });
+      setSearchRenderEvidence(opacities);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [searchQuery, searchMatches]);
+
+  const submitSearch = useCallback(() => {
+    const topMatch = searchMatches[0];
+    if (!topMatch || !rendererReadyRef.current) return;
+    selectNode(topMatch.nodeId, "search");
+    // The reference clears the running query once a term is chosen, so the
+    // graph returns to its normal reading mode.
+    setSearchQuery("");
+  }, [searchMatches, selectNode, setSearchQuery]);
 
   const updateReducedMotion = useCallback((nextReducedMotion: boolean) => {
     if (!rendererReadyRef.current) return;
@@ -1043,14 +1087,39 @@ export function BrowserGraphFixture() {
         || target instanceof HTMLTextAreaElement
         || (target instanceof HTMLElement && target.isContentEditable);
       const commandShortcut = (event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === "k";
+      const findShortcut = (event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === "f";
       const slashShortcut = event.key === "/" && !isTextInput && !event.metaKey && !event.ctrlKey && !event.altKey;
-      if (!commandShortcut && !slashShortcut) return;
+      if (findShortcut || slashShortcut) {
+        // The reference keeps one persistent field and focuses it with "/"
+        // and the browser find shortcut.
+        event.preventDefault();
+        focusSearch();
+        return;
+      }
+      if (!commandShortcut) return;
       event.preventDefault();
       openMatrixPalette();
     };
     document.addEventListener("keydown", openMatrix);
     return () => document.removeEventListener("keydown", openMatrix);
-  }, [openMatrixPalette]);
+  }, [focusSearch, openMatrixPalette]);
+
+  useEffect(() => {
+    const clearSearch = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (searchQuery.trim().length === 0) return;
+      const target = event.target;
+      const isTextInput = target instanceof HTMLInputElement
+        || target instanceof HTMLTextAreaElement
+        || (target instanceof HTMLElement && target.isContentEditable);
+      if (!isTextInput) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setSearchQuery("");
+    };
+    document.addEventListener("keydown", clearSearch, true);
+    return () => document.removeEventListener("keydown", clearSearch, true);
+  }, [searchQuery, setSearchQuery]);
 
   useEffect(() => {
     if (!matrixOpen) return undefined;
@@ -1199,6 +1268,9 @@ export function BrowserGraphFixture() {
         });
         workbenchRef.current = workbench;
         workbench.mount(host);
+        // A shared link can carry a running query. Apply it once the renderer
+        // exists so the matched cluster is framed on the first paint.
+        applySearch();
         const defaultReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
         reducedMotionRef.current = defaultReducedMotion;
         setReducedMotion(defaultReducedMotion);
@@ -1300,7 +1372,7 @@ export function BrowserGraphFixture() {
       workbenchRef.current = null;
       initialTermAppliedRef.current = false;
     };
-  }, [selectTermFromLocation]);
+  }, [applySearch, selectTermFromLocation]);
 
   useEffect(() => {
     if (initialViewportTelemetry.availability !== "observed" || initialTermAppliedRef.current) return;
@@ -1754,6 +1826,14 @@ export function BrowserGraphFixture() {
           <span>{reducedMotion ? "Reduced motion" : "Motion enabled"}</span>
         </div>
 
+        <GraphSearchField
+          inputRef={searchInputRef}
+          matchCount={searchMatchCount}
+          onChange={setSearchQuery}
+          onSubmit={submitSearch}
+          query={searchQuery}
+        />
+
         <nav className="toolbar-actions" aria-label="Graph controls">
           <button
             aria-expanded={matrixOpen}
@@ -2017,7 +2097,7 @@ export function BrowserGraphFixture() {
             <input
               autoComplete="off"
               data-testid="matrix-input"
-              onChange={(event) => setMatrixQuery(event.target.value)}
+              onChange={(event) => setSearchQuery(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "ArrowDown") {
                   event.preventDefault();
@@ -2026,18 +2106,21 @@ export function BrowserGraphFixture() {
                 if (event.key === "Enter" && rendererAvailable && filteredNodes[0]) {
                   event.preventDefault();
                   selectNode(filteredNodes[0].id, "matrix");
+                  // The reference clears the running query once a term is
+                  // chosen, so the graph returns to its normal reading mode.
+                  setSearchQuery("");
                   setMatrixOpen(false);
                 }
               }}
               placeholder="Label, identity, or kind"
               ref={captureMatrixSearchInput}
               type="search"
-              value={matrixQuery}
+              value={graphSearch.query}
             />
             <kbd>ESC</kbd>
           </label>
           <div className="matrix-meta">
-            <span>{filteredNodes.length} identities</span>
+            <span>{searchQuery.trim().length === 0 ? `${filteredNodes.length} identities` : `${searchMatchCount} matches`}</span>
             <span>Shared graph + detail selection</span>
           </div>
           <div className="matrix-table" role="listbox" aria-label="Graph node identities">
@@ -2051,6 +2134,9 @@ export function BrowserGraphFixture() {
                   key={node.id}
                   onClick={() => {
                     selectNode(node.id, "matrix");
+                    // The reference clears the running query once a term is
+                    // chosen, so the graph returns to its normal reading mode.
+                    setSearchQuery("");
                     setMatrixOpen(false);
                   }}
                   onKeyDown={(event) => {
@@ -2104,6 +2190,15 @@ export function BrowserGraphFixture() {
           <Telemetry testId="graph-rendered-link-ids" value={renderedLinkIdsTelemetry} />
           <Telemetry testId="graph-render-observation" value={renderTelemetry} />
           <Telemetry testId="host-label-visibility-observation" value={labelVisibilityTelemetry} />
+          <Telemetry
+            testId="graph-search-observation"
+            value={{
+              availability: "observed" as const,
+              matches: searchMatches.map((match) => ({ nodeId: match.nodeId, score: match.score })),
+              nodeOpacities: searchRenderEvidence,
+              query: searchQuery,
+            }}
+          />
           <Telemetry testId="graph-selection" value={selectionTelemetry} />
           <Telemetry testId="graph-selection-transition" value={selectionTransitionTelemetry} />
           <Telemetry testId="graph-node-hover" value={nodeHoverTelemetry} />

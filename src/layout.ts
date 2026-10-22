@@ -38,6 +38,19 @@ export interface GraphLayoutOptions {
   readonly viewport?: GraphViewport;
 }
 
+/**
+ * Describes the active search reading mode so the renderer can frame the
+ * matched cluster and keep the rest of the graph as quiet context.
+ */
+export interface GraphSearchLayoutState {
+  /** True when a search is running, even when it matched nothing. */
+  readonly active: boolean;
+  /** Radius of the matched cluster in world units. */
+  readonly fitRadius: number;
+  /** Matched node ids ordered by descending relevance. */
+  readonly matchedNodeIds: readonly string[];
+}
+
 export interface RenderNode extends GraphNode {
   readonly fx?: number;
   readonly fy?: number;
@@ -58,6 +71,7 @@ export interface RenderGraphData {
   readonly links: readonly RenderLink[];
   readonly nodes: readonly RenderNode[];
   readonly presentation: GraphPresentation;
+  readonly search: GraphSearchLayoutState;
   readonly selection: GraphSelectionState;
 }
 
@@ -252,16 +266,27 @@ function directionalConstellationPosition(
   };
 }
 
-function visualCue(node: GraphNode, selectedNodeId: string | null, neighborNodeIds: ReadonlySet<string>): GraphNodeVisualCue {
+function visualCue(
+  node: GraphNode,
+  selectedNodeId: string | null,
+  neighborNodeIds: ReadonlySet<string>,
+  matchedNodeIds: ReadonlySet<string>,
+  searchActive: boolean,
+): GraphNodeVisualCue {
   const selected = node.id === selectedNodeId;
   const neighboring = neighborNodeIds.has(node.id);
-  const initial = !selectedNodeId
-    ? { contrast: 0.72, labelCue: "visible" as const, opacity: 0.76 }
-    : selected
-      ? { contrast: 1, labelCue: "primary" as const, opacity: 1 }
-      : neighboring
-        ? { contrast: 0.82, labelCue: "visible" as const, opacity: 0.86 }
-        : { contrast: 0.3, labelCue: "muted" as const, opacity: 0.3 };
+  const matched = matchedNodeIds.has(node.id);
+  const initial = selected
+    ? { contrast: 1, labelCue: "primary" as const, opacity: 1 }
+    : searchActive
+      ? matched
+        ? { contrast: 0.94, labelCue: "primary" as const, opacity: 0.96 }
+        : { contrast: 0.22, labelCue: "muted" as const, opacity: 0.2 }
+      : !selectedNodeId
+        ? { contrast: 0.72, labelCue: "visible" as const, opacity: 0.76 }
+        : neighboring
+          ? { contrast: 0.82, labelCue: "visible" as const, opacity: 0.86 }
+          : { contrast: 0.3, labelCue: "muted" as const, opacity: 0.3 };
   const isMaster = node.roles?.includes("master") === true;
   return {
     contrast: isMaster ? Math.max(initial.contrast, MASTER_READABILITY_FLOOR.contrast) : initial.contrast,
@@ -271,16 +296,32 @@ function visualCue(node: GraphNode, selectedNodeId: string | null, neighborNodeI
   };
 }
 
-function linkVisualCue(link: GraphLink, selectedNodeId: string | null): GraphLinkVisualCue {
+function linkVisualCue(
+  link: GraphLink,
+  selectedNodeId: string | null,
+  matchedNodeIds: ReadonlySet<string>,
+  searchActive: boolean,
+): GraphLinkVisualCue {
   // The idle graph keeps its topology in the data model, but hides the full
   // relationship field so a dense graph reads as a quiet set of nodes. The
   // renderer may temporarily reveal incident edges for hover/focus; a real
   // selection still owns the durable visible-link cue below.
-  if (!selectedNodeId) return { opacity: 0, visible: false, width: 0.8 };
-  const selectedLink = link.source === selectedNodeId || link.target === selectedNodeId;
-  return selectedLink
-    ? { opacity: 0.62, visible: true, width: 1.25 }
-    : { opacity: 0.1, visible: false, width: 0.6 };
+  if (selectedNodeId) {
+    const selectedLink = link.source === selectedNodeId || link.target === selectedNodeId;
+    return selectedLink
+      ? { opacity: 0.62, visible: true, width: 1.25 }
+      : { opacity: 0.1, visible: false, width: 0.6 };
+  }
+  // A search turns the graph into a filtered diagram. Only the edges that
+  // connect two matched nodes survive, so the cluster reads as one object
+  // instead of a set of unrelated points.
+  if (searchActive) {
+    const matchedLink = matchedNodeIds.has(link.source) && matchedNodeIds.has(link.target);
+    return matchedLink
+      ? { opacity: 0.5, visible: true, width: 1.1 }
+      : { opacity: 0.05, visible: false, width: 0.6 };
+  }
+  return { opacity: 0, visible: false, width: 0.8 };
 }
 
 function selectedLayoutPositions(
@@ -336,6 +377,155 @@ function selectedLayoutPositions(
 }
 
 /**
+ * Search clusters the matched nodes into one tight group so a query reads as a
+ * single object in the graph instead of a scattered set of hits.
+ *
+ * The reference re-packs the matched subset with a physics simulation. The
+ * workbench keeps its deterministic layout contract, so the same effect is
+ * produced analytically: a Vogel spiral seeds the group, then a fixed number of
+ * relaxation passes pull linked matches together, push unrelated matches
+ * apart, and hold the group around the scene origin. The same input always
+ * produces the same cluster.
+ */
+const SEARCH_CLUSTER_RADIUS = 54;
+const SEARCH_CLUSTER_ITERATIONS = 72;
+const SEARCH_CLUSTER_REPEL_STRENGTH = 340;
+const SEARCH_CLUSTER_REPEL_CAP = 18;
+const SEARCH_CLUSTER_LINK_STRENGTH = 0.09;
+const SEARCH_CLUSTER_LINK_REST = 34;
+const SEARCH_CLUSTER_CENTER_PULL = 0.05;
+const SEARCH_CLUSTER_MIN_SEPARATION = 30;
+const SEARCH_CLUSTER_DAMPING = 0.62;
+const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+
+function searchClusterSeed(index: number, total: number): Coordinates {
+  if (index <= 0) return { x: 0, y: 0, z: 0 };
+  const progress = (index - 1) / Math.max(1, total - 1);
+  const radius = SEARCH_CLUSTER_RADIUS * Math.sqrt(progress);
+  const angle = (index - 1) * GOLDEN_ANGLE;
+  return {
+    x: Math.cos(angle) * radius,
+    // A shallow vertical fan keeps the group readable in perspective without
+    // flattening it into a single disc.
+    y: (progress - 0.5) * 46 + (Math.sin(angle * 0.5) * 6),
+    z: Math.sin(angle) * radius,
+  };
+}
+
+function searchClusterPositions(
+  input: GraphInput,
+  matchedNodeIds: readonly string[],
+): { readonly positions: readonly Coordinates[]; readonly fitRadius: number } {
+  const count = matchedNodeIds.length;
+  if (count === 0) return { positions: [], fitRadius: 0 };
+
+  const positions = matchedNodeIds.map((_, index) => searchClusterSeed(index, count));
+  if (count === 1) return { positions, fitRadius: SEARCH_CLUSTER_RADIUS * 0.4 };
+
+  const indexByNodeId = new Map<string, number>();
+  matchedNodeIds.forEach((nodeId, index) => indexByNodeId.set(nodeId, index));
+  const clusterLinks = input.links.flatMap((link) => {
+    const source = indexByNodeId.get(link.source);
+    const target = indexByNodeId.get(link.target);
+    if (source === undefined || target === undefined) return [];
+    return [{ source, target }];
+  });
+
+  for (let iteration = 0; iteration < SEARCH_CLUSTER_ITERATIONS; iteration += 1) {
+    const forces = positions.map(() => ({ x: 0, y: 0, z: 0 }));
+
+    for (let left = 0; left < count; left += 1) {
+      for (let right = left + 1; right < count; right += 1) {
+        const deltaX = positions[left].x - positions[right].x;
+        const deltaY = positions[left].y - positions[right].y;
+        const deltaZ = positions[left].z - positions[right].z;
+        const distance = Math.max(1, Math.hypot(deltaX, deltaY, deltaZ));
+        const magnitude = Math.min(
+          SEARCH_CLUSTER_REPEL_CAP,
+          SEARCH_CLUSTER_REPEL_STRENGTH / (distance * distance),
+        );
+        const scale = magnitude / distance;
+        const pushX = deltaX * scale;
+        const pushY = deltaY * scale;
+        const pushZ = deltaZ * scale;
+        forces[left].x += pushX;
+        forces[left].y += pushY;
+        forces[left].z += pushZ;
+        forces[right].x -= pushX;
+        forces[right].y -= pushY;
+        forces[right].z -= pushZ;
+      }
+    }
+
+    for (const link of clusterLinks) {
+      const deltaX = positions[link.target].x - positions[link.source].x;
+      const deltaY = positions[link.target].y - positions[link.source].y;
+      const deltaZ = positions[link.target].z - positions[link.source].z;
+      const distance = Math.max(0.001, Math.hypot(deltaX, deltaY, deltaZ));
+      const stretch = (distance - SEARCH_CLUSTER_LINK_REST) * SEARCH_CLUSTER_LINK_STRENGTH;
+      const scale = stretch / distance;
+      const pullX = deltaX * scale;
+      const pullY = deltaY * scale;
+      const pullZ = deltaZ * scale;
+      forces[link.source].x += pullX;
+      forces[link.source].y += pullY;
+      forces[link.source].z += pullZ;
+      forces[link.target].x -= pullX;
+      forces[link.target].y -= pullY;
+      forces[link.target].z -= pullZ;
+    }
+
+    for (let index = 0; index < count; index += 1) {
+      const position = positions[index];
+      const force = forces[index];
+      let nextX = position.x + (force.x * SEARCH_CLUSTER_DAMPING) - (position.x * SEARCH_CLUSTER_CENTER_PULL);
+      let nextY = position.y + (force.y * SEARCH_CLUSTER_DAMPING) - (position.y * SEARCH_CLUSTER_CENTER_PULL);
+      let nextZ = position.z + (force.z * SEARCH_CLUSTER_DAMPING) - (position.z * SEARCH_CLUSTER_CENTER_PULL);
+
+      for (let other = 0; other < count; other += 1) {
+        if (other === index) continue;
+        const deltaX = nextX - positions[other].x;
+        const deltaY = nextY - positions[other].y;
+        const deltaZ = nextZ - positions[other].z;
+        const distance = Math.hypot(deltaX, deltaY, deltaZ);
+        if (distance >= SEARCH_CLUSTER_MIN_SEPARATION || distance === 0) continue;
+        const push = (SEARCH_CLUSTER_MIN_SEPARATION - distance) * 0.5;
+        nextX += (deltaX / distance) * push;
+        nextY += (deltaY / distance) * push;
+        nextZ += (deltaZ / distance) * push;
+      }
+
+      positions[index] = { x: nextX, y: nextY, z: nextZ };
+    }
+  }
+
+  let centerX = 0;
+  let centerY = 0;
+  let centerZ = 0;
+  for (const position of positions) {
+    centerX += position.x;
+    centerY += position.y;
+    centerZ += position.z;
+  }
+  centerX /= count;
+  centerY /= count;
+  centerZ /= count;
+
+  let fitRadius = 0;
+  const centered = positions.map((position) => {
+    const centeredPosition = {
+      x: position.x - centerX,
+      y: position.y - centerY,
+      z: position.z - centerZ,
+    };
+    fitRadius = Math.max(fitRadius, Math.hypot(centeredPosition.x, centeredPosition.y, centeredPosition.z));
+    return centeredPosition;
+  });
+
+  return { positions: centered, fitRadius: fitRadius + 18 };
+}
+
+/**
  * Creates renderer-local, deterministic positions and visual cues without mutating GraphInput.
  * A selection locks only the selected node and its one-hop neighborhood to settled targets
  * unless the host asks to preserve the existing deterministic layout.
@@ -349,6 +539,10 @@ export function createRenderGraphData(
   const selectedNodeId = primarySelectedNodeId(input, presentation);
   const neighborNodeIds = selectedNodeId ? oneHopNodeIds(input, selectedNodeId) : [];
   const neighborNodeIdSet = new Set(neighborNodeIds);
+  const knownNodeIds = new Set(input.nodes.map((node) => node.id));
+  const searchActive = presentation.matchedNodeIds !== undefined && presentation.matchedNodeIds !== null;
+  const matchedNodeIds = (presentation.matchedNodeIds ?? []).filter((nodeId) => knownNodeIds.has(nodeId));
+  const matchedNodeIdSet = new Set(matchedNodeIds);
   const basePositions = new Map(input.nodes.map((node, index) => [
     node.id,
     organicPosition(node, input.layout.seed, index, input.nodes.length),
@@ -358,23 +552,43 @@ export function createRenderGraphData(
   const positions = preservesSelectionLayout
     ? basePositions
     : selectedLayoutPositions(input, basePositions, nodesById, selectedNodeId, neighborNodeIds, viewport);
+  // The search cluster overrides the canonical positions, so it needs a
+  // mutable copy of the settled map.
+  const mutablePositions = new Map(positions);
+
+  // A live selection already owns the reading layout: its one-hop constellation
+  // is the subject. The search cluster would fight that contract, so an active
+  // selection keeps its positions and the search only changes the visual tiers.
+  let fitRadius = 0;
+  if (searchActive && matchedNodeIds.length > 0 && !selectedNodeId) {
+    const cluster = searchClusterPositions(input, matchedNodeIds);
+    fitRadius = cluster.fitRadius;
+    matchedNodeIds.forEach((nodeId, index) => {
+      const node = nodesById.get(nodeId);
+      if (!node || node.layoutHint?.pinned) return;
+      const clusterPosition = cluster.positions[index];
+      if (!clusterPosition) return;
+      mutablePositions.set(nodeId, clusterPosition);
+    });
+  }
+
   const settledNodeIds = new Set(
     !preservesSelectionLayout && selectedNodeId ? [selectedNodeId, ...neighborNodeIds] : [],
   );
   const nodes = input.nodes.map((node) => {
-    const position = positions.get(node.id)!;
+    const position = mutablePositions.get(node.id)!;
     const settled = settledNodeIds.has(node.id);
     const pinned = node.layoutHint?.pinned === true;
     return {
       ...node,
       ...position,
-      visual: visualCue(node, selectedNodeId, neighborNodeIdSet),
+      visual: visualCue(node, selectedNodeId, neighborNodeIdSet, matchedNodeIdSet, searchActive),
       ...((pinned || settled) ? { fx: position.x, fy: position.y, fz: position.z } : {}),
     };
   });
   const links = input.links.map((link) => ({
     ...link,
-    visual: linkVisualCue(link, selectedNodeId),
+    visual: linkVisualCue(link, selectedNodeId, matchedNodeIdSet, searchActive),
   }));
   const targetNodePositions = nodes
     .map(({ id, x, y, z }) => ({ id, x, y, z }))
@@ -383,6 +597,11 @@ export function createRenderGraphData(
     nodes,
     links,
     presentation,
+    search: {
+      active: searchActive,
+      fitRadius,
+      matchedNodeIds,
+    },
     selection: {
       nodeId: selectedNodeId,
       neighborNodeIds,

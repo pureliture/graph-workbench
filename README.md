@@ -250,13 +250,40 @@ host가 제공합니다.
 계산합니다. Built-in renderer는 구형 volumetric body, camera-facing label, depth-aware opacity,
 focused edge flow를 제공하며, reduced motion에서는 같은 target에 즉시 도달합니다.
 
+## 검색 읽기 모드
+
+검색은 그래프를 읽기 모드로 전환합니다. 쿼리를 실행하면 매칭 node가 강조되고 하나의 cluster로 묶이며,
+camera가 그 cluster를 frame합니다. 매칭되지 않은 node는 낮은 대비의 context로 남습니다.
+
+```ts
+import { createGraphSearchIndex, searchGraph } from "@pureliture/graph-workbench";
+
+// 인덱스는 그래프가 바뀔 때만 다시 만듭니다.
+const index = createGraphSearchIndex(input);
+const result = searchGraph(index, "release workflow");
+result.nodeIds;   // relevancy 순서의 매칭 node id
+result.scores;    // node id → relevance score
+
+// 읽기 모드로 전환합니다.
+workbench.setSearchQuery("release workflow");
+workbench.getSearchState(); // { active, matches, nodeIds, query }
+workbench.clearSearch();
+```
+
+검색은 field 가중치, prefix 매칭, typo 허용 fuzzy 매칭을 사용합니다. 기본 문서는 `node.label`과
+`metadata`에서 만들어지며, `summary`/`definition`/`usage`/`aliases`/`avoid`/`section`이 검색 대상이 됩니다.
+호스트가 own data를 search에 넣으려면 `GraphWorkbenchOptions.searchOptions.resolveDocument`를 사용합니다.
+
+검색 contract와 레퍼런스 역분석 근거는 [docs/graph-search-reference-spec.md](./docs/graph-search-reference-spec.md)에
+정리되어 있습니다.
+
 ## 공개 API
 
 ### Entrypoint
 
 | Import | 용도 | 주요 export |
 |---|---|---|
-| `@pureliture/graph-workbench` | renderer-neutral core, validation, test/custom host | `createGraphWorkbench`, `validateGraphInput`, types |
+| `@pureliture/graph-workbench` | renderer-neutral core, validation, test/custom host | `createGraphWorkbench`, `validateGraphInput`, `createGraphSearchIndex`, `searchGraph`, types |
 | `@pureliture/graph-workbench/browser` | browser/WebView Three.js renderer | `createBrowserGraphWorkbench`, `createThreeForceGraphRenderer`, default node/link factories |
 
 ### `GraphWorkbench`
@@ -266,6 +293,7 @@ focused edge flow를 제공하며, reduced motion에서는 같은 target에 즉�
 | Lifecycle | `mount`, `unmount`, `destroy`, `setActivityState`, `suspend`, `resume`, `captureRecoveryCapsule`, `restoreRecoveryCapsule` |
 | Input/presentation | `setInput`, `setPresentation`, `setReducedMotion` |
 | Selection | `selectNode`, `focusNode`, `getSelectionState` |
+| Search | `search`, `setSearchQuery`, `getSearchState`, `clearSearch` |
 | Camera/layout | `resize`, `fit`, `zoom`, `restoreCamera` |
 | Observation | `getNodeScreenPosition`, `getRenderObservation`, `getTransitionObservation`, `getAmbientMotionObservation` |
 

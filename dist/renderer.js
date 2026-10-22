@@ -69,6 +69,7 @@ const STATIC_LABEL_OPACITY = Object.freeze({
     far: 0.18,
     neighbor: 0.72,
     selected: 1,
+    matched: 0.94,
 });
 // Projected size still helps the labels selected for display read naturally.
 // A separate screen-space density pass below decides when an unrelated label
@@ -964,8 +965,14 @@ function sceneVisualForNode(node, data, descriptor, density = FULL_NODE_DENSITY_
     const isSelected = data.selection.nodeId === node.id;
     const isNeighbor = data.selection.neighborNodeIds.includes(node.id);
     const labelVisibility = labelVisibilityForNode(node, data.presentation);
+    // A running search turns the graph into a filtered diagram. Matched nodes
+    // keep the full readability tier, and everything else drops to the quiet
+    // context tier instead of disappearing.
+    const searchActive = data.search.active;
+    const isMatched = searchActive && data.search.matchedNodeIds.includes(node.id);
     const interactionVisible = isSelected
         || isNeighbor
+        || isMatched
         || data.presentation.focusNodeId === node.id;
     const labelVisible = labelVisibility !== "hidden"
         && (labelVisibility !== "interaction" || interactionVisible);
@@ -977,14 +984,20 @@ function sceneVisualForNode(node, data, descriptor, density = FULL_NODE_DENSITY_
     const depthOpacity = 0.7 + (depthProgress * 0.3);
     const viewportScale = Math.max(1, Math.min(1.3, 480 / Math.max(1, Math.min(data.selection.viewport.width, data.selection.viewport.height))));
     const labelOpacity = data.selection.nodeId === null
-        ? Math.max(STATIC_LABEL_OPACITY.far, baseOpacity * depthOpacity)
+        ? isMatched
+            ? STATIC_LABEL_OPACITY.matched
+            : searchActive
+                ? STATIC_LABEL_OPACITY.far
+                : Math.max(STATIC_LABEL_OPACITY.far, baseOpacity * depthOpacity)
         : isSelected
             ? STATIC_LABEL_OPACITY.selected
             : isNeighbor
                 // Preserve some near-depth distinction without letting a neighbor
                 // equal the selected label or fall into the far-label readability tier.
                 ? Math.max(STATIC_LABEL_OPACITY.neighbor, Math.min(0.9, baseOpacity * depthOpacity))
-                : STATIC_LABEL_OPACITY.far;
+                : isMatched
+                    ? STATIC_LABEL_OPACITY.matched
+                    : STATIC_LABEL_OPACITY.far;
     return {
         // Bodies can recede with depth, while node names retain a high-contrast
         // floor. Counteracting the group depth scale and boosting narrow viewports
@@ -998,9 +1011,9 @@ function sceneVisualForNode(node, data, descriptor, density = FULL_NODE_DENSITY_
             ? (isSelected ? 1 : 1 / depthScale) * viewportScale
             : 0,
         opacity: density.bodyVisible
-            ? Math.max(node.visual.opacityFloor, isSelected ? baseOpacity : baseOpacity * depthOpacity)
+            ? Math.max(node.visual.opacityFloor, isSelected || isMatched ? baseOpacity : baseOpacity * depthOpacity)
             : 0,
-        scale: isSelected ? 1.22 : depthScale,
+        scale: isSelected ? 1.22 : isMatched ? Math.max(1.08, depthScale) : depthScale,
     };
 }
 function setObjectMaterialColor(object, color) {
@@ -2464,7 +2477,11 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
                 && !data.selection.neighborNodeIds.includes(node.id)
                 && object?.userData.graphDefaultNodeObject === true;
             applyNodePalette(node);
-            applyNodeVisual(node, lightQuietContext ? Math.max(visual.opacity, LIGHT_SELECTED_CONTEXT_FLOOR.bodyOpacity) : visual.opacity, visual.scale, data.selection.nodeId === node.id ? visual.opacity : 0, visual.bodyVisible, visual.labelVisible, lightQuietContext && visual.labelVisible
+            const matched = data.search.active && data.search.matchedNodeIds.includes(node.id);
+            // The focus rim marks the active reading subject. A search uses the same
+            // ring so the matched cluster is identifiable inside the graph itself.
+            const rimOpacity = matched || data.selection.nodeId === node.id ? visual.opacity : 0;
+            applyNodeVisual(node, lightQuietContext ? Math.max(visual.opacity, LIGHT_SELECTED_CONTEXT_FLOOR.bodyOpacity) : visual.opacity, visual.scale, rimOpacity, visual.bodyVisible, visual.labelVisible, lightQuietContext && visual.labelVisible
                 ? Math.max(visual.labelOpacity, LIGHT_SELECTED_CONTEXT_FLOOR.labelOpacity)
                 : visual.labelOpacity, visual.labelScale);
         });
@@ -3091,6 +3108,38 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
         const targetDistance = Math.min(maximumDistance, Math.max(minimumDistance, cameraPoseDistance(fittedCamera)));
         return cameraPoseAtDistance(fittedCamera, targetDistance);
     }
+    function searchCameraTarget(nodeIds) {
+        const data = currentData;
+        if (!data || nodeIds.length === 0)
+            return null;
+        const focusNodeIds = new Set(nodeIds);
+        const points = data.nodes.flatMap((node) => {
+            if (!focusNodeIds.has(node.id))
+                return [];
+            const position = nodePosition(node);
+            if (!position)
+                return [];
+            const bodyRadius = defaultVisualInputForNode(node).silhouette.cameraRadius;
+            return [{ ...position, radius: (bodyRadius * 1.24) + AMBIENT_MAX_OFFSET }];
+        });
+        if (points.length === 0)
+            return null;
+        const viewport = rendererViewport ?? data.selection.viewport;
+        return contextCameraPose(points, cameraPose(), boundedPerspectiveProjection(graph.camera(), viewport), viewport, null, 0.5);
+    }
+    function focusNodeSet(nodeIds, options) {
+        if (activeTransition)
+            cancelCameraTransition();
+        const targetCamera = searchCameraTarget(nodeIds);
+        if (!targetCamera)
+            return;
+        startTransition({
+            durationMs: options.reducedMotion ? 0 : 320,
+            reducedMotion: options.reducedMotion,
+            scene: null,
+            targetCamera,
+        });
+    }
     function transitionToNode(nodeId, options) {
         const activeScene = activeTransition?.scene;
         if (!options.reducedMotion && activeScene?.targetFocusNodeId === nodeId) {
@@ -3383,6 +3432,7 @@ export function createThreeForceGraphRenderer({ callbacks, container, nodeObject
             explicitlySuspended = true;
             refreshMotionPauseState();
         },
+        focusNodeSet,
         transitionToNode,
         zoom(scale) {
             const boundedScale = Math.max(0.25, Math.min(8, scale));

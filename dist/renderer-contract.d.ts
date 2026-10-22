@@ -215,6 +215,11 @@ export interface GraphRenderer {
     destroy(): void;
     fit(durationMs?: number): void;
     focus(nodeId: string): void;
+    /**
+     * Optional enhanced seam that frames a set of nodes as one subject. A search
+     * uses it to bring the matched cluster into view.
+     */
+    focusNodeSet?(nodeIds: readonly string[], options?: GraphCameraTransitionOptions): void;
     /** Optional projection seam for the renderer's current node and camera state. */
     getNodeScreenPosition?(nodeId: string): GraphScreenPosition | null;
     /** Optional renderer-owned micro-motion evidence. */
